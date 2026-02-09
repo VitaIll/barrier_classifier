@@ -1,0 +1,12 @@
+# Training datasets and generated model artifacts
+/data/raw_data/
+/data/model_dataset/
+
+# Notebook training logs/artifacts
+/notebooks/catboost_info/
+
+# Local temporary/cache files
+/.tmp/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
