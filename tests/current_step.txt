@@ -1,3 +1,3 @@
 # Active delivery — see tests/conftest.py for the contract.
 # One step per line, or comma-separated. Lines starting with # are ignored.
-analytics_phase0,analytics_phase1
+analytics_phase0,analytics_phase1,analytics_phase2,analytics_phase3
