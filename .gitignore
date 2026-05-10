@@ -10,3 +10,6 @@
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+# Personal Claude Code overrides
+.claude/settings.local.json
