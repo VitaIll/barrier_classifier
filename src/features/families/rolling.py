@@ -23,7 +23,7 @@ import polars as pl
 
 from src.features.base import Feature
 from src.features.config import WINDOWS_F
-from src.features.primitives import rolling_mean, rolling_std_pop
+from src.features.primitives import clip_pos, rolling_mean, rolling_std_pop
 
 
 class _RollingFeature(Feature):
@@ -61,11 +61,22 @@ class RollingRetStd(_RollingFeature):
 
 
 class RollingRetRms(_RollingFeature):
+    """Root-mean-square of returns: ``sqrt(rolling_mean(r², w))``.
+
+    Polars-specific guard: `clip_pos` before `sqrt`. Polars' rolling
+    online algorithm can produce a tiny-negative result on all-zero
+    windows (constant-price bars) due to float cancellation; sqrt of a
+    tiny negative is NaN. Numpy/pandas don't hit this because their
+    rolling mean uses a different summation. The clamp matches what
+    every other variance-shaped feature does (VolGk / VolRs /
+    VolSemivar*) and is mathematically a no-op for r² ≥ 0.
+    """
+
     inputs = ("r",)
     output_prefix = "ret__rms"
 
     def compute(self, w: int | None = None) -> pl.Expr:
-        return rolling_mean(pl.col("r") ** 2, w).sqrt()
+        return clip_pos(rolling_mean(pl.col("r") ** 2, w)).sqrt()
 
 
 class RollingAbsretMean(_RollingFeature):

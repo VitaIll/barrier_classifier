@@ -60,9 +60,100 @@ def test_compute_feature_health_shape(synthetic_health_frame):
     health = compute_feature_health(synthetic_health_frame, feature_cols)
     assert len(health) == 5
     assert set(health.columns) >= {
-        "name", "family", "n", "n_valid", "nan_rate", "undef_rate",
-        "mean", "std", "min", "max", "skew", "kurt", "has_inf", "is_constant",
+        "name", "family", "n", "n_valid",
+        "n_null", "n_nan", "missing_rate",
+        "null_pattern", "n_leading_missing", "n_trailing_missing",
+        "undef_rate",
+        "mean", "std", "min", "max", "skew", "kurt",
+        "n_inf", "has_inf", "is_constant",
     }
+
+
+def test_compute_feature_health_distinguishes_null_from_nan():
+    """polars null and float NaN are distinct kinds of missingness;
+    the health frame must report them separately so an engine bug that
+    emits NaN where null is expected does not silently slip through."""
+    df = pl.DataFrame(
+        {
+            "ret__mixed__f__w0": pl.Series(
+                [1.0, None, float("nan"), 4.0, 5.0],
+                dtype=pl.Float64,
+            ),
+        }
+    )
+    health = compute_feature_health(df, ["ret__mixed__f__w0"])
+    row = health.row(0, named=True)
+    assert row["n_null"] == 1
+    assert row["n_nan"] == 1
+    assert row["missing_rate"] == pytest.approx(0.4)
+    # n_valid is non-null AND non-NaN
+    assert row["n_valid"] == 3
+
+
+def test_null_pattern_classification():
+    """Each pattern bucket lights up on the right input."""
+    n = 10
+    cases = {
+        "clean": [1.0] * n,
+        "all_missing": [None] * n,
+        "leading": [None, None, None] + [1.0] * (n - 3),
+        "trailing": [1.0] * (n - 2) + [None, None],
+        "edge": [None] + [1.0] * (n - 2) + [None],
+        "scattered": [1.0, 1.0, None, 1.0, None, 1.0, 1.0, 1.0, 1.0, 1.0],
+    }
+    for expected, vals in cases.items():
+        df = pl.DataFrame({"ret__x__f__w0": pl.Series(vals, dtype=pl.Float64)})
+        health = compute_feature_health(df, ["ret__x__f__w0"])
+        assert health.row(0, named=True)["null_pattern"] == expected, (
+            f"expected {expected} for input {vals}"
+        )
+
+
+def test_null_pattern_counts_leading_trailing():
+    df = pl.DataFrame(
+        {
+            "ret__x__f__w0": pl.Series(
+                [None, None, 1.0, 2.0, 3.0, 4.0, None],
+                dtype=pl.Float64,
+            ),
+        }
+    )
+    row = compute_feature_health(df, ["ret__x__f__w0"]).row(0, named=True)
+    assert row["null_pattern"] == "edge"
+    assert row["n_leading_missing"] == 2
+    assert row["n_trailing_missing"] == 1
+
+
+def test_flag_issues_priorities_residual_nan_first():
+    """If a feature has both NaN and high undef, the NaN issue wins."""
+    df = pl.DataFrame(
+        {
+            "ret__bad__f__w0": pl.Series(
+                [float("nan"), 1.0, 2.0, 3.0],
+                dtype=pl.Float64,
+            ),
+            "undef__ret__bad__f__w0": pl.Series([1, 0, 0, 0], dtype=pl.Int8),
+        }
+    )
+    health = compute_feature_health(df, ["ret__bad__f__w0"])
+    issues = flag_issues(health, max_undef_rate=0.0)
+    assert len(issues) == 1
+    assert issues.row(0, named=True)["issue"] == "residual_nan"
+
+
+def test_flag_issues_picks_up_scattered_missing():
+    df = pl.DataFrame(
+        {
+            "ret__x__f__w0": pl.Series(
+                [1.0, 1.0, None, 1.0, 1.0, None, 1.0, 1.0],
+                dtype=pl.Float64,
+            ),
+        }
+    )
+    health = compute_feature_health(df, ["ret__x__f__w0"])
+    issues = flag_issues(health)
+    issue_labels = set(issues["issue"].to_list())
+    assert "scattered_missing" in issue_labels
 
 
 def test_compute_feature_health_detects_constant(synthetic_health_frame):
@@ -110,6 +201,7 @@ def test_summarize_by_family_aggregates(synthetic_health_frame):
     assert len(summary) == 5
     assert set(summary.columns) >= {
         "family", "n_features", "avg_undef_rate", "max_undef_rate",
+        "max_missing_rate", "n_features_with_nan", "n_scattered",
         "n_constant", "n_with_inf", "avg_abs_skew",
     }
     # vol family has the constant feature
