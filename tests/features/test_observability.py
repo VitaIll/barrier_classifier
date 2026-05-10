@@ -65,8 +65,87 @@ def test_compute_feature_health_shape(synthetic_health_frame):
         "null_pattern", "n_leading_missing", "n_trailing_missing",
         "undef_rate",
         "mean", "std", "min", "max", "skew", "kurt",
-        "n_inf", "has_inf", "is_constant",
+        "n_inf", "has_inf",
+        "is_constant", "is_imputed_constant", "is_organic_constant",
+        "outlier_ratio", "is_extreme_outlier",
+        "mean_drift_chunks", "std_drift_ratio_chunks", "is_non_stationary",
     }
+
+
+def test_imputed_constant_distinguished_from_organic_constant():
+    """Constant-by-imputation must be flagged separately from a hand-
+    crafted scalar like ``cost__c__h__w0`` so the ML team can drop the
+    former and accept the latter."""
+    n = 100
+    df = pl.DataFrame(
+        {
+            # Imputed constant: undef flag fired everywhere.
+            "ret__dead__f__w0": pl.Series([0.0] * n, dtype=pl.Float64),
+            "undef__ret__dead__f__w0": pl.Series([1] * n, dtype=pl.Int8),
+            # Organic constant: no undef flag (column was always 1.0).
+            "cost__c__h__w0": pl.Series([1.0] * n, dtype=pl.Float64),
+        }
+    )
+    health = compute_feature_health(df, ["ret__dead__f__w0", "cost__c__h__w0"])
+    rows = {r["name"]: r for r in health.iter_rows(named=True)}
+
+    assert rows["ret__dead__f__w0"]["is_imputed_constant"] is True
+    assert rows["ret__dead__f__w0"]["is_organic_constant"] is False
+    assert rows["cost__c__h__w0"]["is_imputed_constant"] is False
+    assert rows["cost__c__h__w0"]["is_organic_constant"] is True
+
+
+def test_extreme_outlier_detection():
+    """A single-row blowup (e.g. division by EPS) sits inside an
+    otherwise tame distribution; max/median ratio surfaces it even
+    when skew alone wouldn't."""
+    n = 1000
+    rng = np.random.default_rng(42)
+    vals = rng.normal(0.0, 1.0, n)
+    vals[7] = 1.0e22  # the kind of blowup we saw with oi__chg_pct
+    df = pl.DataFrame({"oi__chg_pct__f__w0": pl.Series(vals, dtype=pl.Float64)})
+    health = compute_feature_health(
+        df, ["oi__chg_pct__f__w0"], outlier_ratio_threshold=1.0e6
+    )
+    row = health.row(0, named=True)
+    assert row["is_extreme_outlier"] is True
+    assert row["outlier_ratio"] > 1.0e6
+
+
+def test_non_stationarity_detection():
+    """Step change in mean across thirds should fire non_stationary."""
+    n = 600
+    rng = np.random.default_rng(7)
+    chunk_size = n // 3
+    vals = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, chunk_size),
+            rng.normal(0.0, 1.0, chunk_size),
+            rng.normal(5.0, 1.0, n - 2 * chunk_size),  # step shift in last third
+        ]
+    )
+    df = pl.DataFrame({"ret__regime__f__w0": pl.Series(vals, dtype=pl.Float64)})
+    health = compute_feature_health(
+        df,
+        ["ret__regime__f__w0"],
+        mean_drift_threshold=1.0,
+        std_drift_ratio_threshold=100.0,
+    )
+    row = health.row(0, named=True)
+    assert row["is_non_stationary"] is True
+    assert row["mean_drift_chunks"] > 1.0
+
+
+def test_stationarity_skipped_for_constant_features():
+    """Constant features have zero std → drift is undefined; we should
+    not flag them as non_stationary (they get the constant flag instead)."""
+    df = pl.DataFrame(
+        {"x__const__f__w0": pl.Series([3.14] * 100, dtype=pl.Float64)}
+    )
+    health = compute_feature_health(df, ["x__const__f__w0"])
+    row = health.row(0, named=True)
+    assert row["is_constant"] is True
+    assert row["is_non_stationary"] is False
 
 
 def test_compute_feature_health_distinguishes_null_from_nan():
@@ -202,11 +281,12 @@ def test_summarize_by_family_aggregates(synthetic_health_frame):
     assert set(summary.columns) >= {
         "family", "n_features", "avg_undef_rate", "max_undef_rate",
         "max_missing_rate", "n_features_with_nan", "n_scattered",
-        "n_constant", "n_with_inf", "avg_abs_skew",
+        "n_imputed_constant", "n_organic_constant", "n_extreme_outlier",
+        "n_non_stationary", "n_with_inf", "avg_abs_skew",
     }
-    # vol family has the constant feature
+    # vol family has the constant feature (organic — no undef flag in fixture)
     vol_row = summary.filter(pl.col("family") == "vol").row(0, named=True)
-    assert vol_row["n_constant"] == 1
+    assert vol_row["n_organic_constant"] == 1
 
 
 def test_flag_issues_picks_up_all_categories(synthetic_health_frame):
@@ -230,10 +310,13 @@ def test_flag_issues_picks_up_all_categories(synthetic_health_frame):
     assert "logp__bad__f__w0" in issue_names
     assert "liq__skewed__f__w30" in issue_names
     assert "ofi__sparse__f__w0" in issue_names
-    # Issue labels cover the categories we triggered
-    assert "constant" in issue_labels
+    # Issue labels cover the categories we triggered. The constant
+    # vol__broken feature has no undef flag in the fixture so it lands
+    # under organic_constant; inf and high_undef are direct triggers.
+    # liq__skewed is classified as extreme_outlier (lognormal max/median
+    # ratio is huge), which has higher priority than heavy_skew.
+    assert "organic_constant" in issue_labels
     assert "inf" in issue_labels
-    assert "heavy_skew" in issue_labels
     assert "high_undef" in issue_labels
 
 

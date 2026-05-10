@@ -138,28 +138,45 @@ def compute_feature_health(
     feature_cols: Iterable[str],
     *,
     constant_threshold: float = 1e-12,
+    include_stationarity: bool = True,
+    n_stationarity_chunks: int = 3,
+    outlier_ratio_threshold: float = 1.0e4,
+    mean_drift_threshold: float = 1.0,
+    std_drift_ratio_threshold: float = 100.0,
 ) -> pl.DataFrame:
     """Per-feature health summary.
 
     Returns one row per feature with:
 
-    - ``name``, ``family``: identifiers
-    - ``n``, ``n_valid``: total rows / non-missing rows
-    - ``n_null``, ``n_nan``: separate counts of polars-null and float-NaN
-      (the impute step coerces NaN→null upfront, so post-impute both
-      should be 0; surfacing them separately catches engine bugs that
-      emit float NaN where null is expected)
-    - ``missing_rate``: ``(n_null + n_nan) / n``
-    - ``null_pattern``: clean / all_missing / leading / trailing / edge /
-      scattered (see :func:`_classify_missing_pattern`)
-    - ``n_leading_missing``, ``n_trailing_missing``: contiguous missing
-      blocks at the start and end of the series
-    - ``undef_rate``: rate from the matching ``undef__<feature>`` flag
-      column if present (pre-impute missingness signal)
-    - ``mean`` / ``std`` / ``min`` / ``max`` / ``skew`` / ``kurt``: stats
-      over non-missing values; ``std`` is population (``ddof=0``)
-    - ``n_inf``, ``has_inf``: count and bool for ±inf
-    - ``is_constant``: ``std < constant_threshold``
+    Identity / nullability:
+      ``name``, ``family``, ``n``, ``n_valid``, ``n_null``, ``n_nan``,
+      ``missing_rate``, ``null_pattern`` ∈ {clean, all_missing, leading,
+      trailing, edge, scattered}, ``n_leading_missing``,
+      ``n_trailing_missing``, ``undef_rate``.
+
+    Distribution stats over non-missing values (ddof=0):
+      ``mean``, ``std``, ``min``, ``max``, ``skew``, ``kurt``,
+      ``n_inf``, ``has_inf``.
+
+    Constancy (separates organic from imputation-driven):
+      ``is_constant`` (``std < constant_threshold``),
+      ``is_imputed_constant`` (constant + ``undef_rate > 0.5``), and
+      ``is_organic_constant`` (constant + low undef_rate, i.e.
+      hand-crafted scalars like ``cost__c__h__w0``).
+
+    Outlier signal:
+      ``outlier_ratio`` = ``max(|x|) / median(|x| | x ≠ 0)`` over
+      non-missing values. ``is_extreme_outlier`` =
+      ``outlier_ratio > outlier_ratio_threshold``. Catches single-row
+      blowups (e.g. division by ``EPS`` when a denominator is zero) that
+      heavy-skew flags but doesn't quantify.
+
+    Stationarity drift (only when ``include_stationarity``):
+      ``mean_drift_chunks`` = ``(max - min) of per-chunk means / overall
+      std``; ``std_drift_ratio_chunks`` = ``max / min`` of per-chunk
+      std. ``is_non_stationary`` = either exceeds threshold. Defaults
+      flag drift > 1σ between chunks or std-ratio > 100x. The data are
+      split into ``n_stationarity_chunks`` chronological slices.
     """
     rows: list[dict[str, object]] = []
     available = set(df.columns)
@@ -220,6 +237,90 @@ def compute_feature_health(
             and (not math.isnan(std))
             and (std < constant_threshold)
         )
+        is_imputed_constant = is_const and undef_rate > 0.5
+        is_organic_constant = is_const and not is_imputed_constant
+
+        # Outlier ratio: max|x| / median|x≠0| on non-missing values.
+        if n_valid >= 2 and is_numeric:
+            try:
+                abs_s = s_clean.abs()
+                max_abs = float(abs_s.max() or 0.0)
+                nonzero = abs_s.filter(abs_s > 0)
+                if len(nonzero) > 0:
+                    med_abs = float(nonzero.median() or 0.0)
+                else:
+                    med_abs = 0.0
+                if med_abs > 0:
+                    outlier_ratio = max_abs / med_abs
+                elif max_abs > 0:
+                    outlier_ratio = float("inf")
+                else:
+                    outlier_ratio = 0.0
+            except Exception:
+                outlier_ratio = 0.0
+        else:
+            outlier_ratio = 0.0
+        is_extreme_outlier = (
+            (not math.isinf(outlier_ratio))
+            and outlier_ratio > outlier_ratio_threshold
+        ) or math.isinf(outlier_ratio)
+
+        # Stationarity drift across chronological chunks. Skip for
+        # constant or low-signal features (the drift metric is undefined).
+        mean_drift = 0.0
+        std_drift = 1.0
+        is_non_stationary = False
+        if (
+            include_stationarity
+            and is_numeric
+            and not is_const
+            and n >= n_stationarity_chunks * 10
+            and not math.isnan(std)
+            and std > 0
+        ):
+            chunk_size = n // n_stationarity_chunks
+            chunk_means: list[float] = []
+            chunk_stds: list[float] = []
+            ok = True
+            for i in range(n_stationarity_chunks):
+                start = i * chunk_size
+                size = (
+                    chunk_size
+                    if i < n_stationarity_chunks - 1
+                    else n - start
+                )
+                chunk = s.slice(start, size)
+                chunk_clean = (
+                    chunk.drop_nulls().drop_nans()
+                    if is_float
+                    else chunk.drop_nulls()
+                )
+                if len(chunk_clean) < 2:
+                    ok = False
+                    break
+                cm = chunk_clean.mean()
+                cs = chunk_clean.std(ddof=0)
+                if cm is None or cs is None:
+                    ok = False
+                    break
+                chunk_means.append(float(cm))
+                chunk_stds.append(float(cs))
+            if ok and chunk_means:
+                mean_drift = (max(chunk_means) - min(chunk_means)) / std
+                if min(chunk_stds) > 0:
+                    std_drift = max(chunk_stds) / min(chunk_stds)
+                elif max(chunk_stds) > 0:
+                    std_drift = float("inf")
+                else:
+                    std_drift = 1.0
+            is_non_stationary = (
+                mean_drift > mean_drift_threshold
+                or (
+                    not math.isinf(std_drift)
+                    and std_drift > std_drift_ratio_threshold
+                )
+                or math.isinf(std_drift)
+            )
 
         rows.append(
             {
@@ -243,6 +344,13 @@ def compute_feature_health(
                 "n_inf": n_inf,
                 "has_inf": n_inf > 0,
                 "is_constant": is_const,
+                "is_imputed_constant": is_imputed_constant,
+                "is_organic_constant": is_organic_constant,
+                "outlier_ratio": outlier_ratio,
+                "is_extreme_outlier": is_extreme_outlier,
+                "mean_drift_chunks": mean_drift,
+                "std_drift_ratio_chunks": std_drift,
+                "is_non_stationary": is_non_stationary,
             }
         )
 
@@ -267,7 +375,10 @@ def summarize_by_family(health: pl.DataFrame) -> pl.DataFrame:
                 .eq("scattered")
                 .sum()
                 .alias("n_scattered"),
-                pl.col("is_constant").sum().alias("n_constant"),
+                pl.col("is_imputed_constant").sum().alias("n_imputed_constant"),
+                pl.col("is_organic_constant").sum().alias("n_organic_constant"),
+                pl.col("is_extreme_outlier").sum().alias("n_extreme_outlier"),
+                pl.col("is_non_stationary").sum().alias("n_non_stationary"),
                 pl.col("has_inf").sum().alias("n_with_inf"),
                 pl.col("std").mean().alias("avg_std"),
                 pl.col("skew").abs().mean().alias("avg_abs_skew"),
@@ -288,15 +399,21 @@ def flag_issues(
     group / summarise reasons.
 
     Issue priorities (highest first; first match wins):
-      1. ``residual_nan``  — float NaN survived the impute step
-      2. ``inf``           — ±inf in the column
+      1. ``residual_nan``      — float NaN survived the impute step
+      2. ``inf``               — ±inf in the column
       3. ``scattered_missing`` — pre-impute missing cells are not at
          the edges (warmup / coverage tail); flags either a real data
-         anomaly or an engine bug. Should never go unnoticed.
-      4. ``all_nan``       — column is fully missing
-      5. ``constant``      — std < threshold
-      6. ``high_undef``    — pre-impute undef rate > threshold
-      7. ``heavy_skew``    — |skew| > threshold
+         anomaly or an engine bug
+      4. ``all_nan``           — column is fully missing
+      5. ``extreme_outlier``   — max|x| / median|x≠0| > threshold
+         (catches single-row blowups like denominator-near-zero)
+      6. ``imputed_constant``  — constant value but driven by impute
+         (vs. organic constants like cost__c which are by design)
+      7. ``non_stationary``    — mean drifts > 1σ across chronological
+         thirds OR std-ratio > 100×; alerts on regime-change features
+      8. ``organic_constant``  — constant by design (low priority)
+      9. ``high_undef``        — pre-impute undef rate > threshold
+     10. ``heavy_skew``        — |skew| > threshold
     """
     return (
         health.filter(
@@ -304,7 +421,10 @@ def flag_issues(
             | pl.col("has_inf")
             | (pl.col("null_pattern") == "scattered")
             | pl.col("mean").is_nan()
-            | pl.col("is_constant")
+            | pl.col("is_extreme_outlier")
+            | pl.col("is_imputed_constant")
+            | pl.col("is_non_stationary")
+            | pl.col("is_organic_constant")
             | (pl.col("undef_rate") > max_undef_rate)
             | (pl.col("skew").abs() > max_abs_skew)
         )
@@ -317,8 +437,14 @@ def flag_issues(
             .then(pl.lit("scattered_missing"))
             .when(pl.col("mean").is_nan())
             .then(pl.lit("all_nan"))
-            .when(pl.col("is_constant"))
-            .then(pl.lit("constant"))
+            .when(pl.col("is_extreme_outlier"))
+            .then(pl.lit("extreme_outlier"))
+            .when(pl.col("is_imputed_constant"))
+            .then(pl.lit("imputed_constant"))
+            .when(pl.col("is_non_stationary"))
+            .then(pl.lit("non_stationary"))
+            .when(pl.col("is_organic_constant"))
+            .then(pl.lit("organic_constant"))
             .when(pl.col("undef_rate") > max_undef_rate)
             .then(pl.lit("high_undef"))
             .when(pl.col("skew").abs() > max_abs_skew)
@@ -327,8 +453,8 @@ def flag_issues(
             .alias("issue")
         )
         .sort(
-            ["issue", "missing_rate", "undef_rate"],
-            descending=[False, True, True],
+            ["issue", "outlier_ratio", "missing_rate", "undef_rate"],
+            descending=[False, True, True, True],
         )
     )
 
