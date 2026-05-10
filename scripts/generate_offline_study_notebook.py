@@ -1145,12 +1145,281 @@ print(f"Saved uncertainty summary: {ANALYTICS_DIR / 'research_uncertainty_summar
 print(json.dumps(unc_bundle, indent=2, default=str))
 """))
 
+CELLS.append(md("""## 12. Production-trading audits
+
+Sanity checks the model has to pass before it goes near a live execution path:
+
+1. **Causal feature audit** — every feature in `feature_list` carries the `__f__` (frozen-up-to-now) or `__h__` (instantaneous) suffix; nothing leaks future information by name.
+2. **Label-shuffle baseline** — under permutation of `y`, ROC-AUC concentrates on 0.5 and PR-AUC on the base rate. The real model's metrics must sit above this null distribution.
+3. **Time-block permutation importance** — distinguishes features whose value carries the signal (drop under both shuffles) from features that ride on time-of-row only (drop only under across-block shuffle, suggesting time leak).
+4. **Decision turnover** — at the operating threshold, what's the flip rate of the binary entry decision? Frequent flips destroy net-of-cost performance.
+5. **Deflated Sharpe** (Bailey & Lopez de Prado) — adjusts the per-trade Sharpe for selection bias under `n_trials` HPO attempts and for non-normality of returns.
+6. **Half-vs-half drift audit** — fits a model on the first half of train and another on the second; same predictions on test ⇒ covariate shift only; disagreement ⇒ concept drift in the gap between halves.
+"""))
+
+CELLS.append(code("""from src.analytics.audits import (
+    causal_feature_audit,
+    label_shuffle_baseline,
+    time_block_permutation_importance,
+    decision_turnover,
+    deflated_sharpe,
+    expected_max_sharpe,
+    half_vs_half_drift_audit,
+    plot_label_shuffle_baseline,
+    plot_time_block_permutation,
+    plot_half_vs_half_scatter,
+    plot_decision_turnover_runs,
+)
+from sklearn.metrics import average_precision_score, roc_auc_score
+"""))
+
+# 12.1 — Causal feature audit
+CELLS.append(md("""### 12.1 Causal feature audit
+
+Static naming-convention check on `feature_list`. Pass criterion: no suspect tokens, no unmatched names. CI-runnable.
+"""))
+
+CELLS.append(code("""causal_res = causal_feature_audit(feature_list)
+print(f"features audited: {causal_res.n_features}")
+print(f"  causal (__f__ or __h__): {causal_res.n_causal}")
+print(f"  suspect tokens: {causal_res.n_suspect}")
+print(f"  unmatched (no known suffix): {len(causal_res.unmatched)}")
+print(f"  PASS: {causal_res.passed}")
+if causal_res.suspect:
+    print("\\nSUSPECT TOKENS (first 20):")
+    for f in causal_res.suspect[:20]:
+        print(f"  {f}")
+if causal_res.unmatched:
+    print("\\nUNMATCHED (first 20):")
+    for f in causal_res.unmatched[:20]:
+        print(f"  {f}")
+"""))
+
+# 12.2 — Label-shuffle baseline
+CELLS.append(md("""### 12.2 Label-shuffle baseline
+
+Permute `y_test` 1000 times, recompute ROC-AUC and PR-AUC each time. The real model's metrics should sit comfortably above the 97.5% quantile of the shuffle distribution; if not, the model is statistically indistinguishable from random at this `n`.
+"""))
+
+CELLS.append(code("""y_t = test_cache["y"].to_numpy()
+p_t = test_cache["p"].to_numpy()
+
+shuffle_out = label_shuffle_baseline(y_t, p_t, n_shuffles=1000, random_seed=0)
+
+real_roc = float(roc_auc_score(y_t, p_t))
+real_pr = float(average_precision_score(y_t, p_t))
+print(f"REAL test ROC-AUC: {real_roc:.4f}    shuffle median: {shuffle_out['roc_auc'].point:.4f}    "
+      f"shuffle 95% CI: [{shuffle_out['roc_auc'].ci_low:.4f}, {shuffle_out['roc_auc'].ci_high:.4f}]")
+print(f"REAL test PR-AUC : {real_pr:.4f}    shuffle median: {shuffle_out['pr_auc'].point:.4f}    "
+      f"shuffle 95% CI: [{shuffle_out['pr_auc'].ci_low:.4f}, {shuffle_out['pr_auc'].ci_high:.4f}]")
+print(f"base rate: {shuffle_out['base_rate'].point:.4f}")
+
+passes_roc = real_roc > shuffle_out["roc_auc"].ci_high
+passes_pr = real_pr > shuffle_out["pr_auc"].ci_high
+print(f"\\n  ROC-AUC > shuffle 97.5%? {passes_roc}")
+print(f"  PR-AUC  > shuffle 97.5%? {passes_pr}")
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+plot_label_shuffle_baseline(real_roc, shuffle_out["roc_auc"], metric_name="ROC-AUC", ax=axes[0])
+plot_label_shuffle_baseline(real_pr, shuffle_out["pr_auc"], metric_name="PR-AUC",
+                            base_rate=shuffle_out["base_rate"].point, ax=axes[1])
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "research_label_shuffle.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""))
+
+# 12.3 — Time-block permutation importance
+CELLS.append(md("""### 12.3 Time-block permutation importance
+
+For each candidate feature, shuffle within blocks vs across blocks. A feature with `drop_across >> drop_within` derives most of its value from time-of-row (a smell), not from local feature value.
+
+To keep this fast we run on the top-25 features by SHAP importance from Phase 4, with `n_blocks=8` and `n_repeats=2`.
+"""))
+
+CELLS.append(code("""# Top-25 features by Phase 4 signed effect size (the strongest FP-vs-FN drivers)
+top_feats_for_perm = eff.head(25)["feature"].tolist()
+test_perm_df = test_df.copy()
+perm_imp = time_block_permutation_importance(
+    model,
+    test_perm_df,
+    feature_list,
+    metric="pr_auc",
+    n_blocks=8,
+    features_to_test=top_feats_for_perm,
+    n_repeats=2,
+    random_seed=0,
+)
+print(f"base PR-AUC (test): {perm_imp.attrs['base_score']:.4f}")
+print()
+print(perm_imp.head(10).to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(11, 8))
+plot_time_block_permutation(perm_imp, top_n=20, ax=ax)
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "research_time_block_permutation.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""))
+
+# 12.4 — Decision turnover
+CELLS.append(md("""### 12.4 Decision turnover at the operating threshold
+
+Binary entry decision `act_t = (p_t >= τ)` at the operating threshold. High flip rate ⇒ the model toggles frequently across the threshold ⇒ trade churn under cost. A hysteresis band (`τ_in > τ_out`) is the standard mitigation.
+"""))
+
+CELLS.append(code("""ts_t = test_cache["ts"].to_numpy()
+turnover_threshold = float(COHORT_THRESHOLD)
+
+turnover = decision_turnover(p_t, threshold=turnover_threshold, ts=ts_t)
+print(json.dumps(turnover, indent=2, default=str))
+
+# Compare across a small grid of thresholds
+turnover_grid = pd.DataFrame([
+    decision_turnover(p_t, threshold=t, ts=ts_t)
+    for t in [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+])
+turnover_grid["threshold"] = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+print()
+print(turnover_grid[["threshold", "trade_rate", "flip_rate", "lag1_autocorr",
+                     "mean_run_length_active", "mean_run_length_idle"]].to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(9, 4))
+plot_decision_turnover_runs(p_t, threshold=turnover_threshold, ax=ax)
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "research_decision_turnover.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""))
+
+# 12.5 — Deflated Sharpe
+CELLS.append(md("""### 12.5 Deflated Sharpe (Bailey & Lopez de Prado)
+
+Per-trade returns at the operating threshold, with the **same outcome model** used in Phase 3 (gain on hit = `phi`, loss on miss = `phi`, cost = 5 bps). DSR > 0.95 is the conventional threshold for "significantly better than the best of `n_trials` random backtests, after correcting for non-normality."
+
+We report DSR at three trial counts (`n_trials = 1, 100, 1000`) so you can see the selection-bias correction directly.
+"""))
+
+CELLS.append(code("""# Per-trade realized log-returns at the operating threshold (no realized-return col yet, so use phi)
+sel = (p_t >= turnover_threshold)
+y_sel = y_t[sel]
+phi_t = test_cache["phi"].to_numpy()[sel]
+gain = phi_t
+loss = phi_t  # symmetric outcome — conservative
+cost = 0.0005  # 5 bps fees + half-spread
+per_trade = np.where(y_sel == 1, gain, -loss) - cost
+print(f"trades selected: {len(per_trade)}    hit rate: {y_sel.mean():.3f}    "
+      f"mean per-trade return: {per_trade.mean():+.4f}")
+
+dsr_results = {}
+for n_trials in [1, 100, 1000]:
+    out = deflated_sharpe(per_trade, n_trials=n_trials)
+    dsr_results[n_trials] = out
+    print(f"\\nn_trials = {n_trials}")
+    print(f"  Sharpe (per trade)        : {out['sharpe']:+.4f}")
+    print(f"  E[max Sharpe] (selection) : {out['expected_max_sharpe']:+.4f}")
+    print(f"  z statistic               : {out['deflated_sharpe_z']:+.4f}")
+    print(f"  DSR (Pr Sharpe > E[max])  : {out['deflated_sharpe_prob']:.4f}")
+    print(f"  skew = {out['skew']:+.3f}    kurt = {out['kurtosis']:.3f}    n = {out['n']}")
+"""))
+
+# 12.6 — Half-vs-half drift audit
+CELLS.append(md("""### 12.6 Half-vs-half drift audit
+
+Splits `train_recent` chronologically into two halves; trains a model on each (with smaller iterations to keep this fast); predicts on test. Same predictions ⇒ covariate shift only; disagreement ⇒ concept drift between the halves.
+"""))
+
+CELLS.append(code("""# Use halved iterations to keep this audit fast (we only need the disagreement structure)
+half_params = research_train_params(iterations=600, depth=6, verbose=0,
+                                    early_stopping_rounds=100, random_seed=42)
+half_params2 = research_train_params(iterations=600, depth=6, verbose=0,
+                                     early_stopping_rounds=100, random_seed=43)
+
+t0 = time.time()
+half_res = half_vs_half_drift_audit(
+    train_recent, val_df, test_df, feature_list,
+    threshold=COHORT_THRESHOLD,
+    train_params_first=half_params,
+    train_params_second=half_params2,
+)
+elapsed = time.time() - t0
+print(f"trained two half-models in {elapsed:.1f}s")
+print(f"  n_first = {half_res.n_first}    n_second = {half_res.n_second}")
+print(f"  Spearman rank corr (test predictions): {half_res.spearman_corr:.4f}")
+print(f"  Pearson         corr (test predictions): {half_res.pearson_corr:.4f}")
+print(f"  mean |Δp|: {half_res.mean_abs_diff:.4f}    median |Δp|: {half_res.median_abs_diff:.4f}")
+print(f"  decisions disagree at τ={half_res.threshold}: "
+      f"{half_res.n_disagree_at_threshold} / {len(half_res.p_first)} "
+      f"({half_res.n_disagree_at_threshold / len(half_res.p_first) * 100:.1f}%)")
+print()
+print(f"first-half model on test:  ROC-AUC = {half_res.metrics_first['roc_auc']:.4f}    "
+      f"PR-AUC = {half_res.metrics_first['pr_auc']:.4f}")
+print(f"second-half model on test: ROC-AUC = {half_res.metrics_second['roc_auc']:.4f}    "
+      f"PR-AUC = {half_res.metrics_second['pr_auc']:.4f}")
+
+fig, ax = plt.subplots(figsize=(7, 6.5))
+plot_half_vs_half_scatter(half_res, ax=ax)
+plt.tight_layout()
+plt.savefig(PLOTS_DIR / "research_half_vs_half.png", dpi=150, bbox_inches="tight")
+plt.show()
+"""))
+
+# 12.7 — Persist the audit bundle
+CELLS.append(md("""### 12.7 Persist the audit bundle
+
+Save all audit outputs to a single JSON file for posterity.
+"""))
+
+CELLS.append(code("""audit_bundle = {
+    "causal_audit": {
+        "n_features": causal_res.n_features,
+        "n_causal": causal_res.n_causal,
+        "n_suspect": causal_res.n_suspect,
+        "n_unmatched": len(causal_res.unmatched),
+        "passed": causal_res.passed,
+        "suspect": causal_res.suspect,
+        "unmatched_first_20": causal_res.unmatched[:20],
+    },
+    "label_shuffle": {
+        "real_roc_auc": real_roc,
+        "real_pr_auc": real_pr,
+        "shuffle_roc_auc_median": shuffle_out["roc_auc"].point,
+        "shuffle_roc_auc_ci": [shuffle_out["roc_auc"].ci_low, shuffle_out["roc_auc"].ci_high],
+        "shuffle_pr_auc_median": shuffle_out["pr_auc"].point,
+        "shuffle_pr_auc_ci": [shuffle_out["pr_auc"].ci_low, shuffle_out["pr_auc"].ci_high],
+        "base_rate": shuffle_out["base_rate"].point,
+        "passes_roc": bool(passes_roc),
+        "passes_pr": bool(passes_pr),
+    },
+    "time_block_permutation": {
+        "metric": perm_imp.attrs["metric"],
+        "base_score": perm_imp.attrs["base_score"],
+        "n_blocks": perm_imp.attrs["n_blocks"],
+        "top_5_by_drop_across": perm_imp.head(5).to_dict(orient="records"),
+    },
+    "decision_turnover": turnover,
+    "deflated_sharpe": {
+        f"n_trials_{k}": v for k, v in dsr_results.items()
+    },
+    "half_vs_half": {
+        "n_first": half_res.n_first,
+        "n_second": half_res.n_second,
+        "spearman_corr": half_res.spearman_corr,
+        "pearson_corr": half_res.pearson_corr,
+        "mean_abs_diff": half_res.mean_abs_diff,
+        "median_abs_diff": half_res.median_abs_diff,
+        "n_disagree_at_threshold": half_res.n_disagree_at_threshold,
+        "threshold": half_res.threshold,
+        "metrics_first": half_res.metrics_first,
+        "metrics_second": half_res.metrics_second,
+    },
+}
+utils.save_json(ANALYTICS_DIR / "research_audits_bundle.json", audit_bundle)
+print(f"Saved audit bundle: {ANALYTICS_DIR / 'research_audits_bundle.json'}")
+print(json.dumps(audit_bundle, indent=2, default=str))
+"""))
+
 CELLS.append(md("""---
-End of Phase 0+1+2+2b+3+4+5 deliverables.
+End of Phase 0+1+2+2b+3+4+5+6 deliverables.
 
-Subsequent section lands when Phase 6 is built:
-
-- **Phase 6** `audits.py` -> label-shuffle, future-feature audit, time-block permutation, turnover, latency-budget, deflated Sharpe; covariate-vs-concept drift test
+The notebook is now a complete bootstrap-certified offline-study harness covering: certified core metrics + per-regime breakdown, banded ROC / PR / calibration curves, rolling-window degradation + Murphy decomposition + PSI/KS + Page-Hinkley, conditional precision heatmap, threshold sweep + EV vs trades-per-day + Kelly + partial AUC + lift, SHAP cohort decomposition (TP/FP/TN/FN) with discriminative-SHAP, virtual-ensemble uncertainty (decomposition + hit-rate heatmap + joint gate + variance reliability), and the production-trading audit suite (causal, shuffle, time-block permutation, turnover, deflated Sharpe, half-vs-half drift).
 """))
 
 
