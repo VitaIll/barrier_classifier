@@ -1,5 +1,6 @@
 pandas>=2.0
 numpy>=1.24
+polars>=1.21
 pyarrow>=14.0
 catboost>=1.2
 optuna>=3.6
@@ -11,3 +12,4 @@ seaborn>=0.13
 requests>=2.31
 tqdm>=4.66
 jupyter>=1.0
+pytest>=8.0

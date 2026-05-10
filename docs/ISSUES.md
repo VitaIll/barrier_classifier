@@ -1,3 +1,5 @@
+> **LEGACY — DO NOT USE AS SOURCE OF TRUTH.** This document predates the ongoing refactor and may not reflect current code. Kept for historical reference only.
+
 # Issues Log
 
 ## Volatility Semivariance Ratio Definition

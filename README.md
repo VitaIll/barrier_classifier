@@ -1,3 +1,5 @@
+> **LEGACY — DO NOT USE AS SOURCE OF TRUTH.** This document predates the ongoing refactor and may not reflect current code. Kept for historical reference only.
+
 # Minimal Barrier-Crossing Classifier (BTCUSDT 1m)
 
 Offline binary classification on Binance 1-minute klines, predicting whether price crosses an upward log-return barrier within a fixed horizon.

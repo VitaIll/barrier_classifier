@@ -1,0 +1,522 @@
+"""Derivatives feature families (spec Appendix E).
+
+Six sub-families ported from utils.compute_basis_features /
+compute_flow_features / compute_oi_features / compute_funding_features /
+compute_options_features / compute_vol_index_features.
+
+All are Tier-1; derivatives base series (basis_abs, basis_pct,
+tb_ratio_fut, net_vol_fut, pcr_oi, pcr_vol) is computed by the legacy
+``utils.compute_derivatives_base_series`` and assumed already on the
+bars frame at engine entry. We do not re-implement that base step in
+the engine; it is base-series machinery (like compute_base_series).
+
+Output columns and parity hazards documented at each Feature class.
+"""
+
+from __future__ import annotations
+
+import math
+from typing import ClassVar
+
+import polars as pl
+
+from src.features.base import Feature
+from src.features.config import EPS
+from src.features.primitives import (
+    ewm_mean,
+    rolling_mean,
+    rolling_std_pop,
+    rolling_sum,
+)
+
+
+# =============================================================================
+# basis family (perpetual futures vs spot)
+# =============================================================================
+
+
+class BasisAbs(Feature):
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("basis_abs",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "basis__abs__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("basis_abs")
+
+
+class BasisPct(Feature):
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("basis_pct",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "basis__pct__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("basis_pct")
+
+
+class BasisAnnYield(Feature):
+    """Annualised yield from spot↔fut basis with funding-aware time scaling.
+
+    tau (minutes-to-next-funding) clipped to [60, 480]; legacy uses funding
+    boundaries at 8h, 16h, 24h UTC (utils.py:2572-2581). Cast hour/minute
+    to Int32 to avoid Int8 overflow on hour*60.
+    """
+
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("ts", "close", "close_fut")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "basis__ann_yield__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        ts = pl.col("ts")
+        minute = ts.dt.hour().cast(pl.Int32) * 60 + ts.dt.minute().cast(pl.Int32)
+        next_funding = (
+            pl.when(minute < 8 * 60).then(8 * 60)
+            .when(minute < 16 * 60).then(16 * 60)
+            .otherwise(24 * 60)
+        )
+        tau = (next_funding - minute).cast(pl.Float64).clip(lower_bound=60.0, upper_bound=480.0)
+        basis_ratio = (pl.col("close_fut") - pl.col("close")) / (pl.col("close") + EPS)
+        return basis_ratio * (365.0 * 24.0 * 60.0 / tau) * 100.0
+
+
+class BasisChg(Feature):
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("basis_pct",)
+    windows: ClassVar[tuple[int, ...]] = (5,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"basis__chg__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        b = pl.col("basis_pct")
+        return b - b.shift(w)
+
+
+class BasisMean(Feature):
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("basis_pct",)
+    windows: ClassVar[tuple[int, ...]] = (5, 60)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"basis__mean__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return rolling_mean(pl.col("basis_pct"), w)
+
+
+class BasisStd(Feature):
+    family: ClassVar[str] = "deriv_basis"
+    tier: ClassVar[int | str] = 1
+    inputs = ("basis_pct",)
+    windows: ClassVar[tuple[int, ...]] = (5, 60)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"basis__std__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return rolling_std_pop(pl.col("basis_pct"), w)
+
+
+# =============================================================================
+# flow family
+# =============================================================================
+
+
+class FlowTakerBuyRatio(Feature):
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("tb_ratio_fut",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "flow__taker_buy_ratio__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("tb_ratio_fut")
+
+
+class FlowNetVolBtcs(Feature):
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("net_vol_fut",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "flow__net_vol_btcs__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("net_vol_fut")
+
+
+class FlowNetVolCsum(Feature):
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("net_vol_fut",)
+    windows: ClassVar[tuple[int, ...]] = (5, 10, 20)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"flow__net_vol_csum__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return rolling_sum(pl.col("net_vol_fut"), w)
+
+
+class FlowFutVsSpotVol(Feature):
+    """fut quote-vol over spot quote-vol (null when spot ≤ 0)."""
+
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("quote_volume", "quote_volume_fut")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "liq__fut_vs_spot_vol__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        qv = pl.col("quote_volume")
+        qvf = pl.col("quote_volume_fut")
+        return pl.when(qv > 0).then(qvf / (qv + EPS)).otherwise(None)
+
+
+class FlowAvgTradeSizeInst(Feature):
+    """Per-bar avg trade size (volume / num_trades), null when num_trades ≤ 0."""
+
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("volume_fut", "num_trades_fut")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "liq__avg_trade_size__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        nt = pl.col("num_trades_fut")
+        return pl.when(nt > 0).then(pl.col("volume_fut") / (nt + EPS)).otherwise(None)
+
+
+class FlowAvgTradeSize15(Feature):
+    """15-bar windowed avg trade size."""
+
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("volume_fut", "num_trades_fut")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "liq__avg_trade_size__f__w15"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        vol_15 = rolling_sum(pl.col("volume_fut"), 15)
+        trades_15 = rolling_sum(pl.col("num_trades_fut"), 15)
+        return pl.when(trades_15 > 0).then(vol_15 / (trades_15 + EPS)).otherwise(None)
+
+
+class FlowTradesZscore30(Feature):
+    """30-bar z-score of futures trades count.
+
+    Legacy guards with strict ``std_30 > 0`` and uses ``+ EPS`` in the
+    denominator (utils.py:2651-2655). Reproduce both.
+    """
+
+    family: ClassVar[str] = "deriv_flow"
+    tier: ClassVar[int | str] = 1
+    inputs = ("num_trades_fut",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "activity__trades_zscore__f__w30"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        n = pl.col("num_trades_fut")
+        mu = rolling_mean(n, 30)
+        sigma = rolling_std_pop(n, 30)
+        return pl.when(sigma > 0).then((n - mu) / (sigma + EPS)).otherwise(None)
+
+
+# =============================================================================
+# oi family
+# =============================================================================
+
+
+class OiTotalUsd(Feature):
+    family: ClassVar[str] = "deriv_oi"
+    tier: ClassVar[int | str] = 1
+    inputs = ("oi_usd",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "oi__total_usd__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("oi_usd")
+
+
+class OiChg(Feature):
+    family: ClassVar[str] = "deriv_oi"
+    tier: ClassVar[int | str] = 1
+    inputs = ("oi_usd",)
+    windows: ClassVar[tuple[int, ...]] = (60,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__chg__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        oi = pl.col("oi_usd")
+        return oi - oi.shift(w)
+
+
+class OiChgPct(Feature):
+    family: ClassVar[str] = "deriv_oi"
+    tier: ClassVar[int | str] = 1
+    inputs = ("oi_usd",)
+    windows: ClassVar[tuple[int, ...]] = (60,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__chg_pct__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        oi = pl.col("oi_usd")
+        prev = oi.shift(w)
+        return (oi - prev) / (prev + EPS) * 100.0
+
+
+class OiVolRatio(Feature):
+    family: ClassVar[str] = "deriv_oi"
+    tier: ClassVar[int | str] = 1
+    inputs = ("oi_usd", "quote_volume_fut")
+    windows: ClassVar[tuple[int, ...]] = (60,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__vol_ratio__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        oi = pl.col("oi_usd")
+        qv = rolling_sum(pl.col("quote_volume_fut"), w)
+        return pl.when(qv > 0).then(oi / (qv + EPS)).otherwise(None)
+
+
+class OiPriceCorr(Feature):
+    """Sample (ddof=1) correlation between diff(oi) and r over 120 bars.
+
+    Parity note: legacy uses pandas ``.corr()`` which is **sample**
+    correlation (ddof=1) — diverges from the population convention used
+    in compute_correlations. Reproduce sample correlation here via
+    polars' native ``rolling_corr`` (which is also sample, ddof=1).
+    """
+
+    family: ClassVar[str] = "deriv_oi"
+    tier: ClassVar[int | str] = 1
+    inputs = ("oi_usd", "r")
+    windows: ClassVar[tuple[int, ...]] = (120,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__price_corr__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        oi_diff = pl.col("oi_usd").diff()
+        return pl.rolling_corr(oi_diff, pl.col("r"), window_size=w, min_samples=w, ddof=1)
+
+
+# =============================================================================
+# funding family
+# =============================================================================
+
+
+class FundingRate(Feature):
+    family: ClassVar[str] = "deriv_funding"
+    tier: ClassVar[int | str] = 1
+    inputs = ("funding_rate",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "funding__rate__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("funding_rate") * 100.0
+
+
+class FundingEwma(Feature):
+    family: ClassVar[str] = "deriv_funding"
+    tier: ClassVar[int | str] = 1
+    inputs = ("funding_rate",)
+    windows: ClassVar[tuple[int, ...]] = (1440,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"funding__ewma__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return ewm_mean(pl.col("funding_rate") * 100.0, span=w, adjust=False)
+
+
+class FundingTrend(Feature):
+    family: ClassVar[str] = "deriv_funding"
+    tier: ClassVar[int | str] = 1
+    inputs = ("funding_rate",)
+    windows: ClassVar[tuple[int, ...]] = (4320,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"funding__trend__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        rate = pl.col("funding_rate") * 100.0
+        return rate - rolling_mean(rate, w)
+
+
+# =============================================================================
+# options family
+# =============================================================================
+
+
+class OptPcrOi(Feature):
+    family: ClassVar[str] = "deriv_options"
+    tier: ClassVar[int | str] = 1
+    inputs = ("pcr_oi",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "opt_pcr__oi__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("pcr_oi")
+
+
+class OptPcrVol(Feature):
+    family: ClassVar[str] = "deriv_options"
+    tier: ClassVar[int | str] = 1
+    inputs = ("pcr_vol",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "opt_pcr__vol__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("pcr_vol")
+
+
+class OptPcrOiChg(Feature):
+    family: ClassVar[str] = "deriv_options"
+    tier: ClassVar[int | str] = 1
+    inputs = ("pcr_oi",)
+    windows: ClassVar[tuple[int, ...]] = (1440,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"opt_pcr__oi_chg__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        p = pl.col("pcr_oi")
+        return p - p.shift(w)
+
+
+class OptOiTotalUsd(Feature):
+    family: ClassVar[str] = "deriv_options"
+    tier: ClassVar[int | str] = 1
+    inputs = ("opt_oi",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "opt_oi__total_usd__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("opt_oi")
+
+
+class OptVol24hUsd(Feature):
+    family: ClassVar[str] = "deriv_options"
+    tier: ClassVar[int | str] = 1
+    inputs = ("opt_volume",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "opt_vol__24h_usd__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("opt_volume")
+
+
+# =============================================================================
+# vol_idx family
+# =============================================================================
+
+
+class VolIdxBvol30d(Feature):
+    family: ClassVar[str] = "deriv_volidx"
+    tier: ClassVar[int | str] = 1
+    inputs = ("bvol",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "vol_idx__bvol30d__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return pl.col("bvol")
+
+
+class VolIdxBvolChg(Feature):
+    family: ClassVar[str] = "deriv_volidx"
+    tier: ClassVar[int | str] = 1
+    inputs = ("bvol",)
+    windows: ClassVar[tuple[int, ...]] = (1440,)
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"vol_idx__bvol_chg__f__w{w}"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        b = pl.col("bvol")
+        return b - b.shift(w)
+
+
+class VolRealized30d(Feature):
+    """Annualised realised vol from r over 30 days = 43200 minutes."""
+
+    family: ClassVar[str] = "deriv_volidx"
+    tier: ClassVar[int | str] = 1
+    inputs = ("r",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "vol_realized__30d__f__w43200"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        # 525600 minutes per year; std × sqrt(525600) × 100.
+        return rolling_std_pop(pl.col("r"), 43200) * math.sqrt(525600.0) * 100.0
+
+
+class VolRiskPremiumDiff(Feature):
+    family: ClassVar[str] = "deriv_volidx"
+    tier: ClassVar[int | str] = 1
+    inputs = ("bvol", "r")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "vol_risk_premium__diff__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        rv = rolling_std_pop(pl.col("r"), 43200) * math.sqrt(525600.0) * 100.0
+        return pl.col("bvol") - rv
+
+
+class VolRiskPremiumRatio(Feature):
+    family: ClassVar[str] = "deriv_volidx"
+    tier: ClassVar[int | str] = 1
+    inputs = ("bvol", "r")
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    def column_name(self, w: int | None = None) -> str:
+        return "vol_risk_premium__ratio__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        rv = rolling_std_pop(pl.col("r"), 43200) * math.sqrt(525600.0) * 100.0
+        return pl.col("bvol") / (rv + EPS)

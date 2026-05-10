@@ -1,3 +1,5 @@
+> **LEGACY — DO NOT USE AS SOURCE OF TRUTH.** This document predates the ongoing refactor and may not reflect current code. Kept for historical reference only.
+
 # Changelog
 
 ## 2026-01-01
