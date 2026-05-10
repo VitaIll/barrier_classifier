@@ -64,12 +64,53 @@ _DERIVATIVES_FAMILIES: tuple[str, ...] = (
 )
 
 
+# Columns that are NOT model features even though they sit on the boundary
+# frame. Mirrors the notebook's NON_FEATURE_COLS contract — labels, weights,
+# raw OHLCV, base series, and derivatives base series.
+_LABEL_AUX_COLS: tuple[str, ...] = ("k", "ts", "y", "m_k", "tau_k", "phi")
+_RAW_COLS: tuple[str, ...] = (
+    "open", "high", "low", "close", "volume", "quote_volume",
+    "num_trades", "taker_buy_base", "taker_buy_quote",
+)
+_BASE_COLS: tuple[str, ...] = (
+    "p", "r", "rho", "r_oc", "g", "logvol", "logtrades", "logquotevol",
+    "b", "ofi", "clv", "bodyfrac", "wickup", "wickdn", "vwap", "vwapdev",
+    "qpertrade",
+)
+_DERIV_BASE_COLS: tuple[str, ...] = (
+    "close_fut", "volume_fut", "quote_volume_fut", "taker_buy_base_fut",
+    "num_trades_fut", "funding_rate", "oi_usd", "opt_oi",
+    "put_open_interest", "call_open_interest", "opt_volume", "put_volume",
+    "call_volume", "bvol", "basis_abs", "basis_pct", "tb_ratio_fut",
+    "net_vol_fut", "pcr_oi", "pcr_vol",
+)
+
+
 def _to_polars(df_pd: pd.DataFrame) -> pl.DataFrame:
     """pandas → polars with tz stripped (keeps Datetime dtype on Windows)."""
     df = df_pd.copy()
     if df.index.tz is not None:
         df.index = df.index.tz_localize(None)
     return pl.from_pandas(df.reset_index(names="ts"))
+
+
+def _coerce_expected_numeric(df_pl: pl.DataFrame) -> pl.DataFrame:
+    """Force any expected-numeric column to ``Float64`` with null preservation.
+
+    A left-join onto a date range outside the EOH coverage window (e.g.
+    2025 bars joined against 2023-05..2023-10 EOH option data) produces
+    an all-null column. ``pl.from_pandas`` of such a column can land as
+    ``Object``/``str`` dtype, which then breaks downstream feature compute
+    (``pl.col(...).is_infinite()`` rejects ``str``). Cast defensively here.
+    """
+    expected_numeric = set(_RAW_COLS) | set(_BASE_COLS) | set(_DERIV_BASE_COLS)
+    casts: list[pl.Expr] = []
+    for col in df_pl.columns:
+        if col in expected_numeric and df_pl.schema[col] != pl.Float64:
+            casts.append(pl.col(col).cast(pl.Float64, strict=False).alias(col))
+    if casts:
+        df_pl = df_pl.with_columns(casts)
+    return df_pl
 
 
 def run_pipeline(
@@ -95,8 +136,8 @@ def run_pipeline(
     if with_derivatives:
         df_pd = _legacy.compute_derivatives_base_series(df_pd)
 
-    df_pl = _to_polars(df_pd)
-    df_raw_pl = _to_polars(df_raw_pd)
+    df_pl = _coerce_expected_numeric(_to_polars(df_pd))
+    df_raw_pl = _coerce_expected_numeric(_to_polars(df_raw_pd))
 
     # --- Stage 3: bar-level features (Tier 1 + Tier 2) ---------------------
     families = list(_DEFAULT_FAMILIES_NO_DERIV)
@@ -131,8 +172,13 @@ def run_pipeline(
     )
 
     # --- Stage 11: undef flags + imputation -------------------------------
-    label_aux = ("k", "ts", "y", "m_k", "tau_k", "phi")
-    feature_cols = [c for c in df_boundaries.columns if c not in label_aux]
+    # Feature columns = everything on the boundary frame that is NOT a
+    # label, weight, raw bar, base series, or derivatives base series.
+    # Without this exclusion the impute step tries to is_infinite() check
+    # an all-null Object-dtyped column (e.g. opt_oi outside EOH coverage),
+    # which polars rejects.
+    non_feature = set(_LABEL_AUX_COLS + _RAW_COLS + _BASE_COLS + _DERIV_BASE_COLS)
+    feature_cols = [c for c in df_boundaries.columns if c not in non_feature]
     df_final, _ = create_undef_flags_and_impute_pl(
         df_boundaries,
         feature_cols,
