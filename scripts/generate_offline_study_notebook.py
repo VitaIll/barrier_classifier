@@ -979,12 +979,177 @@ utils.save_json(ANALYTICS_DIR / "research_cohort_summary.json", cohort_bundle)
 print(f"Saved cohort summary: {ANALYTICS_DIR / 'research_cohort_summary.json'}")
 """))
 
+CELLS.append(md("""## 11. Virtual-ensemble uncertainty
+
+The research model was trained with `posterior_sampling=True` (Stochastic Gradient Langevin Boosting) which lets us slice the trained tree sequence into K overlapping virtual ensembles and decompose predictive uncertainty:
+
+- **Total** uncertainty = H[E_b[p_b]] — what the model is unsure about overall
+- **Data** uncertainty = E_b[H(p_b)] — irreducible aleatoric noise the data carries
+- **Knowledge** uncertainty = MI = Total - Data — epistemic; high values flag inputs far from training distribution
+
+Operating idea: instead of a scalar gate `p >= τ_p`, use a **joint gate** `p >= τ_p AND knowledge_unc <= τ_unc`. If knowledge uncertainty is informative, this should improve precision at fixed trade rate (the points in the joint-gate scatter sit *above* the scalar-p baseline).
+
+Validation that uncertainty is informative: the **(p decile × knowledge_unc decile) heatmap of empirical hit rate** should show monotone decrease left-to-right at fixed row. If not, the uncertainty signal is dead.
+"""))
+
+CELLS.append(code("""from src.analytics.uncertainty import (
+    hit_rate_heatmap,
+    joint_gate_sweep,
+    plot_hit_rate_heatmap_2d,
+    plot_joint_gate_vs_scalar_p,
+    plot_uncertainty_distributions_by_cohort,
+    plot_variance_reliability,
+    predictive_uncertainty,
+    variance_reliability,
+    virtual_ensemble_predictions,
+)
+
+VE_K = 10  # number of virtual ensembles
+
+print(f"Computing virtual-ensemble predictions on test ({len(test_df):,} rows, K={VE_K}) ...")
+t0 = time.perf_counter()
+p_ve_test = virtual_ensemble_predictions(
+    model, test_df, virtual_ensembles_count=VE_K, feature_list=feature_list
+)
+print(f"VE predictions in {time.perf_counter() - t0:.1f}s, shape={p_ve_test.shape}")
+
+unc_test = predictive_uncertainty(p_ve_test)
+print()
+print(f"mean_p              : mean={unc_test['mean_p'].mean():.4f}, max={unc_test['mean_p'].max():.4f}")
+print(f"total_uncertainty   : mean={unc_test['total_uncertainty'].mean():.4f}, max={unc_test['total_uncertainty'].max():.4f}")
+print(f"data_uncertainty    : mean={unc_test['data_uncertainty'].mean():.4f}, max={unc_test['data_uncertainty'].max():.4f}")
+print(f"knowledge_uncertainty: mean={unc_test['knowledge_uncertainty'].mean():.4f}, max={unc_test['knowledge_uncertainty'].max():.4f}")
+print(f"knowledge / total ratio (mean): {(unc_test['knowledge_uncertainty'] / np.maximum(unc_test['total_uncertainty'], 1e-12)).mean():.3f}")
+"""))
+
+CELLS.append(code("""# Per-cohort distribution of knowledge uncertainty
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+for ax, comp in zip(axes, ["total_uncertainty", "data_uncertainty", "knowledge_uncertainty"]):
+    plot_uncertainty_distributions_by_cohort(cohorts, unc_test, component=comp, ax=ax)
+fig.suptitle("Uncertainty per cohort (TP / FP / TN / FN)")
+plt.tight_layout(rect=[0, 0, 1, 0.95])
+fig.savefig(PLOTS_DIR / "research_uncertainty_by_cohort.png", dpi=150)
+plt.show()
+print(f"Saved: {PLOTS_DIR / 'research_uncertainty_by_cohort.png'}")
+
+# Quick summary table
+unc_by_cohort = pd.DataFrame({
+    "cohort": ["TP", "FP", "TN", "FN"],
+    "n": [int((cohorts == c).sum()) for c in ["TP", "FP", "TN", "FN"]],
+    "mean_p_mean": [float(unc_test["mean_p"][cohorts == c].mean()) if (cohorts == c).any() else np.nan for c in ["TP", "FP", "TN", "FN"]],
+    "knowledge_unc_mean": [float(unc_test["knowledge_uncertainty"][cohorts == c].mean()) if (cohorts == c).any() else np.nan for c in ["TP", "FP", "TN", "FN"]],
+    "knowledge_unc_median": [float(np.median(unc_test["knowledge_uncertainty"][cohorts == c])) if (cohorts == c).any() else np.nan for c in ["TP", "FP", "TN", "FN"]],
+})
+display(unc_by_cohort.style.format({"mean_p_mean": "{:.4f}", "knowledge_unc_mean": "{:.5f}", "knowledge_unc_median": "{:.5f}"}))
+"""))
+
+CELLS.append(code("""# 2D heatmap: empirical hit rate by (mean_p decile x knowledge_unc decile)
+hr_grid = hit_rate_heatmap(
+    test_y, unc_test["mean_p"], unc_test["knowledge_uncertainty"],
+    n_bins_p=8, n_bins_unc=8,
+)
+fig, ax = plt.subplots(figsize=(11, 5.2))
+plot_hit_rate_heatmap_2d(hr_grid, ax=ax, annotate=True)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_hit_rate_by_p_unc.png", dpi=150)
+plt.show()
+
+# Validation: at the highest p decile, hit rate should drop as unc rises
+top_p_bin = hr_grid["p_bin"].max()
+top_p_row = hr_grid[hr_grid["p_bin"] == top_p_bin].sort_values("unc_bin")
+print(f"At top mean_p decile (p_bin={top_p_bin}, mean_p in [{top_p_row['p_lo'].iloc[0]:.3f}, {top_p_row['p_hi'].iloc[0]:.3f}]):")
+for _, row in top_p_row.iterrows():
+    print(f"  unc_bin {int(row['unc_bin'])}  unc in [{row['unc_lo']:.5f}, {row['unc_hi']:.5f}]  "
+          f"n={int(row['n'])}  hit_rate={row['hit_rate']:.3f} [{row['ci_low']:.3f}, {row['ci_high']:.3f}]")
+"""))
+
+CELLS.append(code("""# Variance reliability: predicted data_uncertainty vs observed (y - mean_p)^2
+predicted_var_test = unc_test["data_uncertainty"]
+observed_sq_err = (test_y - unc_test["mean_p"]) ** 2
+var_rel = variance_reliability(predicted_var_test, observed_sq_err, n_bins=10)
+
+fig, ax = plt.subplots(figsize=(7, 6))
+plot_variance_reliability(var_rel, ax=ax)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_variance_reliability.png", dpi=150)
+plt.show()
+
+print()
+print("Variance reliability per bin (perfect calibration -> ratio = 1):")
+display(var_rel.style.format({
+    "var_lo": "{:.5f}", "var_hi": "{:.5f}",
+    "mean_predicted_var": "{:.5f}", "mean_observed_sq_error": "{:.5f}",
+    "ratio_obs_over_pred": "{:.3f}",
+}))
+print()
+mean_ratio = float(var_rel["ratio_obs_over_pred"].mean())
+print(f"Mean ratio (observed / predicted) = {mean_ratio:.3f}")
+print(f"  > 1 -> model is under-confident (predicted variance underestimates true)")
+print(f"  < 1 -> model is over-confident (predicted variance overstates true)")
+"""))
+
+CELLS.append(code("""# Joint gate sweep: precision at every (tau_p, tau_unc) combination
+p_thresholds = np.linspace(0.10, float(unc_test["mean_p"].max()) - 0.05, 12)
+unc_thresholds = np.quantile(unc_test["knowledge_uncertainty"], np.linspace(0.1, 1.0, 8))
+
+sweep_joint = joint_gate_sweep(
+    test_y, unc_test["mean_p"], unc_test["knowledge_uncertainty"],
+    p_thresholds=p_thresholds, unc_thresholds=unc_thresholds,
+)
+print(f"Joint-gate sweep: {len(sweep_joint)} (tau_p, tau_unc) cells")
+
+fig, ax = plt.subplots(figsize=(11, 5.5))
+plot_joint_gate_vs_scalar_p(sweep_joint, ax=ax)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_joint_gate.png", dpi=150)
+plt.show()
+
+# Comparison: at a fixed trade rate, what's the precision lift from the joint gate?
+scalar_only = sweep_joint[sweep_joint["unc_threshold"] == sweep_joint["unc_threshold"].max()]
+joint_strict = sweep_joint[sweep_joint["unc_threshold"] == sweep_joint["unc_threshold"].min()]
+print()
+print("Scalar-p baseline (no uncertainty filtering):")
+display(scalar_only[["p_threshold", "trade_rate", "n_selected", "precision",
+                     "precision_ci_low", "precision_ci_high"]].head(8).style.format({
+    "p_threshold": "{:.3f}", "trade_rate": "{:.4f}", "precision": "{:.3f}",
+    "precision_ci_low": "{:.3f}", "precision_ci_high": "{:.3f}",
+}))
+print()
+print("Joint gate (strictest unc threshold = lowest decile):")
+display(joint_strict[["p_threshold", "unc_threshold", "trade_rate", "n_selected",
+                      "precision", "precision_ci_low", "precision_ci_high"]].head(8).style.format({
+    "p_threshold": "{:.3f}", "unc_threshold": "{:.5f}", "trade_rate": "{:.4f}",
+    "precision": "{:.3f}", "precision_ci_low": "{:.3f}", "precision_ci_high": "{:.3f}",
+}))
+"""))
+
+CELLS.append(code("""# Save uncertainty bundle
+import json
+unc_bundle = {
+    "config": {"K": VE_K, "n_bins_p": 8, "n_bins_unc": 8},
+    "summary_stats": {
+        "mean_p_mean": float(unc_test["mean_p"].mean()),
+        "total_uncertainty_mean": float(unc_test["total_uncertainty"].mean()),
+        "data_uncertainty_mean": float(unc_test["data_uncertainty"].mean()),
+        "knowledge_uncertainty_mean": float(unc_test["knowledge_uncertainty"].mean()),
+        "knowledge_over_total_mean_ratio": float(
+            (unc_test["knowledge_uncertainty"] / np.maximum(unc_test["total_uncertainty"], 1e-12)).mean()
+        ),
+    },
+    "by_cohort": unc_by_cohort.to_dict(orient="records"),
+    "variance_reliability_mean_ratio": float(var_rel["ratio_obs_over_pred"].mean()),
+    "joint_gate_strictest_unc": float(unc_thresholds[0]),
+}
+utils.save_json(ANALYTICS_DIR / "research_uncertainty_summary.json", unc_bundle)
+print(f"Saved uncertainty summary: {ANALYTICS_DIR / 'research_uncertainty_summary.json'}")
+print(json.dumps(unc_bundle, indent=2, default=str))
+"""))
+
 CELLS.append(md("""---
-End of Phase 0+1+2+2b+3+4 deliverables.
+End of Phase 0+1+2+2b+3+4+5 deliverables.
 
-Subsequent sections land as the corresponding analytics phases are built:
+Subsequent section lands when Phase 6 is built:
 
-- **Phase 5** `uncertainty.py` -> virtual-ensemble MI / total / data entropy decomposition, (p, knowledge_unc) gating
 - **Phase 6** `audits.py` -> label-shuffle, future-feature audit, time-block permutation, turnover, latency-budget, deflated Sharpe; covariate-vs-concept drift test
 """))
 
