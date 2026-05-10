@@ -813,14 +813,179 @@ print(f"Saved edge summary: {ANALYTICS_DIR / 'research_edge_summary.json'}")
 print(json.dumps(edge_bundle, indent=2, default=str))
 """))
 
+CELLS.append(md("""## 10. SHAP cohort decomposition (TP / FP / TN / FN)
+
+Where do the model's *errors* come from at the feature level? TreeSHAP gives per-row, per-feature contribution to the log-odds; aggregating within cohorts then reveals systematic biases.
+
+The headline view: **signed effect-size disagreement** = `(mean SHAP on FPs - mean SHAP on FNs) / pooled std`. Features at the top of this ranking are pushing the model toward FPs and away from FNs (or vice versa) — exactly the "inconsistent direction" features that are candidates for carve-out or stabilization.
+
+Three views:
+1. **Top-N by signed effect-size disagreement** (the standardized ranking).
+2. **Top-N with bootstrap CI on the raw mean(FP) - mean(FN) difference** — filter the shortlist by survival under sampling noise; bars whose CI excludes 0 are statistically significant disagreements.
+3. **Discriminative SHAP** — L2 logistic regression of `{FP=1, FN=0}` on per-row SHAP, which handles cross-feature correlations the mean-only views ignore. Ranked by `|coef|`.
+
+Bonus: the grouped-cohort barplot for the top features shows the actual SHAP magnitudes per (TP / FP / TN / FN), not just the differences.
+"""))
+
+CELLS.append(code("""from src.analytics.cohorts import (
+    bootstrap_shap_diff,
+    cohort_assignments,
+    cohort_counts,
+    cohort_mean_shap,
+    compute_shap_values,
+    discriminative_shap,
+    plot_bootstrap_shap_diff_with_ci,
+    plot_signed_effect_size,
+    plot_top_features_grouped_by_cohort,
+    signed_effect_size_disagreement,
+)
+
+COHORT_THRESHOLD = 0.30  # operating threshold from the threshold sweep
+TOP_N_FEATURES = 15
+
+print(f"Computing SHAP on test ({len(test_df):,} rows x {len(feature_list):,} features) ...")
+t0 = time.perf_counter()
+shap_test = compute_shap_values(model, test_df, feature_list=feature_list)
+print(f"SHAP computed in {time.perf_counter() - t0:.1f}s, shape={shap_test.shape}")
+
+# Cohort assignment at the operating threshold
+test_y = test_cache["y"].to_numpy()
+test_p = test_cache["p"].to_numpy()
+cohorts = cohort_assignments(test_y, test_p, threshold=COHORT_THRESHOLD)
+counts = cohort_counts(cohorts)
+print(f"Cohort counts at threshold {COHORT_THRESHOLD}: {counts}")
+"""))
+
+CELLS.append(code("""# Per-cohort mean SHAP (long-form)
+mean_shap_long = cohort_mean_shap(shap_test, cohorts, feature_list)
+
+# Signed effect-size disagreement
+eff = signed_effect_size_disagreement(shap_test, cohorts, feature_list)
+print(f"Top {TOP_N_FEATURES} features by signed effect-size disagreement:")
+display(eff.head(TOP_N_FEATURES).style.format({
+    "mean_shap_fp": "{:.4f}", "mean_shap_fn": "{:.4f}",
+    "shap_diff_fp_minus_fn": "{:.4f}", "pooled_std": "{:.4f}",
+    "effect_size": "{:.3f}", "abs_effect_size": "{:.3f}",
+}))
+
+# Plot
+fig, ax = plt.subplots(figsize=(10, 6.5))
+plot_signed_effect_size(eff, top_n=TOP_N_FEATURES, ax=ax)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_signed_effect_size.png", dpi=150)
+plt.show()
+print(f"Saved: {PLOTS_DIR / 'research_signed_effect_size.png'}")
+"""))
+
+CELLS.append(code("""# Bootstrap CI on (mean SHAP FP - mean SHAP FN) per feature
+t0 = time.perf_counter()
+diff_ci = bootstrap_shap_diff(
+    shap_test, cohorts, feature_list,
+    B=BOOTSTRAP_B, ci=BOOTSTRAP_CI, seed=BOOTSTRAP_SEED,
+)
+print(f"Bootstrap shap-diff: {time.perf_counter() - t0:.1f}s")
+print(f"Top {TOP_N_FEATURES} features by |mean SHAP FP - FN| (with CI excluding 0 marker):")
+display(diff_ci.head(TOP_N_FEATURES).style.format({
+    "shap_diff": "{:.4f}", "shap_diff_ci_low": "{:.4f}", "shap_diff_ci_high": "{:.4f}",
+    "abs_diff": "{:.4f}",
+}))
+
+fig, ax = plt.subplots(figsize=(10, 6.5))
+plot_bootstrap_shap_diff_with_ci(diff_ci, top_n=TOP_N_FEATURES, ax=ax)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_shap_diff_with_ci.png", dpi=150)
+plt.show()
+print(f"Saved: {PLOTS_DIR / 'research_shap_diff_with_ci.png'}")
+"""))
+
+CELLS.append(code("""# Discriminative SHAP: logistic regression of {FP=1, FN=0} on per-row SHAP
+t0 = time.perf_counter()
+disc = discriminative_shap(shap_test, cohorts, feature_list, C=1.0)
+print(f"Discriminative SHAP fit in {time.perf_counter() - t0:.1f}s")
+print(f"Top {TOP_N_FEATURES} features by |discriminative coef|:")
+display(disc.head(TOP_N_FEATURES).style.format({"discriminative_coef": "{:.4f}", "abs_coef": "{:.4f}"}))
+
+# Plot horizontal-bar of top discriminative coefs
+fig, ax = plt.subplots(figsize=(10, 6.5))
+sub = disc.head(TOP_N_FEATURES).iloc[::-1]
+colors = ["#e74c3c" if v > 0 else "#3498db" for v in sub["discriminative_coef"]]
+ax.barh(sub["feature"], sub["discriminative_coef"], color=colors, alpha=0.85)
+ax.axvline(0, color="black", linewidth=0.6)
+ax.set_xlabel("L2 logistic-regression coefficient (FP=1 vs FN=0)")
+ax.set_title(
+    f"Top {TOP_N_FEATURES} features by discriminative SHAP\\n"
+    "red = positive coef -> SHAP value pushes prediction toward FP cohort"
+)
+ax.grid(axis="x", alpha=0.3)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_discriminative_shap.png", dpi=150)
+plt.show()
+print(f"Saved: {PLOTS_DIR / 'research_discriminative_shap.png'}")
+"""))
+
+CELLS.append(code("""# Grouped barplot: top features by abs effect size, mean SHAP per cohort
+top_features_by_effect = eff.head(TOP_N_FEATURES)["feature"].tolist()
+fig, ax = plt.subplots(figsize=(13, 5.5))
+plot_top_features_grouped_by_cohort(mean_shap_long, top_features_by_effect, ax=ax)
+plt.tight_layout()
+fig.savefig(PLOTS_DIR / "research_cohort_mean_shap_grouped.png", dpi=150)
+plt.show()
+print(f"Saved: {PLOTS_DIR / 'research_cohort_mean_shap_grouped.png'}")
+
+# Compare the three rankings (signed-effect, bootstrap-diff, discriminative)
+top_overlap = pd.DataFrame({
+    "by_effect_size": eff.head(TOP_N_FEATURES)["feature"].tolist(),
+    "by_bootstrap_diff": diff_ci.head(TOP_N_FEATURES)["feature"].tolist(),
+    "by_discriminative_coef": disc.head(TOP_N_FEATURES)["feature"].tolist(),
+})
+print("Top-N feature lists across the three rankings:")
+display(top_overlap)
+
+# Set overlap stats
+set_eff = set(eff.head(TOP_N_FEATURES)["feature"])
+set_diff = set(diff_ci.head(TOP_N_FEATURES)["feature"])
+set_disc = set(disc.head(TOP_N_FEATURES)["feature"])
+print()
+print(f"Common across all three rankings: {len(set_eff & set_diff & set_disc)} features")
+print(f"  - in eff and diff but not disc: {len((set_eff & set_diff) - set_disc)}")
+print(f"  - in eff and disc but not diff: {len((set_eff & set_disc) - set_diff)}")
+print(f"  - in diff and disc but not eff: {len((set_diff & set_disc) - set_eff)}")
+"""))
+
+CELLS.append(code("""# Save cohort summary
+import json
+cohort_bundle = {
+    "config": {
+        "operating_threshold": COHORT_THRESHOLD,
+        "top_n": TOP_N_FEATURES,
+        "B": BOOTSTRAP_B,
+        "ci": BOOTSTRAP_CI,
+    },
+    "cohort_counts": counts,
+    "top_by_signed_effect_size": eff.head(TOP_N_FEATURES)[
+        ["feature", "mean_shap_fp", "mean_shap_fn", "shap_diff_fp_minus_fn",
+         "pooled_std", "effect_size"]
+    ].to_dict(orient="records"),
+    "top_by_bootstrap_diff": diff_ci.head(TOP_N_FEATURES)[
+        ["feature", "shap_diff", "shap_diff_ci_low", "shap_diff_ci_high",
+         "ci_excludes_zero"]
+    ].to_dict(orient="records"),
+    "top_by_discriminative_coef": disc.head(TOP_N_FEATURES)[
+        ["feature", "discriminative_coef"]
+    ].to_dict(orient="records"),
+    "intersection_count_all_three": int(len(set_eff & set_diff & set_disc)),
+}
+utils.save_json(ANALYTICS_DIR / "research_cohort_summary.json", cohort_bundle)
+print(f"Saved cohort summary: {ANALYTICS_DIR / 'research_cohort_summary.json'}")
+"""))
+
 CELLS.append(md("""---
-End of Phase 0+1+2+2b+3 deliverables.
+End of Phase 0+1+2+2b+3+4 deliverables.
 
 Subsequent sections land as the corresponding analytics phases are built:
 
-- **Phase 4** `cohorts.py` -> SHAP cohort decomposition (TP/FP/TN/FN), discriminative-SHAP
 - **Phase 5** `uncertainty.py` -> virtual-ensemble MI / total / data entropy decomposition, (p, knowledge_unc) gating
-- **Phase 6** `audits.py` -> label-shuffle, future-feature audit, time-block permutation, turnover, latency-budget, deflated Sharpe
+- **Phase 6** `audits.py` -> label-shuffle, future-feature audit, time-block permutation, turnover, latency-budget, deflated Sharpe; covariate-vs-concept drift test
 """))
 
 
