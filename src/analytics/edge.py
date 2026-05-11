@@ -37,9 +37,26 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, iid_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, block_indices, iid_indices
 from .curves import _interp_pr, _interp_roc
 from .degradation import wilson_interval
+
+
+def _choose_indices(
+    n: int,
+    B: int,
+    rng: np.random.Generator,
+    *,
+    stratify_y: Optional[np.ndarray],
+    stratify: bool,
+    block_size: Optional[int],
+) -> np.ndarray:
+    """Block bootstrap if ``block_size > 1``, else stratified/iid."""
+    if block_size is not None and int(block_size) > 1:
+        return block_indices(n, B, rng, block_size=int(block_size))
+    return iid_indices(
+        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +168,7 @@ def bootstrap_threshold_sweep(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Bootstrap CI bands at every threshold in the grid.
 
@@ -159,9 +177,11 @@ def bootstrap_threshold_sweep(
     recall[/_ci_low/_ci_high], trade_rate[/_ci_low/_ci_high],
     ev_per_trade[/_ci_low/_ci_high], sharpe_per_trade[/_ci_low/_ci_high]``.
 
-    The bootstrap uses class-stratified iid (same as ``bootstrap_metric``);
-    every replicate evaluates ALL thresholds in one vectorized pass, so cost
-    scales as O(B * (N log N + T)) rather than O(B * T * N).
+    By default the bootstrap uses class-stratified iid (same as
+    ``bootstrap_metric``); pass ``block_size`` ≈ M to switch to a moving-
+    block bootstrap for autocorrelated label streams (1-min cadence).
+    Every replicate evaluates ALL thresholds in one vectorized pass, so
+    cost scales as O(B * (N log N + T)) rather than O(B * T * N).
     """
     if outcome_model is None:
         outcome_model = OutcomeModel()
@@ -187,7 +207,9 @@ def bootstrap_threshold_sweep(
     point = _threshold_metrics(y, p, thresholds, outcome_model, r_realized)
 
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     T = len(thresholds)
     samples = np.empty((B, T, 5), dtype=float)
     for b in range(B):
@@ -237,18 +259,22 @@ def bootstrap_partial_roc_auc(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> BootstrapResult:
     """Partial ROC-AUC over the low-FPR operating band, with bootstrap CI.
 
     For an entry-gate model that operates at low false-positive rate
     (sub-percent in trading), the full ROC-AUC averages over irrelevant
-    high-FPR regions. Partial AUC isolates the operating band.
+    high-FPR regions. Partial AUC isolates the operating band. Pass
+    ``block_size`` ≈ M for autocorrelated label streams (1-min cadence).
     """
     y = np.asarray(y)
     p = np.asarray(p)
     point = _partial_roc_auc_from(y, p, fpr_max)
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples = np.empty(B, dtype=float)
     for b in range(B):
         i = idx[b]
@@ -274,13 +300,19 @@ def bootstrap_partial_pr_auc(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> BootstrapResult:
-    """Partial PR-AUC (max-envelope) over the operating recall band."""
+    """Partial PR-AUC (max-envelope) over the operating recall band.
+
+    Pass ``block_size`` ≈ M for autocorrelated label streams (1-min cadence).
+    """
     y = np.asarray(y)
     p = np.asarray(p)
     point = _partial_pr_auc_from(y, p, recall_max)
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples = np.empty(B, dtype=float)
     for b in range(B):
         i = idx[b]

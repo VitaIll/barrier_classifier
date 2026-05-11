@@ -15,6 +15,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from src.analytics.bootstrap import (
     BootstrapResult,
+    block_indices,
     bootstrap_metric,
     iid_indices,
 )
@@ -367,6 +368,138 @@ def test_bootstrap_coverage_at_nominal_levels(ci_level: float, tol: float):
     assert abs(coverage - ci_level) < tol, (
         f"coverage {coverage:.3f} for nominal {ci_level} (tol {tol})"
     )
+
+
+# ---------------------------------------------------------------------------
+# block_indices + block-bootstrap properties (for autocorrelated streams)
+# ---------------------------------------------------------------------------
+
+
+def test_block_indices_shape_and_range():
+    rng = np.random.default_rng(0)
+    idx = block_indices(200, B=30, rng=rng, block_size=20)
+    assert idx.shape == (30, 200)
+    assert idx.min() >= 0 and idx.max() < 200
+
+
+def test_block_indices_blocks_are_contiguous():
+    """Every block of size ``block_size`` is a contiguous run of integers.
+
+    Within each replicate, consecutive cells in each block must differ by 1.
+    """
+    rng = np.random.default_rng(0)
+    n, B, bs = 200, 50, 10
+    idx = block_indices(n, B, rng, block_size=bs)
+    # Reshape to (B, n_blocks, block_size) — only the leading n cells, but n is multiple of bs here.
+    reshaped = idx.reshape(B, n // bs, bs)
+    diffs_within_block = np.diff(reshaped, axis=2)
+    assert np.all(diffs_within_block == 1), "blocks must be contiguous runs"
+
+
+def test_block_indices_rejects_bad_block_size():
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="block_size"):
+        block_indices(100, 5, rng, block_size=0)
+    with pytest.raises(ValueError, match="block_size"):
+        block_indices(100, 5, rng, block_size=200)
+
+
+def test_block_indices_blocks_uniformly_start():
+    """Block starts are uniform on [0, n - block_size].
+
+    Each valid start (n - block_size + 1 possible values) should be hit
+    approximately equally across all blocks in all replicates.
+    """
+    rng = np.random.default_rng(0)
+    n, B, bs = 500, 200, 10
+    idx = block_indices(n, B, rng, block_size=bs)
+    # First element of each block is the start
+    starts = idx[:, ::bs].flatten()
+    valid_range = n - bs + 1
+    counts = np.bincount(starts, minlength=valid_range)
+    expected = B * (n // bs) / valid_range
+    se = math.sqrt(expected * (1.0 - 1.0 / valid_range))
+    z = (counts[:valid_range] - expected) / se
+    assert np.all(np.abs(z) < 6.0), f"non-uniform block starts (max |z|={np.abs(z).max():.2f})"
+
+
+def test_block_bootstrap_ci_wider_than_iid_on_autocorrelated_stream():
+    """Block bootstrap should produce *materially wider* CIs than IID bootstrap
+    when the underlying series is autocorrelated.
+
+    Build an AR(1) sequence with strong correlation (rho=0.95); the IID
+    bootstrap will underestimate the variance of the sample mean because
+    it ignores the within-block dependence. Block bootstrap captures it.
+    """
+    rng = np.random.default_rng(0)
+    n = 2000
+    rho = 0.95
+    eps = rng.normal(0, 1.0, n)
+    x = np.empty(n)
+    x[0] = eps[0]
+    for t in range(1, n):
+        x[t] = rho * x[t - 1] + math.sqrt(1 - rho * rho) * eps[t]
+    y = np.zeros(n, dtype=int)
+
+    def mean_fn(_y, p_):
+        return float(p_.mean())
+
+    iid_res = bootstrap_metric(
+        mean_fn, y, x, B=1000, stratify=False, seed=0,
+    )
+    block_res = bootstrap_metric(
+        mean_fn, y, x, B=1000, stratify=False, seed=0, block_size=40,
+    )
+    iid_width = iid_res.ci_high - iid_res.ci_low
+    block_width = block_res.ci_high - block_res.ci_low
+    # For AR(1) with rho=0.95, effective n is much smaller than n, so block
+    # bootstrap SE should be substantially larger. Require >= 2x widening.
+    assert block_width > 2.0 * iid_width, (
+        f"block CI width {block_width:.5f} not wider than iid {iid_width:.5f} (ratio {block_width/iid_width:.2f})"
+    )
+
+
+def test_block_bootstrap_ci_similar_to_iid_on_independent_stream():
+    """On truly iid data, block bootstrap should *not* be much wider than IID
+    — block size > 1 wastes information when there's no correlation to preserve.
+
+    A factor-of-2 widening on iid data would be too much; require < 1.6x.
+    """
+    rng = np.random.default_rng(0)
+    n = 2000
+    x = rng.normal(0, 1.0, n)
+    y = np.zeros(n, dtype=int)
+
+    def mean_fn(_y, p_):
+        return float(p_.mean())
+
+    iid_res = bootstrap_metric(
+        mean_fn, y, x, B=1000, stratify=False, seed=0,
+    )
+    block_res = bootstrap_metric(
+        mean_fn, y, x, B=1000, stratify=False, seed=0, block_size=20,
+    )
+    iid_width = iid_res.ci_high - iid_res.ci_low
+    block_width = block_res.ci_high - block_res.ci_low
+    assert block_width < 1.6 * iid_width, (
+        f"block widening too aggressive on iid data: "
+        f"block {block_width:.5f} vs iid {iid_width:.5f}"
+    )
+
+
+def test_block_bootstrap_ignores_stratify_flag():
+    """``block_size > 1`` overrides stratify because blocks are class-agnostic.
+
+    Verify the function doesn't error and produces a non-degenerate result
+    when stratify=True and block_size is set simultaneously."""
+    rng = np.random.default_rng(0)
+    n = 500
+    y = (rng.random(n) > 0.5).astype(int)
+    p = rng.random(n)
+    res = bootstrap_metric(
+        roc_auc_score, y, p, B=200, stratify=True, seed=0, block_size=20,
+    )
+    assert res.samples.std() > 0  # non-degenerate
 
 
 def test_bootstrap_ci_low_le_high_under_skewed_statistic():

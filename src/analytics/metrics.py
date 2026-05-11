@@ -41,15 +41,23 @@ def bootstrap_all_metrics(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> Dict[str, BootstrapResult]:
     """Bootstrap the headline metric bundle on ``(y, p)``.
 
     Returns ``{metric_name: BootstrapResult}``. Point estimates match
     ``utils.compute_all_metrics`` (with ``ece_10bin`` mapping to ``ece``).
+
+    Pass ``block_size`` ≈ M (the label horizon) for autocorrelated label
+    streams (e.g. 1-min cadence overlapping barrier labels); the bootstrap
+    switches to a moving-block resampler so the within-block correlation
+    structure is preserved across replicates and CIs are honest (wider).
     """
     out: Dict[str, BootstrapResult] = {}
     for name, fn in _METRIC_FUNCS.items():
-        out[name] = bootstrap_metric(fn, y, p, B=B, ci=ci, stratify=stratify, seed=seed)
+        out[name] = bootstrap_metric(
+            fn, y, p, B=B, ci=ci, stratify=stratify, seed=seed, block_size=block_size
+        )
     return out
 
 
@@ -64,12 +72,14 @@ def bootstrap_metrics_by_regime(
     seed: int = 0,
     metrics: Optional[Sequence[str]] = None,
     min_samples: int = 50,
+    block_size: Optional[int] = None,
 ) -> Dict[str, Dict[str, BootstrapResult]]:
     """Bootstrap a subset of metrics within each tercile of ``regime``.
 
     Terciles are computed via ``pd.qcut(regime, 3) -> {low, med, high}``.
     Regimes with fewer than ``min_samples`` rows are skipped. Per-regime
-    bootstrap is class-stratified within the regime by default.
+    bootstrap is class-stratified within the regime by default. Pass
+    ``block_size`` to switch to block bootstrap for autocorrelated labels.
 
     Returns ``{regime_label: {metric_name: BootstrapResult}}``.
     """
@@ -92,7 +102,14 @@ def bootstrap_metrics_by_regime(
         for name in metric_names:
             fn = _METRIC_FUNCS[name]
             out[label][name] = bootstrap_metric(
-                fn, y_r, p_r, B=B, ci=ci, stratify=stratify, seed=seed
+                fn,
+                y_r,
+                p_r,
+                B=B,
+                ci=ci,
+                stratify=stratify,
+                seed=seed,
+                block_size=block_size,
             )
     return out
 

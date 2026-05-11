@@ -165,6 +165,228 @@ def _legacy_full_chain(bars_pd: pd.DataFrame) -> pd.DataFrame:
     return df_b
 
 
+_NON_FEATURE_COLS_FOR_PIPELINE_TEST = frozenset(
+    {"k", "ts", "y", "m_k", "tau_k", "phi"}
+)
+
+
+def _feature_columns(df: pl.DataFrame) -> list[str]:
+    return [c for c in df.columns if c not in _NON_FEATURE_COLS_FOR_PIPELINE_TEST
+            and not c.startswith("undef__")
+            and df.schema[c] in (pl.Float32, pl.Float64, pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64)]
+
+
+def test_run_pipeline_1min_cadence_smoke(bars_pd):
+    """End-to-end smoke at the new 1-min target cadence.
+
+    The pipeline should run without error, produce one row per non-warmup
+    1-min bar, carry the new autocorr columns, and emit `_h` features at
+    the scaled (calendar-time-preserving) window values.
+    """
+    from src.features.config import N_WARMUP, M as M_BARS
+
+    engine_out = run_pipeline(
+        bars_pd, with_derivatives=False, p_hit_prior=0.5, label_cadence="1min"
+    )
+    # Expected row count: total_bars - N_WARMUP - (M tail bars with NaN labels)
+    n_total = len(bars_pd)
+    expected_rows_upper = n_total - N_WARMUP
+    assert 0 < len(engine_out) <= expected_rows_upper
+    for c in ("k", "ts", "y", "m_k", "tau_k", "phi"):
+        assert c in engine_out.columns, f"missing required column {c}"
+    autocorr_cols = [c for c in engine_out.columns if c.startswith("target__autocorr_")]
+    assert autocorr_cols, "expected target__autocorr_*  columns at 1-min cadence"
+    # `_h` features must use the M-scaled windows (1440 = 72 * M)
+    assert "hit__rate__h__w1440" in engine_out.columns, (
+        "expected hit__rate__h__w1440 (= 72*M) at 1-min cadence"
+    )
+
+    # CRITICAL: post-impute, no feature column may carry null, NaN, or inf.
+    # Any of those means the impute step missed a column and would crash
+    # CatBoost or silently corrupt training. This is the gate that catches
+    # broken imputation patterns for the new autocorr columns.
+    feature_cols = _feature_columns(engine_out)
+    nulls = {c: int(engine_out[c].null_count()) for c in feature_cols
+             if int(engine_out[c].null_count()) > 0}
+    assert not nulls, f"feature columns with residual nulls after impute: {nulls}"
+    for c in feature_cols:
+        dtype = engine_out.schema[c]
+        if dtype in (pl.Float32, pl.Float64):
+            n_nan = int(engine_out[c].is_nan().sum() or 0)
+            assert n_nan == 0, f"{c}: {n_nan} NaN values after impute"
+            if bool(engine_out[c].is_infinite().any()):
+                raise AssertionError(f"{c}: inf values after impute")
+
+    # Label-cadence-shaped row count: in 1-min mode k is the 1-min row index
+    k_min = int(engine_out["k"].min())
+    k_max = int(engine_out["k"].max())
+    assert k_min >= N_WARMUP, f"k_min={k_min} should be >= N_WARMUP={N_WARMUP}"
+    # 1-min cadence labels at row k look ahead M bars; row k+M-1 must exist in raw
+    assert k_max <= n_total - M_BARS, (
+        f"k_max={k_max} should be <= n_total-M={n_total - M_BARS}"
+    )
+
+
+def test_run_pipeline_1min_default_barrier_source_is_high(bars_pd):
+    """``run_pipeline(label_cadence='1min')`` must default to the HIGH-source
+    label so the trained event matches the simulator's exit_tp_or_expiry
+    (long TP fills on intrabar high crossing). A regression that flipped
+    the default back to close-source would still pass other smoke tests
+    (the schema would be identical) — this test is the gate that catches
+    such a silent default flip.
+    """
+    out = run_pipeline(bars_pd, with_derivatives=False, label_cadence="1min")
+    close = bars_pd["close"].to_numpy().astype(float)
+    high = bars_pd["high"].to_numpy().astype(float)
+    phi = float(C + ETA)
+    M_v = int(M)
+    # Sample 50 rows by their stored k (= 1-min row index at 1-min cadence)
+    # and re-derive y under both sources; the stored y must match HIGH.
+    rng = np.random.default_rng(0)
+    n_total = len(close)
+    sample_n = min(50, len(out))
+    if sample_n == 0:
+        pytest.skip("no rows produced by pipeline")
+    sampled = rng.choice(len(out), size=sample_n, replace=False)
+    matches_close, matches_high = 0, 0
+    valid = 0
+    for i in sampled.tolist():
+        k = int(out["k"][i])
+        if k + M_v >= n_total:
+            continue
+        base = close[k]
+        fut_close_ret = np.log(close[k + 1 : k + M_v + 1] / base)
+        fut_high_ret = np.log(high[k + 1 : k + M_v + 1] / base)
+        y_close = 1.0 if fut_close_ret.max() >= phi else 0.0
+        y_high = 1.0 if fut_high_ret.max() >= phi else 0.0
+        y_stored = float(out["y"][i])
+        if y_stored == y_close:
+            matches_close += 1
+        if y_stored == y_high:
+            matches_high += 1
+        valid += 1
+    assert valid > 0
+    assert matches_high == valid, (
+        f"run_pipeline 1-min default is NOT high-source: only {matches_high}/{valid} "
+        f"match high; {matches_close}/{valid} match close. The high-source default "
+        "is required for target/execution alignment with the simulator's long-TP exit."
+    )
+
+
+def test_run_pipeline_1min_m_k_matches_future_high_excursion(bars_pd):
+    """At 1-min cadence with the default barrier_source='high', the stored
+    ``m_k`` must equal ``max(log(high[n+1..n+M] / close[n]))`` — the
+    max excursion of FUTURE HIGHS, not of future closes. A bug that
+    silently used closes for m_k while using highs for y would still
+    pass label tests because y is just an indicator; this test guards
+    the magnitude column."""
+    out = run_pipeline(bars_pd, with_derivatives=False, label_cadence="1min")
+    close = bars_pd["close"].to_numpy().astype(float)
+    high = bars_pd["high"].to_numpy().astype(float)
+    M_v = int(M)
+    rng = np.random.default_rng(1)
+    n_total = len(close)
+    sample_n = min(40, len(out))
+    if sample_n == 0:
+        pytest.skip("no rows produced by pipeline")
+    sampled = rng.choice(len(out), size=sample_n, replace=False)
+    for i in sampled.tolist():
+        k = int(out["k"][i])
+        if k + M_v >= n_total:
+            continue
+        base = close[k]
+        expected_m_high = float(np.log(high[k + 1 : k + M_v + 1] / base).max())
+        stored_m = float(out["m_k"][i])
+        assert abs(stored_m - expected_m_high) < 1e-12, (
+            f"row k={k}: m_k={stored_m} != expected_high_excursion={expected_m_high}"
+        )
+
+
+def test_run_pipeline_1min_explicit_close_source_overrides_default(bars_pd):
+    """``barrier_source='close'`` at 1-min cadence must produce the legacy
+    close-confirmed labels. Verifies the cadence default is overridable."""
+    out = run_pipeline(
+        bars_pd,
+        with_derivatives=False,
+        label_cadence="1min",
+        barrier_source="close",
+    )
+    close = bars_pd["close"].to_numpy().astype(float)
+    phi = float(C + ETA)
+    M_v = int(M)
+    rng = np.random.default_rng(2)
+    n_total = len(close)
+    sample_n = min(30, len(out))
+    if sample_n == 0:
+        pytest.skip("no rows produced")
+    sampled = rng.choice(len(out), size=sample_n, replace=False)
+    for i in sampled.tolist():
+        k = int(out["k"][i])
+        if k + M_v >= n_total:
+            continue
+        base = close[k]
+        fut_close_ret = np.log(close[k + 1 : k + M_v + 1] / base)
+        expected_y = 1.0 if fut_close_ret.max() >= phi else 0.0
+        assert float(out["y"][i]) == expected_y
+
+
+def test_run_pipeline_1min_drops_boundary_sparse_excursion(bars_pd):
+    """The boundary-sparse excursion drawup/drawdown columns are
+    modulo-M sparse by construction and would create a phase artifact
+    at 1-min cadence. ``run_pipeline(label_cadence='1min')`` must drop
+    them and substitute the every-row rolling variants."""
+    out = run_pipeline(bars_pd, with_derivatives=False, label_cadence="1min")
+    sparse = [
+        c for c in out.columns
+        if c.startswith("excursion__max_drawup__f__")
+        or c.startswith("excursion__max_drawdown__f__")
+    ]
+    rolling = [
+        c for c in out.columns
+        if c.startswith("excursion__roll_max_drawup__f__")
+        or c.startswith("excursion__roll_max_drawdown__f__")
+    ]
+    assert not sparse, f"boundary-sparse excursion columns leaked into 1-min: {sparse}"
+    assert rolling, "expected every-row rolling excursion columns at 1-min cadence"
+
+
+def test_run_pipeline_1min_no_autocorr_columns_when_flag_off(bars_pd):
+    """``enable_autocorrelation=False`` must suppress every target__autocorr_* column."""
+    out = run_pipeline(
+        bars_pd, with_derivatives=False, label_cadence="1min",
+        enable_autocorrelation=False,
+    )
+    leaks = [c for c in out.columns if c.startswith("target__autocorr_")]
+    assert not leaks, f"unexpected autocorr columns with flag off: {leaks}"
+
+
+def test_run_pipeline_boundary_default_does_not_add_autocorr_columns(bars_pd):
+    """Boundary cadence with default flag must NOT emit autocorr columns —
+    the legacy schema must remain intact when users haven't opted in.
+
+    Catches the silent-schema-drift hazard surfaced in the review: the
+    autocorr columns were being added at boundary cadence too (full of
+    nulls because consecutive labels don't overlap), changing the legacy
+    feature_list and breaking models trained against the old schema.
+    """
+    out_default = run_pipeline(bars_pd, with_derivatives=False)
+    leaks = [c for c in out_default.columns if c.startswith("target__autocorr_")]
+    assert not leaks, f"boundary-default pipeline leaked autocorr columns: {leaks}"
+
+
+def test_run_pipeline_boundary_can_opt_in_to_autocorr(bars_pd):
+    """A boundary-cadence run with the flag explicitly ON should emit them
+    (so users can compare). Just verifies the override path."""
+    out = run_pipeline(bars_pd, with_derivatives=False, enable_autocorrelation=True)
+    cols = [c for c in out.columns if c.startswith("target__autocorr_")]
+    assert cols, "expected autocorr columns with explicit opt-in"
+
+
+def test_run_pipeline_rejects_bad_label_cadence(bars_pd):
+    with pytest.raises(ValueError, match="label_cadence"):
+        run_pipeline(bars_pd, label_cadence="hourly")
+
+
 def test_run_pipeline_matches_legacy_chain(bars_pd):
     """One end-to-end check that ``run_pipeline`` reproduces the legacy
     notebook's df_final — every shared feature column bit-equal at the

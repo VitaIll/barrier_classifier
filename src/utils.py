@@ -1452,7 +1452,30 @@ def checkpoint_before_training(
     if not results["split_sizes"]["ok"]:
         raise ValueError(f"Split sizes do not match configured fractions: {results['split_sizes']}")
 
-    non_feature_cols = ["k", "ts", "y", "m_k", "tau_k", "phi", "w_dist", "w_time", "weight"]
+    # Non-feature columns — must mirror the pipeline's NON_FEATURE_COLS
+    # contract: labels, weights, raw OHLCV, base series, and derivatives
+    # base series. The dataset preserves these as sidecar columns (they're
+    # carried through for diagnostics but excluded from imputation), so
+    # they can carry NaN where coverage is missing (e.g. EOH options
+    # outside their coverage window). Treating them as features would
+    # trip on legitimate sidecar NaN.
+    non_feature_cols = [
+        "k", "ts", "y", "m_k", "tau_k", "phi", "m_dn", "tau_dn",
+        "w_dist", "w_time", "weight",
+        # Raw OHLCV
+        "open", "high", "low", "close", "volume", "quote_volume",
+        "num_trades", "taker_buy_base", "taker_buy_quote",
+        # Base series (from compute_base_series)
+        "p", "r", "rho", "r_oc", "g", "logvol", "logtrades", "logquotevol",
+        "b", "ofi", "clv", "bodyfrac", "wickup", "wickdn", "vwap", "vwapdev",
+        "qpertrade",
+        # Derivatives base (from compute_derivatives_base_series)
+        "close_fut", "volume_fut", "quote_volume_fut", "taker_buy_base_fut",
+        "num_trades_fut", "funding_rate", "oi_usd", "opt_oi",
+        "put_open_interest", "call_open_interest", "opt_volume", "put_volume",
+        "call_volume", "bvol", "basis_abs", "basis_pct", "tb_ratio_fut",
+        "net_vol_fut", "pcr_oi", "pcr_vol",
+    ]
     for name, split_df in [("train", train_df), ("val", val_df), ("test", test_df)]:
         drop_cols = [c for c in non_feature_cols if c in split_df.columns]
         check_df = split_df.drop(columns=drop_cols, errors="ignore")
@@ -2793,6 +2816,12 @@ def get_imputation_value(feature_name: str, p_hit_prior: float = 0.5, cap_h_bloc
         (r"^hit__rate", float(p_hit_prior)),
         (r"^hit__since", float(cap_h_blocks)),
         (r"^hit__prev", 0.0),
+        # Target autocorrelation: null when the rolling window has zero
+        # label variance (all-zero or all-one). 0.0 = "no detectable
+        # autocorrelation" is the right default here (also matches the
+        # catch-all fallback below, but we list it explicitly so the
+        # intent is auditable and not a happy accident of pattern order).
+        (r"^target__autocorr", 0.0),
         (r"^basis__abs", 0.0),
         (r"^basis__pct", 0.0),
         (r"^basis__ann_yield", 0.0),
@@ -3257,12 +3286,85 @@ def save_metadata(path: str, metadata: Dict[str, Any]) -> None:
 # =============================================================================
 
 
+def recommended_embargo_for_cadence(
+    label_cadence: str, *, base_embargo: int = 60, M: int | None = None
+) -> int:
+    """Calendar-time-preserving embargo for the train/val and val/test splits.
+
+    At **boundary** cadence (one row per M bars, labels non-overlapping by
+    construction), an embargo of ``base_embargo`` boundary rows is the
+    standard López-de-Prado recommendation (~ EMBARGO_K = 60 boundaries
+    = 20 hours at M=20).
+
+    At **1-min** cadence, adjacent labels share M-1 of their M future bars,
+    so the **minimum** embargo to avoid any label overlap between train and
+    val is ``M`` rows. For calendar-time parity with boundary cadence, we
+    scale by M: ``base_embargo * M`` rows. The returned value is the maximum
+    of these two, so callers always get something at least M.
+
+    Critical: if you split a 1-min cadence dataset with embargo_k=60 (the
+    boundary-cadence default), val's first row has its label-prediction
+    window overlapping train's last 19 rows' windows. The model "validates"
+    on the same future bars it trained on. Use this helper.
+    """
+    from src.features.config import M as M_DEFAULT
+
+    M_int = int(M) if M is not None else int(M_DEFAULT)
+    if label_cadence == "boundary":
+        return int(base_embargo)
+    if label_cadence == "1min":
+        return max(M_int, int(base_embargo) * M_int)
+    raise ValueError(
+        f"label_cadence must be 'boundary' or '1min', got {label_cadence!r}"
+    )
+
+
+def recommended_time_discount_delta_for_cadence(
+    label_cadence: str, *, base_delta: float, M: int | None = None
+) -> float:
+    """Per-step decay factor scaled to preserve calendar-time decay.
+
+    ``compute_time_discount_weight`` applies ``delta`` once per row. At
+    boundary cadence each row is M bars apart; at 1-min cadence each row
+    is 1 bar apart. To make a one-day-old sample have the same weight in
+    both cadences, the 1-min delta must equal ``base_delta ** (1/M)``.
+
+    For example, with base_delta=0.5 and M=20 the 1-min delta is ~0.9659:
+    the weight halves over each 20 minutes, identical to the boundary
+    cadence's "halve per boundary".
+    """
+    from src.features.config import M as M_DEFAULT
+
+    M_int = int(M) if M is not None else int(M_DEFAULT)
+    if not (0.0 < float(base_delta) <= 1.0):
+        raise ValueError(f"base_delta must be in (0, 1], got {base_delta}")
+    if label_cadence == "boundary":
+        return float(base_delta)
+    if label_cadence == "1min":
+        return float(base_delta) ** (1.0 / float(M_int))
+    raise ValueError(
+        f"label_cadence must be 'boundary' or '1min', got {label_cadence!r}"
+    )
+
+
 def chronological_split_with_embargo(
     df: pd.DataFrame,
     train_frac: float = 0.70,
     val_frac: float = 0.15,
     embargo_k: int = 1,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Chronological train/val/test split with an embargo gap.
+
+    ``embargo_k`` is in **rows of the input dataframe** — its meaning
+    depends on the cadence used to build ``df``. Use
+    ``recommended_embargo_for_cadence`` to pick a safe value:
+
+        embargo = recommended_embargo_for_cadence(label_cadence)
+        train, val, test = chronological_split_with_embargo(df, embargo_k=embargo)
+
+    Calling with the boundary-cadence default ``embargo_k=60`` on a 1-min
+    cadence dataset leaks label-window overlap into the validation set.
+    """
     n = len(df)
     train_end_idx = int(train_frac * n)
     val_end_idx = int((train_frac + val_frac) * n)
@@ -3283,6 +3385,12 @@ def chronological_split_with_embargo(
 
 
 def walk_forward_cv(df: pd.DataFrame, n_folds: int = 3, embargo_k: int = 1) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    """Walk-forward CV folds with an embargo gap between train and val of each fold.
+
+    Same cadence caveat as ``chronological_split_with_embargo``: pass an
+    ``embargo_k`` sized to the input dataframe's cadence. At 1-min cadence
+    use ``recommended_embargo_for_cadence('1min')`` (>= M rows).
+    """
     n = len(df)
     fold_size = n // (n_folds + 1)
 

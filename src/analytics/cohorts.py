@@ -36,7 +36,7 @@ from typing import List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI
+from .bootstrap import DEFAULT_B, DEFAULT_CI, block_indices
 
 COHORT_LABELS = ("TP", "FP", "TN", "FN")
 
@@ -268,14 +268,27 @@ def bootstrap_shap_diff(
     ci: float = DEFAULT_CI,
     seed: int = 0,
     min_cohort_size: int = 5,
+    block_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Bootstrap CI on per-feature ``mean(SHAP_FP) - mean(SHAP_FN)``.
 
-    Resamples within each cohort independently (preserves cohort sizes).
     Returns ranked DataFrame: ``feature, shap_diff, shap_diff_ci_low,
     shap_diff_ci_high, abs_diff``. Use this to filter the
     ``signed_effect_size_disagreement`` shortlist by survival under
     sampling noise.
+
+    Sampling mode is cadence-aware:
+
+    - ``block_size=None`` (default, correct for boundary cadence): resample
+      WITHIN each cohort independently, preserving the FP and FN cohort
+      sizes. Right when cohort members are independent samples.
+    - ``block_size > 1`` (required for 1-min cadence overlapping labels):
+      resample the ORIGINAL row indices as contiguous blocks of length
+      ``block_size`` (≈ M). For each replicate, cohort membership is
+      re-derived from which resampled rows were originally FP / FN, then
+      the SHAP-mean difference is computed on those subsets. Replicates
+      whose resampled FP or FN count falls below ``min_cohort_size`` are
+      skipped — the recorded ``B_effective`` is the number that survived.
     """
     if shap.shape[1] != len(feature_list):
         raise ValueError("SHAP cols / feature_list length mismatch")
@@ -285,12 +298,31 @@ def bootstrap_shap_diff(
         return pd.DataFrame()
 
     rng = np.random.default_rng(seed)
-    fp_resamples = fp_idx[rng.integers(0, len(fp_idx), size=(B, len(fp_idx)))]
-    fn_resamples = fn_idx[rng.integers(0, len(fn_idx), size=(B, len(fn_idx)))]
     F = shap.shape[1]
-    samples = np.empty((B, F), dtype=float)
-    for b in range(B):
-        samples[b] = shap[fp_resamples[b]].mean(axis=0) - shap[fn_resamples[b]].mean(axis=0)
+
+    if block_size is not None and int(block_size) > 1:
+        idx_matrix = block_indices(len(cohorts), B, rng, block_size=int(block_size))
+        replicate_samples: list[np.ndarray] = []
+        is_fp = cohorts == "FP"
+        is_fn = cohorts == "FN"
+        for b in range(B):
+            row_idx = idx_matrix[b]
+            fp_sel = row_idx[is_fp[row_idx]]
+            fn_sel = row_idx[is_fn[row_idx]]
+            if len(fp_sel) < min_cohort_size or len(fn_sel) < min_cohort_size:
+                continue
+            replicate_samples.append(
+                shap[fp_sel].mean(axis=0) - shap[fn_sel].mean(axis=0)
+            )
+        if not replicate_samples:
+            return pd.DataFrame()
+        samples = np.stack(replicate_samples, axis=0)
+    else:
+        fp_resamples = fp_idx[rng.integers(0, len(fp_idx), size=(B, len(fp_idx)))]
+        fn_resamples = fn_idx[rng.integers(0, len(fn_idx), size=(B, len(fn_idx)))]
+        samples = np.empty((B, F), dtype=float)
+        for b in range(B):
+            samples[b] = shap[fp_resamples[b]].mean(axis=0) - shap[fn_resamples[b]].mean(axis=0)
 
     point = shap[fp_idx].mean(axis=0) - shap[fn_idx].mean(axis=0)
     alpha = (1.0 - ci) / 2.0
@@ -304,6 +336,7 @@ def bootstrap_shap_diff(
     )
     df["abs_diff"] = df["shap_diff"].abs()
     df["ci_excludes_zero"] = (df["shap_diff_ci_low"] > 0) | (df["shap_diff_ci_high"] < 0)
+    df.attrs["B_effective"] = int(samples.shape[0])
     return df.sort_values("abs_diff", ascending=False).reset_index(drop=True)
 
 

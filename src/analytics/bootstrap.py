@@ -1,14 +1,31 @@
-"""Bootstrap primitives: iid resampling with optional class stratification.
+"""Bootstrap primitives: iid resampling with optional class stratification,
+and **block bootstrap** for autocorrelated label streams.
 
 Public API:
 - ``iid_indices(n, B, rng, *, stratify=None)`` -> (B, n) int array
-- ``bootstrap_metric(fn, y, p, *, B, ci, stratify, seed)`` -> BootstrapResult
+- ``block_indices(n, B, rng, *, block_size)`` -> (B, n) int array
+- ``bootstrap_metric(fn, y, p, *, B, ci, stratify, seed, block_size=None)`` -> BootstrapResult
 
-Stratification resamples within each class so the resampled empirical class
-counts equal the original. This stabilizes base-rate-sensitive metrics
-(PR-AUC, ECE) and is the right default for production-trading evaluation
-where prevalence is a property of the eval window, not a property of the
-bootstrap procedure.
+**When to use which**
+
+IID bootstrap (default) is correct when labels are independent — that's true
+for the legacy *boundary-cadence* dataset, where consecutive labels look at
+non-overlapping M-bar windows. Stratification resamples within each class
+so the resampled empirical class counts equal the original; it stabilizes
+base-rate-sensitive metrics (PR-AUC, ECE) and is the right default at
+boundary cadence.
+
+Block bootstrap (``block_size > 1``) is required when labels are
+autocorrelated — that's the case for the *1-min-cadence* dataset, where
+adjacent labels share M−1 of their M future bars. IID bootstrap on that
+data dramatically underestimates CI width (by a factor of roughly √M);
+block bootstrap samples contiguous blocks so the within-block correlation
+structure is preserved across replicates. Block bootstrap is incompatible
+with class stratification (blocks are sampled without regard to class), so
+``stratify`` is ignored when ``block_size`` is set.
+
+Pick ``block_size`` ≈ M (the label horizon). At BTCUSDT M=20 that means
+``block_size=20``.
 """
 
 from __future__ import annotations
@@ -46,6 +63,38 @@ class BootstrapResult:
         return d
 
 
+def block_indices(
+    n: int,
+    B: int,
+    rng: np.random.Generator,
+    *,
+    block_size: int,
+) -> np.ndarray:
+    """Moving-block bootstrap: ``(B, n)`` index matrix built by concatenating
+    random contiguous blocks of length ``block_size``.
+
+    The block start index is uniformly distributed in ``[0, n - block_size]``,
+    so each block contains ``block_size`` consecutive original indices. We
+    concatenate ``ceil(n / block_size)`` blocks per replicate, then truncate
+    to length ``n``.
+
+    Preserves the within-block correlation structure of the original
+    sequence. Required for autocorrelated label streams (e.g. 1-min cadence
+    barrier labels where adjacent labels share M−1 future bars).
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be > 0, got {block_size}")
+    if block_size > n:
+        raise ValueError(f"block_size ({block_size}) > n ({n})")
+    n_blocks = int(np.ceil(n / float(block_size)))
+    starts = rng.integers(0, n - block_size + 1, size=(B, n_blocks), dtype=np.int64)
+    offsets = np.arange(block_size, dtype=np.int64)
+    # (B, n_blocks, 1) + (1, 1, block_size) -> (B, n_blocks, block_size)
+    blocks = starts[..., None] + offsets[None, None, :]
+    out = blocks.reshape(B, n_blocks * block_size)
+    return out[:, :n]
+
+
 def iid_indices(
     n: int,
     B: int,
@@ -81,11 +130,19 @@ def bootstrap_metric(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> BootstrapResult:
     """Bootstrap an arbitrary ``(y_true, y_pred_proba) -> float`` metric.
 
-    Class-stratified iid bootstrap by default. Set ``stratify=False`` to let
-    prevalence vary across replicates.
+    Class-stratified IID bootstrap by default (the right call for
+    independent samples — e.g. the legacy boundary-cadence dataset).
+
+    For autocorrelated label streams (e.g. 1-min-cadence barrier labels,
+    where adjacent samples share M−1 of their M future bars), pass
+    ``block_size`` ≈ M (the label horizon). This swaps to a moving-block
+    bootstrap so the within-block correlation structure is preserved
+    across replicates, producing honest (wider) CIs. Stratification is
+    incompatible with block bootstrap and is ignored when ``block_size`` is set.
 
     Returns ``BootstrapResult`` with ``point`` (metric on the full data),
     ``median``, ``ci_low``, ``ci_high`` (percentile CI at level ``ci``), and
@@ -98,7 +155,10 @@ def bootstrap_metric(
     if y_arr.ndim != 1:
         raise ValueError(f"y and p must be 1D, got {y_arr.ndim}D")
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y_arr), B, rng, stratify=y_arr if stratify else None)
+    if block_size is not None and int(block_size) > 1:
+        idx = block_indices(len(y_arr), B, rng, block_size=int(block_size))
+    else:
+        idx = iid_indices(len(y_arr), B, rng, stratify=y_arr if stratify else None)
     samples = np.empty(B, dtype=float)
     for b in range(B):
         i = idx[b]

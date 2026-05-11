@@ -86,3 +86,91 @@ def test_excursion_and_liquidity_parity(bars_with_base):
     engine = FeatureEngine(tiers=(1, 2), families=("excursion", "liquidity"))
     result = engine.transform(bars_pl)
     _assert_parity(legacy, result.data, legacy_cols, result.warmup_trimmed)
+
+
+def test_excursion_rolling_equals_sparse_at_boundary_rows(bars_with_base):
+    """At rows that are multiples of M, the new every-row trailing
+    drawup/drawdown values must equal the legacy boundary-sparse values.
+
+    Proves the rolling variant is a strict superset (same value at the
+    legacy-populated rows, plus values at every other row). This is the
+    contract that makes the rolling variant a safe drop-in replacement
+    at 1-min cadence without losing boundary-cadence comparability."""
+    from src.features.config import M as M_BARS
+
+    bars_pl = _to_polars(bars_with_base)
+    engine = FeatureEngine(tiers=(2,), families=("excursion",))
+    out = engine.transform(bars_pl, trim=False).data
+
+    for W in WINDOWS_EXCURSION:
+        sparse_up = f"excursion__max_drawup__f__w{W}"
+        sparse_dn = f"excursion__max_drawdown__f__w{W}"
+        roll_up = f"excursion__roll_max_drawup__f__w{W}"
+        roll_dn = f"excursion__roll_max_drawdown__f__w{W}"
+        for sparse_col, roll_col in [(sparse_up, roll_up), (sparse_dn, roll_dn)]:
+            sparse = np.array(
+                [v if v is not None else np.nan for v in out[sparse_col].to_list()],
+                dtype=float,
+            )
+            roll = np.array(
+                [v if v is not None else np.nan for v in out[roll_col].to_list()],
+                dtype=float,
+            )
+            # On rows that are multiples of M and have a populated sparse
+            # value, the rolling value must coincide. Sparse rows beyond
+            # warmup have a value; non-multiples-of-M have NaN.
+            n = len(sparse)
+            for i in range(W - 1, n, M_BARS):
+                if np.isnan(sparse[i]):
+                    continue
+                assert not np.isnan(roll[i]), (
+                    f"{sparse_col}: sparse is populated at row {i} but roll is NaN"
+                )
+                assert abs(sparse[i] - roll[i]) < 1e-12, (
+                    f"{sparse_col} vs {roll_col} at row {i}: {sparse[i]} != {roll[i]}"
+                )
+            # Rolling values must also be populated AFTER warmup at rows
+            # that are NOT multiples of M (the whole point of the refactor).
+            non_M_rows_after_warmup = [
+                i for i in range(W - 1, min(W + 200, n)) if i % M_BARS != 0
+            ]
+            n_dense = sum(1 for i in non_M_rows_after_warmup if not np.isnan(roll[i]))
+            assert n_dense == len(non_M_rows_after_warmup), (
+                f"{roll_col}: expected all non-M rows after warmup to be dense; "
+                f"got {n_dense}/{len(non_M_rows_after_warmup)}"
+            )
+
+
+def test_excursion_rolling_is_strictly_causal_under_masking(bars_with_base):
+    """Mask price-history rows AFTER a chosen probe row and verify the
+    rolling drawup/drawdown values at and before that row are unchanged.
+
+    A non-causal computation (e.g. one that peeked at a centered window)
+    would see different values when the future is masked. The trailing-
+    window formula must not."""
+    bars_pl = _to_polars(bars_with_base)
+    engine = FeatureEngine(tiers=(2,), families=("excursion",))
+    out_full = engine.transform(bars_pl, trim=False).data
+
+    # Mask: replace p (the log-price column the family reads) after t_probe
+    # with null and recompute the engine.
+    t_probe = 5000
+    p_full = out_full["p"].to_list()
+    p_masked = [v if i <= t_probe else None for i, v in enumerate(p_full)]
+    bars_masked = bars_pl.with_columns(pl.Series("p", p_masked))
+    out_masked = engine.transform(bars_masked, trim=False).data
+
+    cols_to_check = [
+        c for c in out_full.columns
+        if c.startswith("excursion__roll_max_drawup__f__")
+        or c.startswith("excursion__roll_max_drawdown__f__")
+    ]
+    for col in cols_to_check:
+        v_full = out_full[col][t_probe]
+        v_masked = out_masked[col][t_probe]
+        if v_full is None and v_masked is None:
+            continue
+        assert v_full == v_masked, (
+            f"causality violation in {col} at probe row {t_probe}: "
+            f"full={v_full} masked={v_masked}"
+        )

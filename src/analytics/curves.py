@@ -41,7 +41,31 @@ from sklearn.metrics import (
 
 from src.utils import expected_calibration_error
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, iid_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, block_indices, iid_indices
+
+
+def _choose_indices(
+    n: int,
+    B: int,
+    rng: np.random.Generator,
+    *,
+    stratify_y: Optional[np.ndarray],
+    stratify: bool,
+    block_size: Optional[int],
+) -> np.ndarray:
+    """Pick block or iid (optionally stratified) resampling indices.
+
+    Centralized helper so every curve / metric bootstrap in this module
+    uses the same precedence rule: ``block_size > 1`` -> moving-block
+    bootstrap (stratification is incompatible with blocks and is
+    ignored), else stratified-iid (if ``stratify=True`` and labels are
+    available), else plain iid.
+    """
+    if block_size is not None and int(block_size) > 1:
+        return block_indices(n, B, rng, block_size=int(block_size))
+    return iid_indices(
+        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
+    )
 
 
 @dataclass
@@ -168,6 +192,7 @@ def bootstrap_roc_curve(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> CurveBootstrapResult:
     """Bootstrap an ROC curve onto a fixed FPR grid.
 
@@ -175,6 +200,10 @@ def bootstrap_roc_curve(
     bootstrap distribution. Uses the same ``iid_indices(seed)`` as
     ``bootstrap_metric``, so the AUC samples are identical between the two
     functions when called with matching ``B``, ``stratify``, and ``seed``.
+
+    Pass ``block_size`` ≈ M for autocorrelated label streams (1-min
+    cadence). Stratification is incompatible with block bootstrap and is
+    ignored when ``block_size`` is set.
     """
     y = np.asarray(y)
     p = np.asarray(p)
@@ -185,7 +214,9 @@ def bootstrap_roc_curve(
     point_auc = float(roc_auc_score(y, p))
 
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples = np.empty((B, len(fpr_grid)), dtype=float)
     auc_samples = np.empty(B, dtype=float)
     for b in range(B):
@@ -220,11 +251,15 @@ def bootstrap_pr_curve(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> CurveBootstrapResult:
     """Bootstrap a PR curve onto a fixed recall grid (max-envelope precision).
 
     AP samples are identical to ``bootstrap_metric(average_precision_score, ...)``
     with matching ``B``, ``stratify``, ``seed`` — see consistency test.
+
+    Pass ``block_size`` ≈ M to switch to block bootstrap for autocorrelated
+    label streams (1-min cadence).
     """
     y = np.asarray(y)
     p = np.asarray(p)
@@ -235,7 +270,9 @@ def bootstrap_pr_curve(
     point_ap = float(average_precision_score(y, p))
 
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples = np.empty((B, len(recall_grid)), dtype=float)
     ap_samples = np.empty(B, dtype=float)
     for b in range(B):
@@ -270,6 +307,7 @@ def bootstrap_calibration_curve(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> CurveBootstrapResult:
     """Bootstrap a reliability diagram with per-bin CIs on empirical fraction.
 
@@ -279,7 +317,8 @@ def bootstrap_calibration_curve(
     fields hold ECE (10-bin), the curve's summary metric.
 
     Empty bins (no predictions in [edge_i, edge_{i+1})) carry ``nan`` for
-    both x and y so they can be skipped at plot time.
+    both x and y so they can be skipped at plot time. Pass ``block_size``
+    ≈ M to switch to block bootstrap for autocorrelated label streams.
     """
     y = np.asarray(y)
     p = np.asarray(p)
@@ -288,7 +327,9 @@ def bootstrap_calibration_curve(
     point_ece = float(expected_calibration_error(y, p, n_bins=n_bins))
 
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples = np.full((B, n_bins), np.nan, dtype=float)
     ece_samples = np.empty(B, dtype=float)
     for b in range(B):

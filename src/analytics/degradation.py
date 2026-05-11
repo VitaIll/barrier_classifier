@@ -39,7 +39,31 @@ import numpy as np
 import pandas as pd
 
 from src.utils import expected_calibration_error
-from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, bootstrap_metric, iid_indices
+from .bootstrap import (
+    DEFAULT_B,
+    DEFAULT_CI,
+    BootstrapResult,
+    block_indices,
+    bootstrap_metric,
+    iid_indices,
+)
+
+
+def _choose_indices(
+    n: int,
+    B: int,
+    rng: np.random.Generator,
+    *,
+    stratify_y: Optional[np.ndarray],
+    stratify: bool,
+    block_size: Optional[int],
+) -> np.ndarray:
+    """Block bootstrap if ``block_size > 1``, else stratified/iid."""
+    if block_size is not None and int(block_size) > 1:
+        return block_indices(n, B, rng, block_size=int(block_size))
+    return iid_indices(
+        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
+    )
 
 PSI_EPS = 1e-6  # smoothing for empty bins (so log(a/b) is finite)
 
@@ -196,11 +220,14 @@ def bootstrap_brier_decomposition(
     ci: float = DEFAULT_CI,
     stratify: bool = True,
     seed: int = 0,
+    block_size: Optional[int] = None,
 ) -> Dict[str, BootstrapResult]:
     """Bootstrap all four Brier-Murphy components in one pass.
 
     Returns ``{component_name: BootstrapResult}`` for ``brier``, ``reliability``,
-    ``resolution``, ``uncertainty``, ``within_bin_variance``.
+    ``resolution``, ``uncertainty``, ``within_bin_variance``. Pass
+    ``block_size`` ≈ M to switch to block bootstrap for autocorrelated
+    label streams (1-min cadence).
     """
     y = np.asarray(y)
     p = np.asarray(p)
@@ -213,7 +240,9 @@ def bootstrap_brier_decomposition(
         "within_bin_variance",
     ]
     rng = np.random.default_rng(seed)
-    idx = iid_indices(len(y), B, rng, stratify=y if stratify else None)
+    idx = _choose_indices(
+        len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
+    )
     samples: Dict[str, np.ndarray] = {k: np.empty(B, dtype=float) for k in keys}
     for b in range(B):
         i = idx[b]
@@ -312,6 +341,7 @@ def rolling_metrics_with_ci(
     seed: int = 0,
     min_n: int = 150,
     min_pos: int = 15,
+    block_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Per-window bootstrap CI bands on each metric for a given split.
 
@@ -354,7 +384,16 @@ def rolling_metrics_with_ci(
             "base_rate": float(y.mean()),
         }
         for name, fn in metric_funcs.items():
-            res = bootstrap_metric(fn, y, p, B=B, ci=ci, stratify=stratify, seed=seed)
+            res = bootstrap_metric(
+                fn,
+                y,
+                p,
+                B=B,
+                ci=ci,
+                stratify=stratify,
+                seed=seed,
+                block_size=block_size,
+            )
             row[f"{name}_point"] = res.point
             row[f"{name}_ci_low"] = res.ci_low
             row[f"{name}_ci_high"] = res.ci_high
@@ -375,6 +414,7 @@ def rolling_brier_decomposition(
     seed: int = 0,
     min_n: int = 150,
     min_pos: int = 15,
+    block_size: Optional[int] = None,
 ) -> pd.DataFrame:
     """Per-window Brier-Murphy decomposition with bootstrap CIs.
 
@@ -401,7 +441,14 @@ def rolling_brier_decomposition(
         y = win["y"].to_numpy()
         p = win["p"].to_numpy()
         decomp = bootstrap_brier_decomposition(
-            y, p, n_bins=n_bins, B=B, ci=ci, stratify=stratify, seed=seed
+            y,
+            p,
+            n_bins=n_bins,
+            B=B,
+            ci=ci,
+            stratify=stratify,
+            seed=seed,
+            block_size=block_size,
         )
         row: Dict[str, Any] = {
             "window_start": win_start,
