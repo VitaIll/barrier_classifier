@@ -302,15 +302,22 @@ def test_bootstrap_metric_propagates_metric_errors():
 
 
 def test_bootstrap_metric_propagates_nan_metrics():
-    """A metric that *returns* NaN (modern sklearn single-class ROC-AUC)
-    must surface as a NaN point estimate, not be silently dropped."""
-    y = np.zeros(100, dtype=int)  # single class -> sklearn>=1.8 returns NaN
+    """A metric that *returns* NaN must surface as a NaN point estimate, not be
+    silently dropped.
+
+    Uses a metric that returns ``float('nan')`` directly instead of relying on
+    single-class ``roc_auc_score``: sklearn's single-class behavior is
+    version-specific (raises ``ValueError`` before 1.8, returns NaN with an
+    ``UndefinedMetricWarning`` from 1.8 on), so the old premise only exercised
+    this contract on sklearn >= 1.8. ``bootstrap_metric`` computes ``point`` on
+    the full data unguarded, so a NaN-returning metric deterministically yields
+    a NaN point estimate on any supported sklearn (>= 1.3)."""
+    y = np.zeros(100, dtype=int)
     p = np.random.default_rng(0).random(100)
-    with pytest.warns(Warning):
-        res = bootstrap_metric(
-            lambda y_, p_: float(roc_auc_score(y_, p_)),
-            y, p, B=10, seed=0, stratify=False,
-        )
+    res = bootstrap_metric(
+        lambda y_, p_: float("nan"),
+        y, p, B=10, seed=0, stratify=False,
+    )
     assert math.isnan(res.point)
 
 
