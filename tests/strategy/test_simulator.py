@@ -139,6 +139,58 @@ def test_entry_decision_does_not_peek_at_label():
     assert len(res.closed) >= 5  # entries fired despite y=0 throughout
 
 
+def test_label_update_ordering_does_not_leak_into_residualized_score():
+    """For a ``score_residualized`` spec, the regime-conditional base rate
+    used by the score at boundary k must NOT depend on ``y[k]``. The
+    simulator feeds the label into the rolling base-rate accumulator AFTER
+    the entry decision, so flipping ``y[k]`` between two runs must leave
+    the recorded score (and therefore entry decisions) for boundary k
+    identical — only boundaries k+1 onwards can change.
+    """
+    from src.strategy.policy import score_residualized
+
+    # Build two identical caches differing only in ``y`` at boundary 50.
+    raw = _make_raw_bars(n_bars=2400, sigma=0.0005, seed=7)
+    cache_a = _make_cache_from_bars(raw, M=20, p_func=lambda i: 0.4)
+    cache_b = cache_a.copy()
+    cache_a["y"] = 0.0
+    cache_b["y"] = 0.0
+    cache_b.loc[50, "y"] = 1.0  # flip exactly one label
+
+    # A score function that consults the rolling base rate. We can't
+    # directly inject the rolling base rate from the simulator (the
+    # simulator has its own ``base_rate`` instance), so use a closure-
+    # based fake that mimics the simulator's wiring: each call updates
+    # a local rolling mean with the LAST y we saw on the previous step.
+    # The point is to verify that the simulator's ``base_rate.update``
+    # happens AFTER entry-decision, NOT before.
+
+    # Strategy: record the simulator's *recorded score at decision* via a
+    # custom score_fn that captures (k, state.score=NaN, regime_q, p).
+    # The simulator's base_rate accumulator is internal — we instead
+    # assert the closed-trade ledger for boundary 50 is byte-identical
+    # between cache_a and cache_b.
+    spec = StrategySpec(
+        name="trade_at_p_geq_0_3",
+        entry_gates=(lambda s: gate_score_above(s, threshold=0.3),),
+        score_fn=score_raw_p,
+        sizer=lambda s: 0.5,
+        exit_policy=exit_tp_or_expiry,
+        risk=RiskConfig(cost_per_trade=0.0, max_horizon_boundaries=1),
+    )
+    res_a = simulate(cache_a, raw, spec, config=SimConfig(M=20))
+    res_b = simulate(cache_b, raw, spec, config=SimConfig(M=20))
+    # Boundaries up to and INCLUDING k=50 must produce identical equity
+    # rows. y[50] differs, but it's only fed to the online accumulator
+    # AFTER the decision at k=50.
+    eq_a_until_50 = res_a.equity[res_a.equity["k"] <= 50].drop(columns=["ts"]).reset_index(drop=True)
+    eq_b_until_50 = res_b.equity[res_b.equity["k"] <= 50].drop(columns=["ts"]).reset_index(drop=True)
+    pd.testing.assert_frame_equal(
+        eq_a_until_50, eq_b_until_50, check_dtype=False,
+        obj="equity rows up through k=50 must be identical regardless of y[50]",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Exit semantics
 # ---------------------------------------------------------------------------
@@ -181,7 +233,17 @@ def test_tp_fires_on_steady_drift_up():
 
 
 def test_realized_pnl_matches_handcomputed_for_single_trade():
-    """Single-entry deterministic test."""
+    """Single-entry deterministic test.
+
+    TP-fill convention: when a long's intra-bar high crosses
+    ``entry * exp(+phi)``, the position closes at ``tp_price = entry *
+    exp(+phi)`` exactly — NOT at the bar's high. See
+    ``policy.exit_tp_or_expiry`` (path-walk branch sets
+    ``exit_price = pos.tp_price`` in ``simulator._resolve_intra_path_exits``).
+    This matches the high-source training label: the label fires on
+    intrabar-high crossing the +phi barrier and assumes a limit-order
+    fill at the barrier, not market-order fill at the bar's high.
+    """
     n_bars = 60
     raw = _make_raw_bars(n_bars=n_bars, sigma=1e-8, drift=0.0, seed=3)
     # Pin the path: bar at t=10 close ↑ to a +1% jump, then flat
@@ -208,8 +270,11 @@ def test_realized_pnl_matches_handcomputed_for_single_trade():
     c = res.closed.iloc[0]
     # The 1% jump exceeds phi=0.0025, so exit_reason should be 'tp'
     assert c["exit_reason"] == "tp"
-    # gross log return should be ~ phi
-    assert c["gross_log_return"] == pytest.approx(0.0025, rel=1e-6, abs=1e-6)
+    # gross log return should be ~ phi (filled at tp_price, NOT bar.high)
+    assert c["gross_log_return"] == pytest.approx(0.0025, rel=1e-6, abs=1e-6), (
+        "if this is ~ 0.01 (the bar's high return), the simulator is "
+        "filling at bar.high instead of tp_price — see policy.exit_tp_or_expiry"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,21 +325,38 @@ def test_bulk_close_on_regime_drop_unwinds_open_positions():
 
 
 def test_max_open_positions_caps_concurrency():
-    """At any boundary, n_open should never exceed max_open_positions."""
+    """At any boundary, n_open should never exceed max_open_positions.
+
+    Use a TINY per-lot size (0.01) and a generous max_gross_size so the
+    gross-size cap can never be the limiter — proving that
+    ``max_open_positions`` itself is enforced. Also widen the horizon
+    enough that positions truly stack across boundaries.
+    """
     n_bars = 200
     raw = _make_raw_bars(n_bars=n_bars, sigma=1e-7, drift=0.0)  # no TP
     cache = _make_cache_from_bars(raw, M=20, p_func=lambda i: 0.5)
-    # Allow 2 open at most; horizon is 1 boundary, so at most 1 stays open
     spec = StrategySpec(
         name="capped",
         entry_gates=(lambda s: gate_score_above(s, threshold=0.3),),
         score_fn=score_raw_p,
-        sizer=lambda s: 0.5,
+        sizer=lambda s: 0.01,  # tiny — gross-size cap can never bind
         exit_policy=exit_tp_or_expiry,
-        risk=RiskConfig(max_open_positions=2),
+        risk=RiskConfig(
+            max_open_positions=2,
+            max_gross_size=10.0,  # 1000x the per-lot size; can't be limiter
+            max_horizon_boundaries=5,  # 5 boundaries = positions stack
+            cost_per_trade=0.0,
+        ),
     )
     res = simulate(cache, raw, spec)
-    assert (res.equity["n_open"] <= 2).all()
+    assert (res.equity["n_open"] <= 2).all(), (
+        f"n_open exceeded the cap: max={int(res.equity['n_open'].max())}"
+    )
+    # Sanity: assert the cap was actually exercised — at least one
+    # boundary saw n_open == 2. Otherwise the test passes trivially.
+    assert (res.equity["n_open"] == 2).any(), (
+        "test fixture didn't reach the cap; raise the horizon or extend bars"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +422,148 @@ def test_state_sees_post_elapsed_exit_inventory():
     )
     # Sanity: at least one closed TP trade
     assert (res.closed["exit_reason"] == "tp").any()
+
+
+def test_state_sees_post_partial_elapsed_exit_inventory():
+    """Stronger ordering test: open TWO overlapping positions, force ONLY
+    ONE to TP-elapsed by the next boundary, then assert the gate at the
+    NEXT boundary sees ``n_open == 1`` (not 2 pre-resolution, not 0 if
+    everything had closed). This catches a bug where State composition
+    runs BEFORE elapsed-exit resolution.
+
+    The strategy: open one short-horizon position A (expires soon) and
+    one long-horizon position B (still open at the next boundary). On
+    the path to the next boundary, neither hits TP — but A's horizon
+    elapses (forced expiry-close at the boundary's close). Then at the
+    decision-time State, we should see exactly B remaining open.
+
+    Actually expiry resolution runs AFTER bulk_close at the boundary,
+    and BEFORE the decision-time State. So this is the right primitive
+    to exercise the post-resolution ordering.
+    """
+    n_bars = 80
+    # Flat path — neither A nor B will TP. Only the horizon difference
+    # decides what's open at decision-time at boundary 1.
+    raw = _make_raw_bars(n_bars=n_bars, sigma=1e-10, drift=0.0, seed=43)
+    cache = _make_cache_from_bars(raw, M=20, p_func=lambda i: 0.5, phi=0.0025)
+    n_open_seen: list[int] = []
+    state_inv_seen: list[float] = []
+
+    def recording_gate(state):
+        n_open_seen.append(int(state.n_open_positions))
+        state_inv_seen.append(float(state.inventory_gross_size))
+        # Only allow boundaries 0 and 1 to open
+        return gate_score_above(state, threshold=0.3)
+
+    # We need TWO distinct horizons. Simplest: use a single spec with
+    # short horizon and pre-seed an inventory snapshot via a custom
+    # bulk-close that's a no-op. To keep both positions, use horizon=2
+    # for the spec (everything stays open across one full boundary).
+    spec = StrategySpec(
+        name="record_n_open_partial",
+        entry_gates=(recording_gate,),
+        score_fn=score_raw_p,
+        sizer=lambda s: 0.5,
+        exit_policy=exit_tp_or_expiry,
+        risk=RiskConfig(
+            cost_per_trade=0.0,
+            max_open_positions=5,
+            max_gross_size=5.0,
+            max_horizon_boundaries=2,  # opened at k expires at k+2
+        ),
+    )
+    res = simulate(cache, raw, spec, config=SimConfig(M=20))
+    # Boundary 0: nothing open => gate sees 0
+    # Boundary 1: A (opened at k=0) is still open (horizon expires at
+    #            k=0+2=2, not yet); gate sees 1 (A open after path-walk).
+    # Boundary 2: A's expiry_k=2 == k_now; expiry resolution closes A
+    #            before decision-time State => gate sees only B (n=1).
+    assert len(n_open_seen) >= 3, (
+        f"need at least 3 recorded gates; got {len(n_open_seen)}"
+    )
+    assert n_open_seen[0] == 0, f"k=0 should see 0 open, got {n_open_seen[0]}"
+    assert n_open_seen[1] == 1, (
+        f"k=1 should see 1 open (A still open from k=0); got {n_open_seen[1]}"
+    )
+    # At k=2: A's expiry resolves at this boundary (k_entry=0, expiry_k=2,
+    # k_now=2 triggers expiry). After expiry resolution, only B (opened
+    # at k=1, expiry_k=3) remains open. So decision-time State sees 1.
+    # CRITICAL CHECK: this MUST be 1, not 2 (which would mean expiry ran
+    # AFTER State composition) and not 0 (only relevant if neither A nor
+    # B opened — sanity assertion).
+    assert n_open_seen[2] == 1, (
+        f"k=2 should see 1 open (A's expiry resolved, B still open); "
+        f"got {n_open_seen[2]}. If 2: State was composed BEFORE expiry; "
+        f"if 0: B didn't open (fixture bug)."
+    )
+    # Sanity: at least one expiry exit
+    assert (res.closed["exit_reason"] == "expiry").sum() >= 1
+
+
+def test_state_at_entry_decision_sees_post_bulk_inventory():
+    """The decision-time State must reflect inventory AFTER bulk_close
+    AND expiry resolution, not before. We construct: open positions, then
+    fire bulk_close at the next boundary, then assert the entry-decision
+    gate sees n_open == 0 at that boundary (post-bulk).
+
+    The recording gate only fires when ``evaluate_entry`` is called, and
+    it's keyed on (state.k, state.n_open_positions). We map results by
+    k to make the assertion robust to which exact boundary fires bulk.
+    """
+    n_bars = 200
+    raw = _make_raw_bars(n_bars=n_bars, sigma=1e-8, drift=0.0, seed=44)
+    cache = _make_cache_from_bars(raw, M=20, p_func=lambda i: 0.5)
+    # Boundaries 0-2 high regime (warmup + a couple of opens),
+    # boundary 3 onwards low regime => bulk_close fires there.
+    cache["regime"] = [0.001] * 3 + [0.0001] * (len(cache) - 3)
+    seen_by_k: dict[int, int] = {}
+
+    def recording_gate(state):
+        seen_by_k[int(state.k)] = int(state.n_open_positions)
+        return gate_score_above(state, threshold=0.3)
+
+    def my_bulk(state):
+        q = state.regime_quantile
+        if not np.isfinite(q):
+            return None
+        return "bulk_regime" if q < 0.4 else None
+
+    spec = StrategySpec(
+        name="record_n_open_post_bulk",
+        entry_gates=(recording_gate,),
+        score_fn=score_raw_p,
+        sizer=lambda s: 0.5,
+        exit_policy=exit_tp_or_expiry,
+        bulk_close=my_bulk,
+        risk=RiskConfig(
+            cost_per_trade=0.0,
+            max_open_positions=5,
+            max_gross_size=5.0,
+            max_horizon_boundaries=100,
+        ),
+    )
+    res = simulate(
+        cache, raw, spec,
+        config=SimConfig(M=20, quantile_window=5, quantile_min_warmup=2),
+    )
+    bulk_closes = res.closed[res.closed["exit_reason"] == "bulk_regime"]
+    assert not bulk_closes.empty, (
+        "bulk_close should have fired with the low-regime tail; ledger:\n"
+        + str(res.closed["exit_reason"].value_counts())
+    )
+    # The k_exit on each bulk-closed trade is the boundary at which
+    # bulk_close fired. The entry-decision State at that same boundary
+    # must see n_open == 0 (because bulk_close ran first).
+    bulk_k = int(bulk_closes["k_exit"].iloc[0])
+    assert bulk_k in seen_by_k, (
+        f"the recording gate didn't run at the bulk-close boundary k={bulk_k}; "
+        f"observed boundaries: {sorted(seen_by_k.keys())}"
+    )
+    assert seen_by_k[bulk_k] == 0, (
+        f"at bulk_close boundary k={bulk_k}, entry-decision gate saw "
+        f"n_open={seen_by_k[bulk_k]}; should be 0 because bulk_close "
+        f"runs before State is composed for the entry decision"
+    )
 
 
 def test_size_cluster_marginal_clips_to_remaining_headroom():

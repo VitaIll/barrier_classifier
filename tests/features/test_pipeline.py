@@ -170,6 +170,38 @@ _NON_FEATURE_COLS_FOR_PIPELINE_TEST = frozenset(
 )
 
 
+# Representative columns used by ``test_run_pipeline_matches_legacy_chain``
+# below. Lifted to module scope so the registry-coverage invariant test
+# (``test_pipeline_sample_cols_cover_every_registered_family``) can read it.
+_PIPELINE_SAMPLE_COLS: tuple[str, ...] = (
+    "ret__lag1__f__w0",                       # lag family
+    "ret__std__f__w60",                       # rolling family
+    "ret__q50__f__w240",                      # quantile family (boundary-sparse)
+    "vol__rs__f__w240",                       # vol Tier-1
+    "vol__bpv_ratio__f__w240",                # vol Tier-2
+    "logp__pos__f__w240",                     # candle breakout
+    "ret__rsi__f__w14",                       # trend RSI (Wilder shift trick)
+    "logvol__z__f__w120",                     # activity rolling
+    "ret__acf1__f__w240",                     # correlation
+    "pentropy_norm__inst__f__w240__m3__tau1", # entropy
+    "event__run_dir__f__w0",                  # event
+    "time__sin_minute__f__w0",                # seasonality (Int8 overflow)
+    "excursion__max_drawup__f__w240",         # excursion (boundary-sparse)
+    "liq__amihud__f__w120",                   # liquidity
+)
+
+
+# Families added in Round 1/2 with no legacy ``utils.compute_*``
+# counterpart. They participate in the default no-derivatives pipeline
+# but cannot be parity-tested against the legacy chain. The coverage
+# invariant below exempts them; their correctness is verified by
+# ``tests/features/test_family_round1.py`` and
+# ``tests/features/test_family_equilibrium.py``.
+_PIPELINE_FAMILIES_WITHOUT_LEGACY_PARITY: frozenset[str] = frozenset(
+    {"extreme", "pivot", "flow", "eq"}
+)
+
+
 def _feature_columns(df: pl.DataFrame) -> list[str]:
     return [c for c in df.columns if c not in _NON_FEATURE_COLS_FOR_PIPELINE_TEST
             and not c.startswith("undef__")
@@ -398,47 +430,51 @@ def test_run_pipeline_matches_legacy_chain(bars_pd):
         f"row count mismatch: legacy={len(legacy)} engine={len(engine_out)}"
     )
 
-    # Compare label/aux columns
-    for col in ("y", "m_k", "tau_k", "k"):
+    # Compare label/aux columns. ``k`` is integer and matches exactly; the
+    # float-valued ``y``/``m_k``/``tau_k``/``phi`` use the contract
+    # ``rtol=1e-9, atol=1e-12`` rather than exact equality.
+    for col in ("k",):
+        legacy_vals = legacy[col].to_numpy(dtype=float)
+        engine_vals = np.array(
+            [v if v is not None else float("nan") for v in engine_out[col].to_list()],
+            dtype=float,
+        )
+        np.testing.assert_array_equal(
+            engine_vals, legacy_vals, err_msg=f"{col}: divergence",
+        )
+    for col in ("y", "m_k", "tau_k"):
         legacy_vals = legacy[col].to_numpy(dtype=float)
         engine_vals = np.array(
             [v if v is not None else float("nan") for v in engine_out[col].to_list()],
             dtype=float,
         )
         np.testing.assert_allclose(
-            engine_vals, legacy_vals, rtol=0, atol=0,
+            engine_vals, legacy_vals, rtol=1e-9, atol=1e-12,
             err_msg=f"{col}: divergence",
         )
 
     # Spot-check a representative sample of feature columns from each family.
     # Full per-column comparison runs in the family-level parity tests; here
-    # we verify the pipeline composes correctly.
-    sample_cols = [
-        "ret__lag1__f__w0",                 # lag family
-        "ret__std__f__w60",                 # rolling family
-        "ret__q50__f__w240",                # quantile family (boundary-sparse)
-        "vol__rs__f__w240",                 # vol Tier-1
-        "vol__bpv_ratio__f__w240",          # vol Tier-2
-        "logp__pos__f__w240",               # candle breakout
-        "ret__rsi__f__w14",                 # trend RSI (Wilder shift trick)
-        "logvol__z__f__w120",               # activity rolling
-        "ret__acf1__f__w240",               # correlation
-        "pentropy_norm__inst__f__w240__m3__tau1",  # entropy
-        "event__run_dir__f__w0",            # event
-        "time__sin_minute__f__w0",          # seasonality (Int8 overflow caught)
-        "data__bad_ohlc__f__w0",            # quality
-        "excursion__max_drawup__f__w240",   # Tier-2 boundary-sparse
-        "liq__amihud__f__w120",             # Tier-2 liquidity
-        "ret__inst__h__w0",                 # block feature
-        "barrier__z_tight__f__w240",        # barrier-aware
-        "hit__prev__h__w0",                 # past-target
+    # we verify the pipeline composes correctly. Boundary-stage columns
+    # (``ret__inst__h__w0``, ``barrier__z_tight__*``, ``hit__prev__h__w0``,
+    # ``data__bad_ohlc__f__w0``) live outside the family registry — they
+    # are checked separately to keep ``_PIPELINE_SAMPLE_COLS`` aligned
+    # with ``get_registry()`` for the coverage invariant.
+    sample_cols = list(_PIPELINE_SAMPLE_COLS) + [
+        "data__bad_ohlc__f__w0",          # quality stage
+        "ret__inst__h__w0",               # block feature
+        "barrier__z_tight__f__w240",      # barrier-aware
+        "hit__prev__h__w0",               # past-target
     ]
     for col in sample_cols:
         if col not in engine_out.columns:
             pytest.fail(f"engine output missing expected column {col}")
         if col not in legacy.columns:
-            pytest.skip(f"legacy missing {col} — investigate")
-            continue
+            pytest.fail(
+                f"legacy chain missing {col} — the parity test must compare "
+                "a column that appears in both pipelines; the hand-maintained "
+                "sample list has drifted from the registered families."
+            )
         legacy_vals = legacy[col].to_numpy(dtype=float)
         engine_vals = np.array(
             [v if v is not None else float("nan") for v in engine_out[col].to_list()],
@@ -455,3 +491,47 @@ def test_run_pipeline_matches_legacy_chain(bars_pd):
                 rtol=1e-9, atol=1e-12,
                 err_msg=f"{col}: numeric divergence",
             )
+
+
+def test_pipeline_sample_cols_cover_every_registered_family():
+    """Invariant: ``_PIPELINE_SAMPLE_COLS`` must touch every family
+    registered for the no-derivatives end-to-end pipeline run. When a
+    new family is added but the sample list isn't updated, the parity
+    test silently stops covering it; this test fires loudly instead.
+    """
+    from src.features.base import get_registry
+    from src.features.pipeline import _DEFAULT_FAMILIES_NO_DERIV
+
+    # Set of families actually registered AND included in the default
+    # no-derivatives pipeline. Excludes derivatives families (their parity
+    # test lives in test_family_step11.py) and families without a legacy
+    # counterpart (Round 1 additions — extreme, pivot, flow — see
+    # ``_PIPELINE_FAMILIES_WITHOUT_LEGACY_PARITY``).
+    pipeline_families = set(_DEFAULT_FAMILIES_NO_DERIV) - _PIPELINE_FAMILIES_WITHOUT_LEGACY_PARITY
+    registered_families = {
+        cls.family
+        for cls in get_registry()
+        if cls.family in pipeline_families
+    }
+
+    # Each sample column maps to a family via its leading family-class
+    # registration. Build {family -> set(emitted_columns)} from the
+    # registry and check every family hits at least one sample col.
+    family_to_cols: dict[str, set[str]] = {f: set() for f in pipeline_families}
+    for cls in get_registry():
+        if cls.family in family_to_cols:
+            spec = cls()
+            for _w, name in spec.expanded():
+                family_to_cols[cls.family].add(name)
+
+    sample_set = set(_PIPELINE_SAMPLE_COLS)
+    uncovered = []
+    for family in registered_families:
+        if not (family_to_cols[family] & sample_set):
+            uncovered.append(family)
+    assert not uncovered, (
+        "Pipeline parity sample list does not cover registered families: "
+        f"{sorted(uncovered)}. Add a representative column for each to "
+        "_PIPELINE_SAMPLE_COLS so the end-to-end parity test exercises "
+        "every family registered in the default pipeline."
+    )

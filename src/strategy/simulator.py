@@ -101,6 +101,11 @@ class SimConfig:
     base_rate_n_bins: int = 5
     sigma_target: float = 0.001          # used by size_voltarget_overlay if spec opts in
     cost_per_trade_override: Optional[float] = None  # overrides spec.risk.cost_per_trade
+    # Per-row cadence in minutes. 20.0 = legacy 20-min-boundary mode; 1.0 =
+    # canonical 1-min spec from the overlapping-target refactor. Used by
+    # reporting.headline_row for Sharpe annualization. Echoed onto
+    # SimResult.config so reporting can pick it up without an extra arg.
+    cadence_minutes: float = 20.0
 
 
 def _bar_index_at_boundary(boundary_index_k: int, M: int, k_offset: int = 0) -> int:
@@ -118,7 +123,7 @@ def _bar_index_at_boundary(boundary_index_k: int, M: int, k_offset: int = 0) -> 
 # ---------------------------------------------------------------------------
 
 
-def _get_intra_bars(
+def get_intra_bars(
     raw_bars: pd.DataFrame,
     *,
     ts_after: pd.Timestamp,
@@ -159,7 +164,7 @@ def _get_intra_bars(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_intra_path_exits(
+def resolve_intra_path_exits(
     portfolio: Portfolio,
     spec: StrategySpec,
     *,
@@ -202,7 +207,7 @@ def _resolve_intra_path_exits(
     return closed
 
 
-def _resolve_expiries(
+def resolve_expiries(
     portfolio: Portfolio,
     spec: StrategySpec,
     *,
@@ -234,6 +239,12 @@ def _resolve_expiries(
         )
         closed.append(c)
     return closed
+
+
+# Backwards-compatible aliases (pre-engine private names).
+_get_intra_bars = get_intra_bars
+_resolve_intra_path_exits = resolve_intra_path_exits
+_resolve_expiries = resolve_expiries
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +364,7 @@ def simulate(
         # intra-bar OHLC that finished before ts, and the State sees a
         # snapshot of the world at ts that includes those resolutions.
         if prev_ts is not None and portfolio.n_open() > 0:
-            intra_bars = _get_intra_bars(raw_bars, ts_after=prev_ts, ts_through=ts)
+            intra_bars = get_intra_bars(raw_bars, ts_after=prev_ts, ts_through=ts)
         else:
             intra_bars = []
         closed_this_step: list[ClosedPosition] = []
@@ -373,7 +384,7 @@ def simulate(
                 knowledge_unc_quantile=unc_q,
             )
             closed_this_step.extend(
-                _resolve_intra_path_exits(
+                resolve_intra_path_exits(
                     portfolio,
                     spec,
                     intra_bars=intra_bars,
@@ -382,11 +393,11 @@ def simulate(
                 )
             )
 
-        # ---- 3. Compose state (post-elapsed-exit inventory snapshot) -------
-        # Score is computed once per state; cluster_pnl reflects MTM at the
-        # boundary close of currently-open positions AFTER elapsed-path
-        # exits resolved. Gates / sizers thus see honest inventory state.
-        cluster_pnl_now = (
+        # ---- 3. Pre-bulk State for bulk_close trigger ----------------------
+        # Bulk-close inspects post-elapsed-exit inventory but does NOT need to
+        # see the score (it's keyed on regime / unc / cluster P&L). Compose a
+        # minimal pre-bulk state for the bulk_close primitive only.
+        cluster_pnl_pre_bulk = (
             sum(
                 pos.size * pos.mtm_log_return(bar_close)
                 for pos in portfolio.open_positions
@@ -394,13 +405,11 @@ def simulate(
             if portfolio.n_open() > 0
             else 0.0
         )
-
-        # Build initial state without score; spec's score_fn fills it in next.
-        state_no_score = State(
+        state_pre_bulk = State(
             k=k,
             ts=ts,
             p=p,
-            p_calibrated=p,  # online recalibration deferred to a later step
+            p_calibrated=p,
             bar_close=bar_close,
             bar_high=bar_high,
             bar_low=bar_low,
@@ -408,7 +417,7 @@ def simulate(
             regime_quantile=regime_q,
             fast_sigma=fast_vol.value(),
             n_open_positions=portfolio.n_open(),
-            cluster_pnl=cluster_pnl_now,
+            cluster_pnl=cluster_pnl_pre_bulk,
             cluster_streak=cluster_streak,
             inventory_gross_size=portfolio.gross_size(),
             mean_p_ve=mean_p_ve,
@@ -420,13 +429,9 @@ def simulate(
                 else np.empty(0)
             ),
         )
-        s_score = float(spec.score_fn(state_no_score))
-        state = State(**{**vars(state_no_score), "score": s_score})
-        # Update score quantile (post-rank, in case future specs key off it)
-        score_rank.update(s_score)
 
         # ---- 4. Bulk-close trigger (pre-expiry; affects survivors) ---------
-        bulk_reason = spec.bulk_close(state) if portfolio.n_open() > 0 else None
+        bulk_reason = spec.bulk_close(state_pre_bulk) if portfolio.n_open() > 0 else None
         if bulk_reason is not None:
             bulk_closed = portfolio.close_all(
                 k_exit=k, ts_exit=ts, exit_price=bar_close, exit_reason=bulk_reason
@@ -436,13 +441,13 @@ def simulate(
         # ---- 5. Expiry-by-time for any positions still open ----------------
         if portfolio.n_open() > 0:
             closed_this_step.extend(
-                _resolve_expiries(
+                resolve_expiries(
                     portfolio,
                     spec,
                     boundary_close_price=bar_close,
                     k_now=k,
                     ts_now=ts,
-                    state_for_records=state,
+                    state_for_records=state_pre_bulk,
                 )
             )
 
@@ -475,18 +480,54 @@ def simulate(
                 cluster_streak = 0
                 cluster_start_ts = None
         else:
+            # Streak continues while at least one position remains open
+            # after bulk_close + expiry at the current boundary. Reset
+            # to 1 when a fresh cluster opens (handled in the entry
+            # branch below — see ``cluster_streak = 1`` there).
             cluster_streak += 1
 
-        # ---- 7. Online label feedback (drift detector + base-rate map) -------
-        # ``y`` is the LABEL of boundary k, which the spec did NOT see at
-        # decision time. We feed it ONLY into the post-decision online layers
-        # used for diagnostics / the next-step base-rate map. This is honest:
-        # the entry at boundary k was already decided above using state_no_score.
-        if not math.isnan(y):
-            if not math.isnan(p):
-                drift.update(y - p)
-            if not math.isnan(regime_q):
-                base_rate.update(regime_q, y)
+        # ---- 7. Compose entry-decision State (post-bulk, post-expiry) -------
+        # The gate/sizer must see the FINAL post-resolution inventory: after
+        # elapsed-path exits, bulk_close, and expiry have all fired. Rebuild
+        # State here rather than reuse state_pre_bulk so n_open_positions,
+        # cluster_pnl, inventory_gross_size, and cluster_streak all reflect
+        # the world entering the decision call.
+        cluster_pnl_at_decision = (
+            sum(
+                pos.size * pos.mtm_log_return(bar_close)
+                for pos in portfolio.open_positions
+            )
+            if portfolio.n_open() > 0
+            else 0.0
+        )
+        state_no_score = State(
+            k=k,
+            ts=ts,
+            p=p,
+            p_calibrated=p,
+            bar_close=bar_close,
+            bar_high=bar_high,
+            bar_low=bar_low,
+            regime_value=regime_value,
+            regime_quantile=regime_q,
+            fast_sigma=fast_vol.value(),
+            n_open_positions=portfolio.n_open(),
+            cluster_pnl=cluster_pnl_at_decision,
+            cluster_streak=cluster_streak,
+            inventory_gross_size=portfolio.gross_size(),
+            mean_p_ve=mean_p_ve,
+            knowledge_unc=knowledge_unc,
+            knowledge_unc_quantile=unc_q,
+            p_ve_samples=(
+                np.asarray(p_ve_samples[i], dtype=float)
+                if p_ve_samples is not None
+                else np.empty(0)
+            ),
+        )
+        s_score = float(spec.score_fn(state_no_score))
+        state = State(**{**vars(state_no_score), "score": s_score})
+        # Update score quantile (post-rank, in case future specs key off it)
+        score_rank.update(s_score)
 
         # ---- 8. Entry decision ----------------------------------------------
         opened = False
@@ -535,7 +576,21 @@ def simulate(
             for c in closed_this_step:
                 cluster_pnl += c.weighted_net_log_return(cost_per_trade)
 
-        # ---- 9. Equity row --------------------------------------------------
+        # ---- 9. Online label feedback (post-decision; drift + base-rate) ----
+        # ``y`` is the LABEL of boundary k, which the spec did NOT see at
+        # decision time. We feed it AFTER the entry decision so that for
+        # ``score_residualized`` specs, the regime-conditional base rate
+        # used by the score at boundary k does NOT depend on y[k]. The
+        # label is only folded into the rolling accumulators consumed at
+        # boundary k+1 onwards — consistent with the "label available
+        # retrospectively, not at decision time" causality contract.
+        if not math.isnan(y):
+            if not math.isnan(p):
+                drift.update(y - p)
+            if not math.isnan(regime_q):
+                base_rate.update(regime_q, y)
+
+        # ---- 10. Equity row -------------------------------------------------
         equity_rows.append(
             {
                 "ts": ts,
