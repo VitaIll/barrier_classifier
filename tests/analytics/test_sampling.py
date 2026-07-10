@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from src.analytics.sampling import (
+    _interval_overlaps_any,
     compute_uniqueness_weights,
     concurrency_counts,
     label_intervals,
@@ -15,6 +16,11 @@ from src.analytics.sampling import (
     purged_train_indices,
     sample_uniqueness,
 )
+
+# Belt-and-braces marker: conftest also stamps this file with
+# ``analytics_bootstrap`` by path, but declaring the marker explicitly makes
+# the file's selection contract visible at the top.
+pytestmark = pytest.mark.analytics_bootstrap
 
 
 def test_label_intervals_layout():
@@ -118,3 +124,79 @@ def test_purged_chronological_splits_total_count_minus_purged():
     assert va.max() < te.min()
     # Test fold size is approximately n * test_frac.
     assert math.isclose(len(te), int(round(n * 0.2)))
+
+
+def test_purged_train_indices_non_contiguous_test_set_local_purge():
+    """Regression: with a non-contiguous test set [50, 200] and M=20, the
+    correct purge drops only ~M rows around EACH test row (rows 31..49 around
+    row 50, and 181..199 around row 200), NOT every row between them.
+
+    The previous implementation collapsed the "other" intervals to a single
+    bounding box and would have purged everything in [31, 199] — 169 rows
+    instead of ~38.
+    """
+    M = 20
+    train = np.arange(0, 300, dtype=np.int64)
+    test = np.array([50, 200], dtype=np.int64)
+    kept = purged_train_indices(train, test, M=M, bar_stride=1, embargo_rows=0)
+    # Around test row 50: train row i has interval [i+1, i+20]; it overlaps
+    # test row 50's interval [51, 70] iff i+1 < 71 and i+20 > 51, i.e.
+    # 32 <= i <= 69 (and i != 50 since 50 is in test, but train passes ALL
+    # of 0..299). Bound the dropped slice on each side.
+    # Around test row 200: similar logic gives 182 <= i <= 219.
+    # In the gap (rows 70..181) nothing should be dropped on overlap grounds.
+    assert (kept == 100).sum() == 1, "row 100 (well between test points) must survive"
+    assert (kept == 150).sum() == 1, "row 150 (well between test points) must survive"
+    # Rough cardinality check: at most ~80 rows dropped (≈M+M each side of two
+    # test rows, with overlap), not 169. (Exact count depends on how the
+    # overlap math rounds — assert << 169.)
+    n_dropped = len(train) - len(kept)
+    assert n_dropped < 100, (
+        f"expected ~40 dropped (M+M around two non-contiguous test rows), "
+        f"got {n_dropped} — the bounding-box bug would drop 169"
+    )
+    # And it must drop a non-zero number (the overlap must actually fire).
+    assert n_dropped >= 30
+
+
+def test_purged_train_indices_contiguous_test_unchanged_by_new_algorithm():
+    """The new per-interval overlap check must produce IDENTICAL results to
+    the bounding-box approach on the contiguous test set that
+    purged_chronological_splits feeds (it always passes ``np.arange(...)``)."""
+    M = 20
+    train = np.arange(0, 800, dtype=np.int64)
+    test = np.arange(800, 950, dtype=np.int64)
+    kept = purged_train_indices(train, test, M=M, bar_stride=1, embargo_rows=0)
+    # Train row i has half-open label interval [i+1, i+M+1); first test row
+    # 800 has interval [801, 821). Overlap iff (i+1) < 821 AND (i+M+1) > 801,
+    # i.e. i+21 > 801 -> i >= 781. So rows 0..780 survive; 781..799 are dropped.
+    assert kept.max() == 780
+    assert (kept == np.arange(0, 781)).all()
+
+
+def test_interval_overlaps_any_correctness_under_disjoint_others():
+    """Direct unit test of the per-interval overlap function on a synthetic
+    disjoint-others case. Train intervals straddle gaps; only those that
+    actually touch one of the other intervals are reported."""
+    # Queries
+    q_starts = np.array([0, 30, 60, 90, 200, 500])
+    q_ends = q_starts + 10
+    # Disjoint others: [50, 70), [100, 120), [300, 320)
+    other_starts = np.array([50, 100, 300])
+    other_ends = np.array([70, 120, 320])
+    out = _interval_overlaps_any(q_starts, q_ends, other_starts, other_ends)
+    # [0,10): no overlap. [30,40): no overlap. [60,70): overlaps [50,70).
+    # [90,100): just touches [100,120) — NO overlap (half-open).
+    # [200,210): no overlap. [500,510): no overlap.
+    expected = np.array([False, False, True, False, False, False])
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_concurrency_counts_rejects_out_of_range_intervals():
+    """Negative starts or ends > n_bars must raise rather than silently clip."""
+    bad = np.array([[0, 5], [3, 12]])  # second end exceeds n_bars=10
+    with pytest.raises(ValueError, match="n_bars"):
+        concurrency_counts(bad, n_bars=10)
+    bad2 = np.array([[-1, 5], [2, 8]])
+    with pytest.raises(ValueError, match="< 0"):
+        concurrency_counts(bad2, n_bars=10)

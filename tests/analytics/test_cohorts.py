@@ -252,6 +252,65 @@ def test_bootstrap_shap_diff_returns_empty_when_cohort_too_small():
     assert df.empty
 
 
+def test_bootstrap_shap_diff_iid_branch_sets_B_effective():
+    """The iid (block_size=None) branch must set ``df.attrs["B_effective"]``
+    to B for clean data — every replicate preserves cohort sizes by
+    construction. This regression-tests the iid branch missing-attr bug."""
+    shap, cohorts, feats = _make_synthetic_shap_and_cohorts(n=400)
+    df = bootstrap_shap_diff(shap, cohorts, feats, B=80, seed=0)  # iid branch
+    assert "B_effective" in df.attrs
+    assert df.attrs["B_effective"] == 80
+    assert df.attrs.get("B") == 80
+
+
+def test_bootstrap_shap_diff_block_size_widens_ci_and_tracks_B_effective():
+    """With autocorrelated cohorts (clusters of FP / FN runs) the block
+    bootstrap drops replicates whose resampled cohort sizes fall below
+    ``min_cohort_size``. The recorded ``B_effective`` must be <= B, and
+    the CI must be at least as wide as the iid baseline (block bootstrap
+    cannot tighten honest CIs on autocorrelated data)."""
+    rng = np.random.default_rng(0)
+    F = 6
+    feature_list = [f"f{i:02d}" for i in range(F)]
+    # Build a strongly autocorrelated cohort sequence: alternate long runs of
+    # each cohort label so blocks of 20 rows are usually within a single
+    # cohort. This is the autocorrelation structure the block bootstrap is
+    # designed for.
+    run_len = 30
+    cohorts = np.array(
+        ["TP"] * run_len + ["FP"] * run_len
+        + ["TN"] * run_len + ["FN"] * run_len
+        + ["FP"] * run_len + ["FN"] * run_len
+        + ["TP"] * run_len + ["TN"] * run_len
+    )
+    # Build SHAP with a planted FP-minus-FN signal on feature 0.
+    shap = rng.normal(0, 0.3, size=(len(cohorts), F))
+    shap[cohorts == "FP", 0] += 0.4
+    shap[cohorts == "FN", 0] -= 0.4
+
+    df_iid = bootstrap_shap_diff(shap, cohorts, feature_list, B=200, seed=0)
+    df_blk = bootstrap_shap_diff(
+        shap, cohorts, feature_list, B=200, seed=0, block_size=20
+    )
+    assert not df_iid.empty and not df_blk.empty
+    # Block bootstrap may have dropped some replicates whose resampled
+    # cohort fell below min_cohort_size. B_effective must be <= B.
+    assert df_blk.attrs["B_effective"] <= 200
+    assert df_blk.attrs.get("B") == 200
+    # CI width on feature 0 (planted signal) is at least as wide under
+    # block bootstrap. Compare absolute width — block honest CI cannot be
+    # *tighter* than iid on autocorrelated data.
+    f0_iid = df_iid[df_iid["feature"] == "f00"].iloc[0]
+    f0_blk = df_blk[df_blk["feature"] == "f00"].iloc[0]
+    iid_w = f0_iid["shap_diff_ci_high"] - f0_iid["shap_diff_ci_low"]
+    blk_w = f0_blk["shap_diff_ci_high"] - f0_blk["shap_diff_ci_low"]
+    # Allow a tiny tolerance for finite-B noise (B=200 has CI-width noise).
+    assert blk_w >= iid_w * 0.85, (
+        f"block bootstrap should not produce a tighter CI on autocorrelated "
+        f"data; iid_w={iid_w:.4f}, blk_w={blk_w:.4f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CatBoost SHAP integration smoke
 # ---------------------------------------------------------------------------

@@ -59,6 +59,13 @@ def augment_cache_with_r_realized(
     raw_close = raw["close"].to_numpy(dtype=float)
 
     out = cache.copy()
+    # Guard against caches that carry ``ts`` as object/string — silent
+    # ``.dt`` accessor failures here were a known confounder.
+    if not pd.api.types.is_datetime64_any_dtype(out["ts"]):
+        raise TypeError(
+            f"cache['ts'] must be datetime-typed; got dtype={out['ts'].dtype}. "
+            "Cast with pd.to_datetime upstream."
+        )
     boundary_ts = pd.to_datetime(out["ts"]).dt.tz_localize(None) if out["ts"].dt.tz is not None else pd.to_datetime(out["ts"])
     # For each boundary, find the matching 1-min bar by exact ts (every boundary
     # ts MUST exist in raw — sampled from raw with iloc[::M]). If not, fall back
@@ -114,8 +121,13 @@ def augment_cache_with_boundary_ohlc(
         raw.index = raw.index.tz_localize(None)
     raw = raw.sort_index()
 
+    if not pd.api.types.is_datetime64_any_dtype(cache["ts"]):
+        raise TypeError(
+            f"cache['ts'] must be datetime-typed; got dtype={cache['ts'].dtype}. "
+            "Cast with pd.to_datetime upstream."
+        )
     boundary_ts = pd.to_datetime(cache["ts"])
-    if hasattr(boundary_ts.dt, "tz_localize") and boundary_ts.dt.tz is not None:
+    if boundary_ts.dt.tz is not None:
         boundary_ts = boundary_ts.dt.tz_localize(None)
 
     raw_sub = raw.loc[raw.index.isin(boundary_ts), needed]

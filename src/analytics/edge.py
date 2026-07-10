@@ -20,8 +20,9 @@ Outcome model (parameterized — see ``OutcomeModel``):
   cache, i.e. exit at barrier)
 - ``loss_per_miss``: realized log-return magnitude when y=0 (default = ``phi``,
   i.e. symmetric outcome). The TRUE realized end-of-horizon return is dataset-
-  specific; if you've added an ``r_realized`` column in 02_feature_building,
-  pass ``cache_with_realized_return=True`` so EV is computed from it.
+  specific; ``augment_cache_with_r_realized`` (``src/strategy/cache.py``) adds
+  the column from raw 1-min bars — pass ``cache_with_realized_return=True``
+  to compute EV from it.
 - ``cost_per_trade``: fees + half-spread + slippage (default 5 bps = 0.0005)
 
 The default symmetric-outcome assumption is conservative for entry-only
@@ -199,8 +200,8 @@ def bootstrap_threshold_sweep(
         if "r_realized" not in cs.columns:
             raise ValueError(
                 "outcome_model.use_realized_return=True but 'r_realized' "
-                "column not in cache. Add it in 02_feature_building or set "
-                "use_realized_return=False to use the parameterized model."
+                "column not in cache. Run augment_cache_with_r_realized "
+                "(src/strategy/cache.py) first, or set use_realized_return=False."
             )
         r_realized = cs["r_realized"].astype(float).to_numpy()
 
@@ -236,18 +237,31 @@ def bootstrap_threshold_sweep(
 # ---------------------------------------------------------------------------
 
 
+def _trapezoid(values: np.ndarray, xs: np.ndarray) -> float:
+    """Wrapper that prefers ``np.trapezoid`` (NumPy >= 2.0), falling back to
+    the legacy ``np.trapz`` on older NumPy. Identical semantics; only the
+    name changed in NumPy 2."""
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(values, xs))
+    return float(np.trapz(values, xs))  # type: ignore[attr-defined]
+
+
 def _partial_roc_auc_from(y: np.ndarray, p: np.ndarray, fpr_max: float) -> float:
     """Partial ROC-AUC normalized to [0, 1] over FPR in [0, fpr_max]."""
+    if fpr_max <= 0:
+        raise ValueError(f"fpr_max must be > 0, got {fpr_max}")
     fpr_grid = np.linspace(0.0, float(fpr_max), 201)
     tpr_grid = _interp_roc(y, p, fpr_grid)
-    return float(np.trapz(tpr_grid, fpr_grid) / fpr_max)
+    return _trapezoid(tpr_grid, fpr_grid) / float(fpr_max)
 
 
 def _partial_pr_auc_from(y: np.ndarray, p: np.ndarray, recall_max: float) -> float:
     """Partial PR-AUC (max-envelope) normalized to [0, 1] over recall [0, recall_max]."""
+    if recall_max <= 0:
+        raise ValueError(f"recall_max must be > 0, got {recall_max}")
     recall_grid = np.linspace(0.0, float(recall_max), 201)
     prec_grid = _interp_pr(y, p, recall_grid)
-    return float(np.trapz(prec_grid, recall_grid) / recall_max)
+    return _trapezoid(prec_grid, recall_grid) / float(recall_max)
 
 
 def bootstrap_partial_roc_auc(
@@ -275,19 +289,24 @@ def bootstrap_partial_roc_auc(
     idx = _choose_indices(
         len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
     )
-    samples = np.empty(B, dtype=float)
+    samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        samples[b] = _partial_roc_auc_from(y[i], p[i], fpr_max)
+        try:
+            samples[b] = _partial_roc_auc_from(y[i], p[i], fpr_max)
+        except ValueError:
+            pass
     alpha = (1.0 - ci) / 2.0
+    b_effective = int(np.count_nonzero(~np.isnan(samples)))
     return BootstrapResult(
         point=point,
-        median=float(np.quantile(samples, 0.5)),
-        ci_low=float(np.quantile(samples, alpha)),
-        ci_high=float(np.quantile(samples, 1.0 - alpha)),
+        median=float(np.nanmedian(samples)),
+        ci_low=float(np.nanquantile(samples, alpha)),
+        ci_high=float(np.nanquantile(samples, 1.0 - alpha)),
         ci=ci,
         B=B,
         samples=samples,
+        B_effective=b_effective,
     )
 
 
@@ -313,19 +332,24 @@ def bootstrap_partial_pr_auc(
     idx = _choose_indices(
         len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
     )
-    samples = np.empty(B, dtype=float)
+    samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        samples[b] = _partial_pr_auc_from(y[i], p[i], recall_max)
+        try:
+            samples[b] = _partial_pr_auc_from(y[i], p[i], recall_max)
+        except ValueError:
+            pass
     alpha = (1.0 - ci) / 2.0
+    b_effective = int(np.count_nonzero(~np.isnan(samples)))
     return BootstrapResult(
         point=point,
-        median=float(np.quantile(samples, 0.5)),
-        ci_low=float(np.quantile(samples, alpha)),
-        ci_high=float(np.quantile(samples, 1.0 - alpha)),
+        median=float(np.nanmedian(samples)),
+        ci_low=float(np.nanquantile(samples, alpha)),
+        ci_high=float(np.nanquantile(samples, 1.0 - alpha)),
         ci=ci,
         B=B,
         samples=samples,
+        B_effective=b_effective,
     )
 
 

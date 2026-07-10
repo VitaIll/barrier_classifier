@@ -15,12 +15,14 @@ Public surface (kept minimal until cell-level tests prove out the core):
 
 - ``inventory`` — Position dataclass + Portfolio (open / close / mark-to-market)
 - ``policy``    — composable score / gate / sizer / exit / bulk-close primitives
-                  + ``StrategySpec`` that bundles them
+                  + ``StrategySpec`` that bundles them. Risk caps, halts, and
+                  cluster-loss accounting live on ``RiskConfig`` inside this
+                  module (there is no separate ``risk`` submodule).
 - ``simulator`` — bar-by-bar driver: ``simulate(cache, raw_bars, spec) -> SimResult``
 - ``online``    — River wrappers: streaming quantile, EWVar, online isotonic, ADWIN
 - ``diagnostics`` — pre-flight checks that gate which specs are eligible
-- ``risk``      — caps, halts, cluster-loss accounting
 - ``reporting`` — equity ladder, deflated-Sharpe table, regime attribution
+- ``cache``     — augment a research cache with boundary OHLC and r_realized
 
 Causality contract:
 - All decision functions consume only ``State`` snapshots built from data

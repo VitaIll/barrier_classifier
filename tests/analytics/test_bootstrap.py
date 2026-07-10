@@ -263,7 +263,10 @@ def test_bootstrap_metric_to_dict_roundtrip():
     res = bootstrap_metric(roc_auc_score, y, p, B=20, seed=0)
     d = res.to_dict(include_samples=False)
     assert "samples" not in d
-    assert set(d.keys()) == {"point", "median", "ci_low", "ci_high", "ci", "B"}
+    assert set(d.keys()) == {"point", "median", "ci_low", "ci_high", "ci", "B", "B_effective"}
+    # On clean two-class iid data, every replicate produces a finite metric,
+    # so B_effective equals B.
+    assert d["B_effective"] == d["B"]
     d2 = res.to_dict(include_samples=True)
     assert "samples" in d2 and len(d2["samples"]) == 20
 
@@ -281,12 +284,34 @@ def test_bootstrap_metric_2d_raises():
 
 
 def test_bootstrap_metric_propagates_metric_errors():
-    """If the metric fn raises (e.g., ROC-AUC on a single-class y),
-    bootstrap_metric must propagate the error rather than swallow it."""
-    y = np.zeros(100, dtype=int)  # all-negative -> roc_auc_score raises
+    """If the metric fn raises, bootstrap_metric must propagate the error
+    rather than swallow it.
+
+    Uses an explicitly raising metric: sklearn changed ``roc_auc_score``'s
+    single-class behavior from raising ValueError to returning NaN with an
+    ``UndefinedMetricWarning`` (>= 1.8), so the old sklearn-based premise
+    no longer exercises the propagation contract."""
+    y = np.zeros(100, dtype=int)
     p = np.random.default_rng(0).random(100)
-    with pytest.raises(ValueError):
-        bootstrap_metric(roc_auc_score, y, p, B=20, seed=0, stratify=False)
+
+    def exploding_metric(y_, p_):
+        raise ValueError("metric is undefined on this resample")
+
+    with pytest.raises(ValueError, match="undefined on this resample"):
+        bootstrap_metric(exploding_metric, y, p, B=20, seed=0, stratify=False)
+
+
+def test_bootstrap_metric_propagates_nan_metrics():
+    """A metric that *returns* NaN (modern sklearn single-class ROC-AUC)
+    must surface as a NaN point estimate, not be silently dropped."""
+    y = np.zeros(100, dtype=int)  # single class -> sklearn>=1.8 returns NaN
+    p = np.random.default_rng(0).random(100)
+    with pytest.warns(Warning):
+        res = bootstrap_metric(
+            lambda y_, p_: float(roc_auc_score(y_, p_)),
+            y, p, B=10, seed=0, stratify=False,
+        )
+    assert math.isnan(res.point)
 
 
 def test_bootstrap_stratified_preserves_prevalence_unstratified_does_not():
@@ -518,3 +543,57 @@ def test_bootstrap_ci_low_le_high_under_skewed_statistic():
     res = bootstrap_metric(ece_fn, y, p, B=300, seed=0)
     assert res.ci_low <= res.median <= res.ci_high
     assert 0.0 <= res.ci_low  # ECE is non-negative
+
+
+# ---------------------------------------------------------------------------
+# B_effective: block bootstrap on pathological data drops crashed replicates.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_metric_B_effective_drops_single_class_replicates():
+    """A block bootstrap on a stream where positives sit in a single small
+    contiguous run will produce some all-zero block resamples — roc_auc_score
+    raises on those, and the new try/except in bootstrap_metric records them
+    as NaN. Verify that:
+        (a) B_effective < B (at least one replicate was dropped);
+        (b) median / CI bounds are computed only over surviving replicates
+            (finite, despite NaN samples).
+    """
+    n = 1000
+    # Positives only in rows 50..70 — block_size=20 will sometimes miss them.
+    y = np.zeros(n, dtype=int)
+    y[50:70] = 1
+    rng = np.random.default_rng(0)
+    p = np.clip(0.1 + 0.4 * y + rng.normal(0, 0.05, n), 0.001, 0.999)
+    res = bootstrap_metric(
+        roc_auc_score, y, p, B=300, stratify=False, seed=0, block_size=20
+    )
+    # Some replicates produced NaN -> B_effective strictly < B.
+    assert 0 < res.B_effective < res.B, (
+        f"expected 0 < B_effective={res.B_effective} < B={res.B}"
+    )
+    # Sample array has exactly B_effective non-NaN entries.
+    finite_count = int(np.count_nonzero(~np.isnan(res.samples)))
+    assert finite_count == res.B_effective
+    # Median / CI are finite — computed from the surviving replicates.
+    assert np.isfinite(res.median)
+    assert np.isfinite(res.ci_low)
+    assert np.isfinite(res.ci_high)
+
+
+def test_bootstrap_result_B_effective_defaults_to_B_for_legacy_constructors():
+    """The dataclass post_init fills B_effective with B when not supplied,
+    so any existing code that constructs ``BootstrapResult(..., samples=...)``
+    without the new field keeps working."""
+    samples = np.array([0.5, 0.6, 0.7])
+    res = BootstrapResult(
+        point=0.6,
+        median=0.6,
+        ci_low=0.5,
+        ci_high=0.7,
+        ci=0.95,
+        B=3,
+        samples=samples,
+    )
+    assert res.B_effective == 3
+    assert res.to_dict()["B_effective"] == 3

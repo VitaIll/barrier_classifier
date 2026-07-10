@@ -11,6 +11,8 @@ Reuses the parity assertion helper pattern from step 7.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -204,6 +206,43 @@ class TestVolL1Sanity:
         # All output null (every input row has h == l → null).
         for v in out:
             assert v is None
+
+    def test_parkinson_flat_window_after_normal_stretch_is_clip_safe(self):
+        """``clip_pos`` before sqrt — same hazard as ``RollingRetRms``:
+        polars' rolling-mean online algorithm can produce a tiny-negative
+        cancellation residual on all-zero windows, and sqrt of a tiny
+        negative is NaN. Construct a window that starts non-flat, runs
+        through ``w`` consecutive flat bars (h == l) so the rolling mean
+        is computed on a slice with both data and nulls, and assert the
+        output is a finite non-negative number — not NaN — for every
+        post-warmup row.
+        """
+        from src.features.families.volatility import VolParkinson
+
+        w = 4
+        # 6 non-flat bars (h > l) followed by 6 flat bars (h == l). The
+        # rolling window of length ``w`` will eventually consist entirely
+        # of null log_hl values (rows where h == l fall through to null
+        # under ``safe_log_ratio``), which is the cancellation hazard.
+        n_normal = 6
+        n_flat = 6
+        opens = [1.0] * (n_normal + n_flat)
+        closes = [1.0] * (n_normal + n_flat)
+        highs = [1.1] * n_normal + [1.0] * n_flat
+        lows = [0.9] * n_normal + [1.0] * n_flat
+        bars = pl.DataFrame(
+            {"open": opens, "high": highs, "low": lows, "close": closes}
+        )
+        spec = VolParkinson()
+        out = bars.select(spec.compute(w).alias("out"))["out"].to_list()
+        # Skip the warmup rows; every later row must be either null
+        # (legitimate when the window has any null) or a finite >= 0
+        # value — never NaN.
+        for i, v in enumerate(out):
+            if v is None:
+                continue
+            assert math.isfinite(v), f"row {i}: vol__parkinson NaN/inf: {v}"
+            assert v >= 0.0, f"row {i}: vol__parkinson is negative: {v}"
 
     def test_rs_flat_candle_zero(self):
         from src.features.families.volatility import VolRs

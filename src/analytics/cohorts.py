@@ -317,12 +317,16 @@ def bootstrap_shap_diff(
         if not replicate_samples:
             return pd.DataFrame()
         samples = np.stack(replicate_samples, axis=0)
+        b_effective = int(samples.shape[0])
     else:
         fp_resamples = fp_idx[rng.integers(0, len(fp_idx), size=(B, len(fp_idx)))]
         fn_resamples = fn_idx[rng.integers(0, len(fn_idx), size=(B, len(fn_idx)))]
         samples = np.empty((B, F), dtype=float)
         for b in range(B):
             samples[b] = shap[fp_resamples[b]].mean(axis=0) - shap[fn_resamples[b]].mean(axis=0)
+        # Independent within-cohort resamples never crash on min_cohort_size
+        # (resamples preserve the original cohort sizes), so B_effective == B.
+        b_effective = int(B)
 
     point = shap[fp_idx].mean(axis=0) - shap[fn_idx].mean(axis=0)
     alpha = (1.0 - ci) / 2.0
@@ -336,7 +340,8 @@ def bootstrap_shap_diff(
     )
     df["abs_diff"] = df["shap_diff"].abs()
     df["ci_excludes_zero"] = (df["shap_diff_ci_low"] > 0) | (df["shap_diff_ci_high"] < 0)
-    df.attrs["B_effective"] = int(samples.shape[0])
+    df.attrs["B_effective"] = b_effective
+    df.attrs["B"] = int(B)
     return df.sort_values("abs_diff", ascending=False).reset_index(drop=True)
 
 

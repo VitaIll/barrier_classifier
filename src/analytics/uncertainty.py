@@ -38,7 +38,7 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Union
+from typing import Dict, Literal, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,8 @@ import pandas as pd
 from .degradation import wilson_interval
 
 EPS_ENTROPY = 1e-12  # safe clip for binary entropy at 0 / 1
+
+PredictionType = Literal["probability", "logit"]
 
 
 # ---------------------------------------------------------------------------
@@ -60,15 +62,34 @@ def virtual_ensemble_predictions(
     virtual_ensembles_count: int = 10,
     feature_list: Optional[Sequence[str]] = None,
     thread_count: int = -1,
+    prediction_type: PredictionType = "probability",
 ) -> np.ndarray:
     """Per-row, per-virtual-ensemble class-1 probabilities, shape ``(N, K)``.
 
     The model must have been trained with ``posterior_sampling=True``.
     CatBoost's ``virtual_ensembles_predict(prediction_type='VirtEnsembles')``
-    returns ``(N, K, 2)`` for a binary classifier; we keep only the class-1
-    column.
+    returns per-ensemble outputs in either probability space or log-odds
+    space depending on the CatBoost build. ``prediction_type`` tells this
+    function which space to expect:
+
+    - ``"probability"`` (default): values are class-1 probabilities in
+      ``[0, 1]``. The function clips numerical dust at the endpoints and
+      returns them unchanged.
+    - ``"logit"``: values are raw log-odds. The function applies the
+      sigmoid ``1 / (1 + exp(-x))`` to convert to probabilities.
+
+    The previous behavior auto-detected logits by checking whether any value
+    sat outside ``[0, 1]``; that heuristic was brittle (a CatBoost build
+    that returns probabilities-with-tiny-negative-noise would have been
+    silently sigmoid-mapped, doubly transforming them). The explicit param
+    makes the caller's expectation contract-level.
     """
     from catboost import Pool
+
+    if prediction_type not in ("probability", "logit"):
+        raise ValueError(
+            f"prediction_type must be 'probability' or 'logit', got {prediction_type!r}"
+        )
 
     if isinstance(X, pd.DataFrame):
         if feature_list is None:
@@ -87,9 +108,8 @@ def virtual_ensemble_predictions(
         verbose=False,
     )
     out = np.asarray(out, dtype=float)
-    # CatBoost returns (N, K, 1) — per-ensemble RawFormulaVal (log-odds) — for
-    # binary classifiers under prediction_type='VirtEnsembles'. Some versions
-    # may return (N, K, 2) class probabilities; handle both shapes plus bare 2D.
+    # CatBoost returns (N, K, 1) or (N, K, 2) for binary classifiers under
+    # prediction_type='VirtEnsembles'. Handle both shapes plus bare 2D.
     if out.ndim == 3:
         if out.shape[2] == 2:
             return out[:, :, 1].astype(float)
@@ -99,8 +119,7 @@ def virtual_ensemble_predictions(
             raise ValueError(f"Unexpected last dim {out.shape[2]}; expected 1 or 2")
     if out.ndim != 2:
         raise ValueError(f"Unexpected VE shape after squeeze {out.shape}; expected 2D")
-    # If values exceed [0, 1] they are log-odds; apply sigmoid.
-    if out.min() < -1e-6 or out.max() > 1.0 + 1e-6:
+    if prediction_type == "logit":
         out = 1.0 / (1.0 + np.exp(-out))
     # Numerical safety
     return np.clip(out, 0.0, 1.0).astype(float)

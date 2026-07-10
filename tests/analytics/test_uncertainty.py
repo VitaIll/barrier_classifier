@@ -297,6 +297,25 @@ def test_virtual_ensemble_predictions_shape():
     p_ve = virtual_ensemble_predictions(model, X, virtual_ensembles_count=K, feature_list=feats)
     assert p_ve.shape == (len(X), K)
     assert (p_ve >= 0).all() and (p_ve <= 1).all()
+    # The K ensemble columns are NOT all identical — different sub-ensembles
+    # produce different per-row probabilities (the whole point of the virtual
+    # ensemble). At least one row should show non-zero std across columns.
+    assert p_ve.std(axis=1).max() > 0, (
+        "all K virtual-ensemble columns are identical — the ensemble "
+        "decomposition is degenerate"
+    )
+    # Probabilities must be in [0, 1] — explicit check (not logits).
+    assert p_ve.min() >= 0.0
+    assert p_ve.max() <= 1.0
+
+
+def test_virtual_ensemble_predictions_rejects_invalid_prediction_type():
+    model, X, _, feats = _fit_smoke_model()
+    with pytest.raises(ValueError, match="prediction_type"):
+        virtual_ensemble_predictions(
+            model, X, virtual_ensembles_count=5, feature_list=feats,
+            prediction_type="bogus",  # type: ignore[arg-type]
+        )
 
 
 def test_virtual_ensemble_predictions_dataframe_input():

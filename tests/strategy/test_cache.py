@@ -75,12 +75,12 @@ def test_augment_cache_with_r_realized_with_real_data():
     """Light smoke test against the real on-disk dataset if it exists."""
     import os
     raw_path = "data/raw_data/klines_1m.parquet"
-    cache_path = "data/model_dataset/research_predictions.parquet"
+    cache_path = "data/model_dataset/research_predictions_1min.parquet"
     if not (os.path.exists(raw_path) and os.path.exists(cache_path)):
         pytest.skip("real data files not present")
     raw = pd.read_parquet(raw_path, columns=["close"])
     cache = pd.read_parquet(cache_path)
-    out = augment_cache_with_r_realized(cache, raw, M=20)
+    out = augment_cache_with_r_realized(cache, raw, M=1)
     assert "r_realized" in out.columns
     # At least 95% non-NaN (we tolerate boundary effects)
     valid = out["r_realized"].notna()

@@ -125,9 +125,20 @@ def test_all_derivatives_families_parity(bars_with_derivatives):
     legacy_cols = [c for c in legacy.columns if c not in bars_with_derivatives.columns]
 
     bars_pl = _to_polars(bars_with_derivatives)
+    # Tier-2 needed for VolRiskPremiumDiff / VolRiskPremiumRatio which read
+    # the tier-1 ``vol_realized__30d__f__w43200`` column emitted by
+    # VolRealized30d, eliminating duplicate 43200-row rolling_std evals.
+    #
+    # ``rolling`` is included for the new Tier-2 ``oi__long_build`` etc.
+    # decomposition features, which use ``ret__rms__f__w{W}`` as the
+    # per-bar return scale. The parity assertion only compares the
+    # ``legacy_cols`` set (columns added by ``utils.compute_*``), so
+    # the extra rolling-family columns this brings onto the frame are
+    # not compared and do not affect the test.
     engine = FeatureEngine(
-        tiers=(1,),
+        tiers=(1, 2),
         families=(
+            "rolling",
             "deriv_basis", "deriv_flow", "deriv_oi", "deriv_funding",
             "deriv_options", "deriv_volidx",
         ),

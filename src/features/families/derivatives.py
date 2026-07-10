@@ -21,7 +21,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import EPS
+from src.features.config import EPS, M as _M, WINDOWS_OI_REGIME
 from src.features.primitives import (
     ewm_mean,
     rolling_mean,
@@ -330,6 +330,116 @@ class OiPriceCorr(Feature):
         return pl.rolling_corr(oi_diff, pl.col("r"), window_size=w, min_samples=w, ddof=1)
 
 
+# -------- OI regime decomposition (Round 4a) ------------------------------
+#
+# Four non-overlapping quadrants of the (price-change, OI-change) plane,
+# each non-negative and bounded by ``tanh`` smoothing:
+#
+#     dp_z = tanh((p_n - p_{n-W}) / (sigma_W,n * sqrt(W) + EPS))
+#     doi_z = tanh((OI_n - OI_{n-W}) / (sigma_OI_W,n + EPS))
+#
+#     long_build  = max(0,  dp_z) * max(0,  doi_z)   price up + OI up    → new longs
+#     short_build = max(0, -dp_z) * max(0,  doi_z)   price down + OI up  → new shorts
+#     short_cover = max(0,  dp_z) * max(0, -doi_z)   price up + OI down  → covering shorts
+#     long_liq    = max(0, -dp_z) * max(0, -doi_z)   price down + OI down → liquidations
+#
+# The four columns are 1 of N: only ONE quadrant is non-zero on any
+# given row. The model can split on any of them; useful for learning
+# regime-conditional effects (e.g. a high score might be more reliable
+# under ``short_cover`` than under ``long_build``).
+#
+# Normalizer for the OI side uses ``rolling_std_pop(oi_usd.diff(), W)``
+# — population std of 1-bar OI changes over the trailing W bars. This is
+# faster than MAD and adequate given the ``tanh`` saturation.
+
+
+class _OiRegimeFeature(Feature):
+    __abstract__: ClassVar[bool] = True
+    family: ClassVar[str] = "deriv_oi"
+    # Tier 2: depends on ``ret__rms__f__w{W}`` for price normalization.
+    tier: ClassVar[int | str] = 2
+    inputs = ("p", "oi_usd")
+    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_OI_REGIME)
+
+
+def _oi_regime_components(w: int) -> tuple[pl.Expr, pl.Expr]:
+    """Shared building blocks: signed normalized price change and OI change."""
+    p = pl.col("p")
+    dp = p - p.shift(w)
+    # Use ret__rms as the per-bar return scale (consistent with flow features).
+    sigma_r = pl.col(f"ret__rms__f__w{w}")
+    sqrt_w = float(w) ** 0.5
+    dp_z = (dp / (sigma_r * sqrt_w + EPS)).tanh()
+
+    oi = pl.col("oi_usd")
+    doi = oi - oi.shift(w)
+    sigma_oi = rolling_std_pop(oi.diff(), w)
+    # 1-bar OI delta std rescaled to W-bar by sqrt(W), matching the
+    # Brownian-style normalization used on the price side.
+    doi_z = (doi / (sigma_oi * sqrt_w + EPS)).tanh()
+    return dp_z, doi_z
+
+
+class OiLongBuild(_OiRegimeFeature):
+    """Price up × OI up — new longs adding leverage."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__long_build__f__w{w}"
+
+    def warmup_for(self, w: int | None) -> int:
+        # ``dp = p - p.shift(w)`` is null until row w; ``ret__rms`` and the
+        # OI std are likewise null until row w. Binding warmup is w.
+        return w if w else 0
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        dp_z, doi_z = _oi_regime_components(int(w))
+        # ``clip`` (not ``max_horizontal``) so null inputs propagate to
+        # null output. See ``FlowSellAbsorption`` for the rationale.
+        return dp_z.clip(lower_bound=0.0) * doi_z.clip(lower_bound=0.0)
+
+
+class OiShortBuild(_OiRegimeFeature):
+    """Price down × OI up — new shorts adding leverage."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__short_build__f__w{w}"
+
+    def warmup_for(self, w: int | None) -> int:
+        return w if w else 0
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        dp_z, doi_z = _oi_regime_components(int(w))
+        return (-dp_z).clip(lower_bound=0.0) * doi_z.clip(lower_bound=0.0)
+
+
+class OiShortCover(_OiRegimeFeature):
+    """Price up × OI down — shorts covering, deleveraging into rally."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__short_cover__f__w{w}"
+
+    def warmup_for(self, w: int | None) -> int:
+        return w if w else 0
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        dp_z, doi_z = _oi_regime_components(int(w))
+        return dp_z.clip(lower_bound=0.0) * (-doi_z).clip(lower_bound=0.0)
+
+
+class OiLongLiq(_OiRegimeFeature):
+    """Price down × OI down — longs liquidating, deleveraging into drop."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return f"oi__long_liq__f__w{w}"
+
+    def warmup_for(self, w: int | None) -> int:
+        return w if w else 0
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        dp_z, doi_z = _oi_regime_components(int(w))
+        return (-dp_z).clip(lower_bound=0.0) * (-doi_z).clip(lower_bound=0.0)
+
+
 # =============================================================================
 # funding family
 # =============================================================================
@@ -359,6 +469,67 @@ class FundingEwma(Feature):
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return ewm_mean(pl.col("funding_rate") * 100.0, span=w, adjust=False)
+
+
+class _FundingPhaseBase(Feature):
+    """Common machinery for funding-cycle phase features.
+
+    Phase = (minutes to next scheduled funding) / 480
+          ∈ (0, 1], with values near 1 just AFTER a settlement and values
+          near 0 just BEFORE the next settlement. Calendar-causal — uses
+          ``ts`` only, no realized funding rate.
+    """
+
+    __abstract__: ClassVar[bool] = True
+    family: ClassVar[str] = "deriv_funding"
+    tier: ClassVar[int | str] = 1
+    inputs = ("ts",)
+    windows: ClassVar[tuple[int, ...]] = ()
+
+    @staticmethod
+    def _phase_expr() -> pl.Expr:
+        ts = pl.col("ts")
+        minute = ts.dt.hour().cast(pl.Int32) * 60 + ts.dt.minute().cast(pl.Int32)
+        next_funding = (
+            pl.when(minute < 8 * 60).then(8 * 60)
+            .when(minute < 16 * 60).then(16 * 60)
+            .otherwise(24 * 60)
+        )
+        # tau is in (0, 480] minutes. Divide by 480 to get the unit phase.
+        tau = (next_funding - minute).cast(pl.Float64)
+        return tau / 480.0
+
+
+class FundingPhase(_FundingPhaseBase):
+    """Unit phase to next funding settlement, in (0, 1]."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return "funding__phase__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return self._phase_expr()
+
+
+class FundingPhaseSin(_FundingPhaseBase):
+    """Sine of 2*pi*phase — bounded continuous representation of the
+    cyclic phase. Combined with the cosine partner, gives the model
+    distance-on-the-cycle without a discontinuity at phase = 0/1."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return "funding__phase_sin__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return (2.0 * math.pi * self._phase_expr()).sin()
+
+
+class FundingPhaseCos(_FundingPhaseBase):
+    """Cosine of 2*pi*phase. See ``FundingPhaseSin`` for rationale."""
+
+    def column_name(self, w: int | None = None) -> str:
+        return "funding__phase_cos__f__w0"
+
+    def compute(self, w: int | None = None) -> pl.Expr:
+        return (2.0 * math.pi * self._phase_expr()).cos()
 
 
 class FundingTrend(Feature):
@@ -479,12 +650,18 @@ class VolIdxBvolChg(Feature):
 
 
 class VolRealized30d(Feature):
-    """Annualised realised vol from r over 30 days = 43200 minutes."""
+    """Annualised realised vol from r over 30 days = 43200 minutes.
+
+    Declares ``windows=(43200,)`` so the engine's warmup tracker includes
+    the 30-day window — and so dependent features
+    (``VolRiskPremiumDiff``/``VolRiskPremiumRatio``) can read the
+    precomputed column instead of re-evaluating a 43200-row rolling_std.
+    """
 
     family: ClassVar[str] = "deriv_volidx"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)
-    windows: ClassVar[tuple[int, ...]] = ()
+    windows: ClassVar[tuple[int, ...]] = (43200,)
 
     def column_name(self, w: int | None = None) -> str:
         return "vol_realized__30d__f__w43200"
@@ -495,28 +672,33 @@ class VolRealized30d(Feature):
 
 
 class VolRiskPremiumDiff(Feature):
+    """Reads the precomputed ``vol_realized__30d__f__w43200`` (tier-1) so the
+    43200-row rolling_std evaluates exactly once across the three vol-idx
+    features that depend on it."""
+
     family: ClassVar[str] = "deriv_volidx"
-    tier: ClassVar[int | str] = 1
-    inputs = ("bvol", "r")
+    tier: ClassVar[int | str] = 2
+    inputs = ("bvol", "vol_realized__30d__f__w43200")
     windows: ClassVar[tuple[int, ...]] = ()
 
     def column_name(self, w: int | None = None) -> str:
         return "vol_risk_premium__diff__f__w0"
 
     def compute(self, w: int | None = None) -> pl.Expr:
-        rv = rolling_std_pop(pl.col("r"), 43200) * math.sqrt(525600.0) * 100.0
-        return pl.col("bvol") - rv
+        return pl.col("bvol") - pl.col("vol_realized__30d__f__w43200")
 
 
 class VolRiskPremiumRatio(Feature):
+    """See ``VolRiskPremiumDiff`` for the shared-rv rationale."""
+
     family: ClassVar[str] = "deriv_volidx"
-    tier: ClassVar[int | str] = 1
-    inputs = ("bvol", "r")
+    tier: ClassVar[int | str] = 2
+    inputs = ("bvol", "vol_realized__30d__f__w43200")
     windows: ClassVar[tuple[int, ...]] = ()
 
     def column_name(self, w: int | None = None) -> str:
         return "vol_risk_premium__ratio__f__w0"
 
     def compute(self, w: int | None = None) -> pl.Expr:
-        rv = rolling_std_pop(pl.col("r"), 43200) * math.sqrt(525600.0) * 100.0
+        rv = pl.col("vol_realized__30d__f__w43200")
         return pl.col("bvol") / (rv + EPS)

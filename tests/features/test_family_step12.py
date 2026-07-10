@@ -99,7 +99,7 @@ def test_excursion_rolling_equals_sparse_at_boundary_rows(bars_with_base):
     from src.features.config import M as M_BARS
 
     bars_pl = _to_polars(bars_with_base)
-    engine = FeatureEngine(tiers=(2,), families=("excursion",))
+    engine = FeatureEngine(tiers=(1,), families=("excursion",))
     out = engine.transform(bars_pl, trim=False).data
 
     for W in WINDOWS_EXCURSION:
@@ -149,7 +149,7 @@ def test_excursion_rolling_is_strictly_causal_under_masking(bars_with_base):
     would see different values when the future is masked. The trailing-
     window formula must not."""
     bars_pl = _to_polars(bars_with_base)
-    engine = FeatureEngine(tiers=(2,), families=("excursion",))
+    engine = FeatureEngine(tiers=(1,), families=("excursion",))
     out_full = engine.transform(bars_pl, trim=False).data
 
     # Mask: replace p (the log-price column the family reads) after t_probe
@@ -169,6 +169,14 @@ def test_excursion_rolling_is_strictly_causal_under_masking(bars_with_base):
         v_full = out_full[col][t_probe]
         v_masked = out_masked[col][t_probe]
         if v_full is None and v_masked is None:
+            continue
+        # Windows longer than the probe row (e.g. w7200 at row 5000) are in
+        # warmup on both sides: NaN == NaN is "equally undefined", not a
+        # causality violation.
+        if (
+            isinstance(v_full, float) and isinstance(v_masked, float)
+            and np.isnan(v_full) and np.isnan(v_masked)
+        ):
             continue
         assert v_full == v_masked, (
             f"causality violation in {col} at probe row {t_probe}: "

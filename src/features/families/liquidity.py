@@ -30,7 +30,9 @@ from src.features.primitives import rolling_max, rolling_min, rolling_sum
 
 class LiqAmihud(Feature):
     family: ClassVar[str] = "liquidity"
-    tier: ClassVar[int | str] = 2
+    # Tier 1: ``r`` is a base-series column on the bars frame at engine
+    # entry, not an engine-emitted column. No tier-2 dependency exists.
+    tier: ClassVar[int | str] = 1
     inputs = ("r", "volume")
     windows = tuple(WINDOWS_LIQ_AMIHUD)
 
@@ -48,7 +50,8 @@ class LiqAmihud(Feature):
 
 class LiqRangePerVol(Feature):
     family: ClassVar[str] = "liquidity"
-    tier: ClassVar[int | str] = 2
+    # Tier 1: reads raw OHLCV only, no engine-emitted dependency.
+    tier: ClassVar[int | str] = 1
     inputs = ("high", "low", "volume")
     windows = tuple(WINDOWS_LIQ_RPV)
 
@@ -67,7 +70,9 @@ class LiqRangePerVol(Feature):
 class _OfiImpulseFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "liquidity"
-    tier: ClassVar[int | str] = 2
+    # Tier 1: ``ofi`` is a base-series column on the bars frame, not an
+    # engine-emitted column.
+    tier: ClassVar[int | str] = 1
     inputs = ("ofi",)
     windows = tuple(WINDOWS_OFI_IMPULSE)
 

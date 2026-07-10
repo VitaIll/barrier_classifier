@@ -1,11 +1,12 @@
-"""Feature observability: per-column validation, reports, and feature-set
-quality inspection helpers used by the notebook for post-build analysis.
+"""Feature observability: per-column quality reporting and feature-set
+inspection helpers used by the notebook for post-build analysis.
 
 Two layers:
 
-1. ``Validator`` + ``FeatureReport`` — a per-Feature structural check that
-   runs at engine compute time (currently stub-level; will fill in once
-   the engine wires up validation hooks).
+1. ``FeatureReport`` — a per-Feature structural summary returned by the
+   engine alongside the wide dataframe (currently emitted as an empty
+   dict from ``FeatureEngine.transform``; the dataclass is the public
+   contract for when the engine wires up structured reporting).
 
 2. Inspection helpers (``compute_feature_health``, ``summarize_by_family``,
    ``flag_issues``, ``monthly_target_balance``) — operate on the FINAL
@@ -22,8 +23,6 @@ from typing import Iterable
 
 import polars as pl
 
-from src.features.base import Feature
-
 
 @dataclass(frozen=True)
 class FeatureReport:
@@ -39,29 +38,6 @@ class FeatureReport:
     warmup_ok: bool
     tail_ok: bool
     parity_ok: bool | None = None
-
-
-class Validator:
-    """Runs Feature.expected_* checks against a computed column."""
-
-    def check(self, spec: Feature, name: str, col: pl.Series) -> FeatureReport:
-        n = len(col)
-        n_null = int(col.null_count())
-        nan_rate = (n_null / n) if n else 0.0
-        return FeatureReport(
-            name=name,
-            n=n,
-            nan_rate=nan_rate,
-            mean=float("nan"),
-            std=float("nan"),
-            min=float("nan"),
-            max=float("nan"),
-            range_ok=True,
-            finite_ok=True,
-            warmup_ok=True,
-            tail_ok=True,
-            parity_ok=None,
-        )
 
 
 # ===========================================================================
@@ -211,15 +187,15 @@ def compute_feature_health(
             mx = float(mx_v) if mx_v is not None else float("nan")
             try:
                 skew = float(s_clean.skew()) if n_valid > 2 else float("nan")
-            except Exception:
+            except (pl.exceptions.ComputeError, ValueError):
                 skew = float("nan")
             try:
                 kurt = float(s_clean.kurtosis()) if n_valid > 3 else float("nan")
-            except Exception:
+            except (pl.exceptions.ComputeError, ValueError):
                 kurt = float("nan")
             try:
                 n_inf = int(s_clean.is_infinite().sum() or 0)
-            except Exception:
+            except (pl.exceptions.ComputeError, ValueError):
                 n_inf = 0
         else:
             mean = std = mn = mx = skew = kurt = float("nan")
@@ -256,14 +232,14 @@ def compute_feature_health(
                     outlier_ratio = float("inf")
                 else:
                     outlier_ratio = 0.0
-            except Exception:
+            except (pl.exceptions.ComputeError, ValueError):
                 outlier_ratio = 0.0
         else:
             outlier_ratio = 0.0
         is_extreme_outlier = (
-            (not math.isinf(outlier_ratio))
-            and outlier_ratio > outlier_ratio_threshold
-        ) or math.isinf(outlier_ratio)
+            outlier_ratio > outlier_ratio_threshold
+            or math.isinf(outlier_ratio)
+        )
 
         # Stationarity drift across chronological chunks. Skip for
         # constant or low-signal features (the drift metric is undefined).
@@ -404,7 +380,8 @@ def flag_issues(
       3. ``scattered_missing`` — pre-impute missing cells are not at
          the edges (warmup / coverage tail); flags either a real data
          anomaly or an engine bug
-      4. ``all_nan``           — column is fully missing
+      4. ``all_missing``       — column is fully missing (matches the
+         ``null_pattern`` vocabulary)
       5. ``extreme_outlier``   — max|x| / median|x≠0| > threshold
          (catches single-row blowups like denominator-near-zero)
       6. ``imputed_constant``  — constant value but driven by impute
@@ -420,7 +397,7 @@ def flag_issues(
             (pl.col("n_nan") > 0)
             | pl.col("has_inf")
             | (pl.col("null_pattern") == "scattered")
-            | pl.col("mean").is_nan()
+            | (pl.col("null_pattern") == "all_missing")
             | pl.col("is_extreme_outlier")
             | pl.col("is_imputed_constant")
             | pl.col("is_non_stationary")
@@ -435,8 +412,8 @@ def flag_issues(
             .then(pl.lit("inf"))
             .when(pl.col("null_pattern") == "scattered")
             .then(pl.lit("scattered_missing"))
-            .when(pl.col("mean").is_nan())
-            .then(pl.lit("all_nan"))
+            .when(pl.col("null_pattern") == "all_missing")
+            .then(pl.lit("all_missing"))
             .when(pl.col("is_extreme_outlier"))
             .then(pl.lit("extreme_outlier"))
             .when(pl.col("is_imputed_constant"))

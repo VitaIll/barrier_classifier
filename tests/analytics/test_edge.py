@@ -219,6 +219,28 @@ def test_partial_roc_auc_ci_brackets_point():
     assert res.ci_low <= res.point <= res.ci_high
 
 
+def test_partial_roc_auc_zero_fpr_max_raises():
+    """fpr_max <= 0 is undefined (division by zero in normalization)."""
+    cache = _make_cache(n=500, seed=0)
+    y = cache["y"].to_numpy()
+    p = cache["p"].to_numpy()
+    with pytest.raises(ValueError, match="fpr_max"):
+        bootstrap_partial_roc_auc(y, p, fpr_max=0.0, B=5)
+    with pytest.raises(ValueError, match="fpr_max"):
+        bootstrap_partial_roc_auc(y, p, fpr_max=-0.1, B=5)
+
+
+def test_partial_pr_auc_zero_recall_max_raises():
+    """recall_max <= 0 is undefined (division by zero in normalization)."""
+    cache = _make_cache(n=500, seed=0)
+    y = cache["y"].to_numpy()
+    p = cache["p"].to_numpy()
+    with pytest.raises(ValueError, match="recall_max"):
+        bootstrap_partial_pr_auc(y, p, recall_max=0.0, B=5)
+    with pytest.raises(ValueError, match="recall_max"):
+        bootstrap_partial_pr_auc(y, p, recall_max=-0.05, B=5)
+
+
 # ---------------------------------------------------------------------------
 # Kelly by bin
 # ---------------------------------------------------------------------------
@@ -281,12 +303,18 @@ def test_kelly_by_bin_higher_p_bins_have_higher_hit_rates():
 
 
 def test_lift_curve_at_full_population_equals_base_rate():
-    """precision_at_k=N (everyone selected) = base rate; lift = 1."""
+    """precision_at_k=N (everyone selected) = base rate; lift = 1.
+
+    Also assert the last-row k is N — i.e. the curve really did include the
+    full population (catches off-by-one truncation in the cumulative sum).
+    """
     cache = _make_cache(n=1500, seed=0)
     df = lift_curve(cache, split="test")
     base = float(cache["y"].mean())
     assert df.iloc[-1]["precision_at_k"] == pytest.approx(base, rel=1e-12)
     assert df.iloc[-1]["lift_at_k"] == pytest.approx(1.0, rel=1e-12)
+    # The cumulative population reaches all rows in the cache.
+    assert int(df.iloc[-1]["k"]) == len(cache)
 
 
 def test_lift_curve_recall_at_full_equals_one():

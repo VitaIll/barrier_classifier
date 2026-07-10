@@ -222,6 +222,24 @@ def rolling_max(
 # ---------------------------------------------------------------------------
 
 
+def ewm_mean_halflife(x: pl.Expr, *, half_life: int) -> pl.Expr:
+    """EWMA with half-life parametrization, ``adjust=False`` (causal recursive).
+
+    ``alpha = 1 - 2^(-1/half_life)`` so the weight of the bar ``half_life``
+    rows ago is exactly 0.5× the weight on the current bar:
+
+        y_t = alpha · x_t + (1 - alpha) · y_{t-1},  y_0 = x_0
+
+    Polars accepts ``half_life`` directly; ``adjust=False`` is critical
+    because polars' default ``adjust=True`` uses normalized weights that
+    do not match the spec's recursive update form.
+
+    Wrapped here rather than called bare in feature classes so the
+    ``adjust=False`` discipline is enforced in one place.
+    """
+    return x.ewm_mean(half_life=half_life, adjust=False)
+
+
 def ewm_mean(x: pl.Expr, *, span: int, adjust: bool = False) -> pl.Expr:
     """Exponentially weighted mean with ``alpha = 2 / (span + 1)``.
 
@@ -615,5 +633,111 @@ def signed_run_cumret(x: pl.Expr) -> pl.Expr:
     """Cumulative sum of values within the current signed run."""
     return x.map_batches(
         lambda s: pl.Series(_signed_run_np(s.to_numpy())[2]),
+        return_dtype=pl.Float64,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Past-only linear OLS (equilibrium family helper)
+#
+# Used by ``eq__mu_trend`` and ``eq__trend_sresid``. Differs from
+# ``_quad_trend_np`` in two ways:
+#   1. Linear (degree 1) instead of quadratic.
+#   2. Strictly past-only window: at row n the fit uses p[n-W..n-1], with
+#      design coordinates x_i = i - n so x ranges from -W to -1. The
+#      reported intercept is evaluated at x = 0 — i.e. extrapolated ONE
+#      step beyond the past data, to the current-bar position. The
+#      residual std is the population (ddof=0) standard deviation of the
+#      fit residuals over the same past-only window.
+# ---------------------------------------------------------------------------
+
+
+def _past_only_linear_trend_np(
+    p: np.ndarray, w: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Past-only linear-OLS fit at each row.
+
+    For each row ``n`` with ``n >= w``, fits ``p_i = a + b·x_i + e_i`` over
+    the past-only window ``{n-w, ..., n-1}`` with coordinates
+    ``x_i = i - n``. Returns:
+
+      - ``mu_trend``: the intercept evaluated at ``x = 0`` (the current-bar
+        extrapolation of the trend line).
+      - ``s_resid``: ``sqrt(mean(e_i²))`` over the past-only window
+        (population, ``ddof=0``).
+
+    Rows ``0..w-1`` return ``NaN`` (warmup — the past window is incomplete).
+    Windows containing any ``NaN`` return ``NaN`` for both outputs.
+
+    Implementation note: residual variance is clamped at zero before sqrt
+    to guard against tiny-negative cancellation residuals on perfect-line
+    windows (mirrors the ``clip_pos`` pattern in ``VolGk`` / ``VolRs``).
+    """
+    n = len(p)
+    mu_trend = np.full(n, np.nan, dtype=float)
+    s_resid = np.full(n, np.nan, dtype=float)
+    w_int = int(w)
+    if n <= w_int:
+        return mu_trend, s_resid
+
+    # Fixed design moments (depend only on w).
+    x = np.arange(-w_int, 0, dtype=float)
+    x_mean = float(x.mean())  # = -(w+1)/2
+    x_centered = x - x_mean
+    sum_u2 = float((x_centered ** 2).sum())
+    if sum_u2 <= 0.0:
+        return mu_trend, s_resid
+
+    # Eligible rows: first valid output is at row w (window covers rows
+    # 0..w-1, strictly past). Process in chunks to bound peak memory.
+    eligible = np.arange(w_int, n, dtype=np.int64)
+    # offsets[j]: rows back from n. Window indices = n - offsets, so
+    # column 0 is the oldest (n-w) and column w-1 is the newest (n-1).
+    offsets = np.arange(w_int, 0, -1, dtype=np.int64)
+    max_elements = 5_000_000
+    chunk_size = int(min(20_000, max(1, max_elements // w_int)))
+
+    for start in range(0, len(eligible), chunk_size):
+        idx = eligible[start : start + chunk_size]
+        rows = idx[:, None] - offsets[None, :]
+        window_vals = p[rows]
+        invalid = np.isnan(window_vals).any(axis=1)
+
+        p_mean = window_vals.mean(axis=1)
+        Sup = ((window_vals - p_mean[:, None]) * x_centered[None, :]).sum(axis=1)
+        beta = Sup / sum_u2  # slope
+        alpha = p_mean - beta * x_mean  # intercept at x = 0
+
+        # Residuals against the past-only window.
+        fitted = alpha[:, None] + beta[:, None] * x[None, :]
+        resid = window_vals - fitted
+        resid_var = (resid ** 2).mean(axis=1)
+        resid_var = np.maximum(0.0, resid_var)
+        sres = np.sqrt(resid_var)
+
+        alpha[invalid] = np.nan
+        sres[invalid] = np.nan
+        mu_trend[idx] = alpha
+        s_resid[idx] = sres
+
+    return mu_trend, s_resid
+
+
+def past_only_linear_trend_mu(x: pl.Expr, w: int) -> pl.Expr:
+    """Past-only OLS fair value: the intercept at ``x=0`` of a linear fit
+    over the trailing ``w`` rows ``{n-w, ..., n-1}``.
+
+    See :func:`_past_only_linear_trend_np` for math details.
+    """
+    return x.map_batches(
+        lambda s, ww=w: pl.Series(_past_only_linear_trend_np(s.to_numpy(), ww)[0]),
+        return_dtype=pl.Float64,
+    )
+
+
+def past_only_linear_trend_sresid(x: pl.Expr, w: int) -> pl.Expr:
+    """Past-only OLS residual std (population) over the trailing ``w`` rows."""
+    return x.map_batches(
+        lambda s, ww=w: pl.Series(_past_only_linear_trend_np(s.to_numpy(), ww)[1]),
         return_dtype=pl.Float64,
     )

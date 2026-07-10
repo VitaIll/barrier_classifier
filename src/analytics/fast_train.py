@@ -22,6 +22,8 @@ The cache is the canonical input to all downstream analytics phases.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -33,6 +35,21 @@ from catboost import CatBoostClassifier, Pool
 CACHE_REQUIRED_COLS = ["k", "ts", "y", "m_k", "tau_k", "phi", "regime", "p", "split"]
 
 DEFAULT_REGIME_SIGNAL = "vol__rs__f__w240"
+
+# Schema version for the prediction-cache sidecar metadata. Bump when the
+# on-disk format or required keys change in a non-backwards-compatible way.
+CACHE_SCHEMA_VERSION = 1
+
+
+class CacheKeyMismatchError(ValueError):
+    """Raised by ``load_predictions_cache`` when the on-disk cache's identity
+    keys (data_hash, model_id, feature_list_hash, schema_version) do not
+    match the values the caller expects.
+
+    A mismatch means the cache was produced from a different dataset, model,
+    or feature list, so re-using its predictions would silently mix incompatible
+    sources. The correct response is to regenerate the cache.
+    """
 
 
 @dataclass
@@ -202,19 +219,135 @@ def compute_predictions(
     return out
 
 
-def save_predictions_cache(cache: pd.DataFrame, path: str | Path) -> None:
-    """Write the prediction cache to parquet, validating schema first."""
+def _cache_meta_path(path: str | Path) -> Path:
+    """Sidecar JSON path for cache metadata (lives next to the parquet)."""
+    return Path(path).with_suffix(Path(path).suffix + ".meta.json")
+
+
+def save_predictions_cache(
+    cache: pd.DataFrame,
+    path: str | Path,
+    *,
+    data_hash: str,
+    model_id: str,
+    feature_list_hash: str,
+) -> None:
+    """Atomically write the prediction cache to parquet plus a sidecar meta.
+
+    The sidecar at ``{path}.meta.json`` records the identity keys
+    (``data_hash``, ``model_id``, ``feature_list_hash``, ``schema_version``)
+    so callers can verify they are loading a cache built from the inputs they
+    expect — see :func:`load_predictions_cache`.
+
+    Atomicity: the parquet is written to ``{path}.tmp`` (same directory as
+    the destination, so the rename is a single filesystem move on the same
+    volume), then promoted via :func:`os.replace`. If the process crashes
+    before the replace, the destination is untouched and only the ``.tmp``
+    file is left behind. The sidecar is written using the same tmp+rename
+    pattern.
+
+    All three identity keys are required (no defaults) to keep callers from
+    silently producing un-keyed caches.
+    """
     missing = [c for c in CACHE_REQUIRED_COLS if c not in cache.columns]
     if missing:
         raise ValueError(f"cache missing required columns: {missing}")
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    cache.to_parquet(path, index=False)
+    if not isinstance(data_hash, str) or not data_hash:
+        raise ValueError("data_hash must be a non-empty str")
+    if not isinstance(model_id, str) or not model_id:
+        raise ValueError("model_id must be a non-empty str")
+    if not isinstance(feature_list_hash, str) or not feature_list_hash:
+        raise ValueError("feature_list_hash must be a non-empty str")
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_parquet = path.with_suffix(path.suffix + ".tmp")
+    tmp_meta = _cache_meta_path(path).with_suffix(".json.tmp")
+
+    # Write parquet to a tmp first, then atomically promote. If `to_parquet`
+    # raises after partial bytes are written, the destination is untouched.
+    cache.to_parquet(tmp_parquet, index=False)
+    try:
+        meta = {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "data_hash": data_hash,
+            "model_id": model_id,
+            "feature_list_hash": feature_list_hash,
+        }
+        tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        os.replace(tmp_parquet, path)
+        os.replace(tmp_meta, _cache_meta_path(path))
+    except Exception:
+        # Clean up partial tmps on failure so the next attempt isn't confused.
+        for f in (tmp_parquet, tmp_meta):
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+        raise
 
 
-def load_predictions_cache(path: str | Path) -> pd.DataFrame:
-    """Load and validate the prediction cache from parquet."""
+def load_predictions_cache(
+    path: str | Path,
+    *,
+    expected_data_hash: Optional[str] = None,
+    expected_model_id: Optional[str] = None,
+    expected_feature_list_hash: Optional[str] = None,
+) -> pd.DataFrame:
+    """Load and validate the prediction cache from parquet.
+
+    Validates two things:
+
+    1. **Schema**: every required column in :data:`CACHE_REQUIRED_COLS` is
+       present. Missing columns raise :class:`ValueError`.
+
+    2. **Identity keys** (optional, recommended): if any of
+       ``expected_data_hash`` / ``expected_model_id`` /
+       ``expected_feature_list_hash`` is supplied, the corresponding sidecar
+       value is compared and a :class:`CacheKeyMismatchError` is raised on
+       any mismatch. ``expected_*=None`` skips that check.
+
+    The schema version is always compared if a sidecar is present; an
+    on-disk version different from :data:`CACHE_SCHEMA_VERSION` raises
+    :class:`CacheKeyMismatchError`.
+    """
     df = pd.read_parquet(path)
     missing = [c for c in CACHE_REQUIRED_COLS if c not in df.columns]
     if missing:
         raise ValueError(f"cache at {path} missing required columns: {missing}")
+
+    expected = {
+        "data_hash": expected_data_hash,
+        "model_id": expected_model_id,
+        "feature_list_hash": expected_feature_list_hash,
+    }
+    any_check = any(v is not None for v in expected.values())
+    meta_path = _cache_meta_path(path)
+    if any_check or meta_path.exists():
+        if not meta_path.exists():
+            raise CacheKeyMismatchError(
+                f"cache at {path} has no sidecar metadata at {meta_path}; "
+                "cannot verify identity keys"
+            )
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise CacheKeyMismatchError(
+                f"sidecar metadata at {meta_path} is not valid JSON: {exc}"
+            ) from exc
+        on_disk_version = int(meta.get("schema_version", -1))
+        if on_disk_version != CACHE_SCHEMA_VERSION:
+            raise CacheKeyMismatchError(
+                f"cache schema_version {on_disk_version} != "
+                f"expected {CACHE_SCHEMA_VERSION}"
+            )
+        for key, value in expected.items():
+            if value is None:
+                continue
+            on_disk = meta.get(key)
+            if on_disk != value:
+                raise CacheKeyMismatchError(
+                    f"cache {key} mismatch: on-disk={on_disk!r}, "
+                    f"expected={value!r}"
+                )
     return df

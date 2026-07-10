@@ -159,18 +159,21 @@ def test_bootstrap_roc_curve_auc_samples_match_bootstrap_metric():
     """Consistency: same seed + B + stratify -> same iid_indices -> same AUC samples
     as bootstrap_metric. This is a very tight cross-module check that catches
     any divergence between the curve module and the metric module.
+
+    The curve module stores per-grid samples in ``res_curve.samples``; the
+    AUC summary is exposed only via the quantile fields. We compare quantiles
+    here — and assert the curve's per-replicate AUC sample shape matches the
+    metric's. (Earlier versions of this test mistakenly compared each array
+    against itself; the renamed assertions catch any divergence in practice.)
     """
     y, p = _synthetic(n=1500)
     res_curve = bootstrap_roc_curve(y, p, B=300, stratify=True, seed=0)
     res_metric = bootstrap_metric(roc_auc_score, y, p, B=300, stratify=True, seed=0)
-    np.testing.assert_array_equal(
-        np.sort(res_curve.samples.shape), np.sort(res_curve.samples.shape)
-    )
-    # The curve module recomputes auc_samples from the same idx; values must match exactly.
-    np.testing.assert_allclose(
-        np.sort(res_metric.samples), np.sort(np.sort(res_metric.samples)), rtol=1e-12
-    )
-    # And via the curve's auc bootstrap quantiles match the metric's quantiles.
+    # The curve module's per-grid samples and the metric's per-replicate samples
+    # have different shapes (curve is 2D over the FPR grid); both reflect the
+    # same idx matrix, so B must match.
+    assert res_curve.samples.shape[0] == res_metric.samples.shape[0] == 300
+    # Quantile cross-check — these are the only AUC summaries exposed.
     assert res_curve.auc_median == pytest.approx(res_metric.median, rel=1e-12)
     assert res_curve.auc_ci_low == pytest.approx(res_metric.ci_low, rel=1e-12)
     assert res_curve.auc_ci_high == pytest.approx(res_metric.ci_high, rel=1e-12)

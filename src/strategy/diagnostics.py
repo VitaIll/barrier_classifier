@@ -26,12 +26,32 @@ from sklearn.metrics import roc_auc_score
 
 @dataclass(frozen=True)
 class DiagnosticResult:
+    """Outcome of one diagnostic check.
+
+    ``failure_kind`` is a stable machine-readable tag for the FAIL branch:
+
+    - ``"insufficient_data"``: fewer rows than the diagnostic's minimum.
+    - ``"constant_input"``: the gating covariate has near-zero variance.
+    - ``"too_few_above_threshold"``: not enough rows pass the gating cut.
+    - ``"no_eligible_subset"``: median-split / tercile-split produced an
+      empty or uneven subset.
+    - ``"missing_inputs"``: optional inputs (e.g. VE columns) absent.
+    - ``"degenerate_signal"``: input is uniform/random and the diagnostic
+      cannot evaluate (no AUC, no correlation, etc.).
+    - ``""`` (empty): no failure (``passed=True``), or pass/fail is
+      well-defined and the failure isn't one of the structured kinds.
+
+    Tests prefer the structured tag over substring-matching the
+    free-form ``message``.
+    """
+
     name: str
     passed: bool
     value: float
     threshold: float
     message: str
     details: dict = field(default_factory=dict)
+    failure_kind: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -41,6 +61,7 @@ class DiagnosticResult:
             "threshold": float(self.threshold),
             "message": self.message,
             "details": dict(self.details),
+            "failure_kind": self.failure_kind,
         }
 
 
@@ -88,6 +109,7 @@ def ve_diagnostic(
                 f"{2 * min_per_subset}"
             ),
             details={"n_valid": int(valid.sum())},
+            failure_kind="insufficient_data",
         )
     y_v, p_v, u_v = y[valid], mean_p[valid], knowledge_unc[valid]
 
@@ -99,6 +121,7 @@ def ve_diagnostic(
             threshold=pass_uplift,
             message="knowledge_uncertainty is (nearly) constant — no sortable variation",
             details={"unc_std": float(u_v.std())},
+            failure_kind="constant_input",
         )
 
     p_cut = float(np.quantile(p_v, 1.0 - score_top_quantile))
@@ -115,6 +138,7 @@ def ve_diagnostic(
                 f"score_top_quantile or get more data"
             ),
             details={"n_selected": n_sel},
+            failure_kind="too_few_above_threshold",
         )
 
     u_in_sel = u_v[sel]
@@ -134,6 +158,7 @@ def ve_diagnostic(
                 f"both subsets need >= {min_per_subset}"
             ),
             details={"n_low_mi": n_low, "n_high_mi": n_high},
+            failure_kind="no_eligible_subset",
         )
 
     prec_low = float(y_v[low_mi].mean())
@@ -207,6 +232,7 @@ def vol_gate_diagnostic(
             threshold=pass_uplift,
             message=f"too few candidates ({int(sel_all.sum())} < {min_trades})",
             details={"n_all": int(sel_all.sum()), "n_gated": int(sel_gate.sum())},
+            failure_kind="too_few_above_threshold",
         )
 
     prec_all = float(y[sel_all].mean())
@@ -261,6 +287,7 @@ def cluster_persistence_diagnostic(
             threshold=pass_lift,
             message=f"too few rows ({len(p)} < 100)",
             details={"n": int(len(p))},
+            failure_kind="insufficient_data",
         )
     tau = float(np.quantile(p, threshold_quantile))
     above = p > tau
@@ -275,6 +302,7 @@ def cluster_persistence_diagnostic(
                 f"too few rows above threshold ({n_above} < {min_above_threshold})"
             ),
             details={"n_above": n_above, "tau": tau},
+            failure_kind="too_few_above_threshold",
         )
 
     # P(above_{k+1} | above_k) using lag-1 conditioning
@@ -289,6 +317,7 @@ def cluster_persistence_diagnostic(
             threshold=pass_lift,
             message="no above-threshold rows except possibly the last",
             details={"n_above": n_above},
+            failure_kind="no_eligible_subset",
         )
     p_marginal = float(above.mean())
     p_conditional = float(n_pair_above / n_above_excl_last)
@@ -357,6 +386,7 @@ def within_regime_signal_diagnostic(
             threshold=pass_threshold,
             message="no regime tercile met min sample / both-class requirements",
             details={},
+            failure_kind="no_eligible_subset",
         )
     median_auc = float(np.median(list(aucs.values())))
     passed = bool(median_auc >= pass_threshold)
@@ -405,6 +435,7 @@ def run_all_diagnostics(
             threshold=-0.20,
             message="VE quantities (mean_p_ve, knowledge_unc) not provided",
             details={},
+            failure_kind="missing_inputs",
         )
     return out
 

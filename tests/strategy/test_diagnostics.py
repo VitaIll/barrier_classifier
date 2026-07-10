@@ -29,13 +29,23 @@ pytestmark = pytest.mark.strategy_v1
 def test_diagnostic_result_to_dict_roundtrips_fields():
     r = DiagnosticResult(
         name="x", passed=True, value=0.5, threshold=0.3,
-        message="ok", details={"k": 1},
+        message="ok", details={"k": 1}, failure_kind="",
     )
     d = r.to_dict()
     assert d["passed"] is True
     assert d["value"] == 0.5
     assert d["threshold"] == 0.3
     assert d["details"] == {"k": 1}
+    assert d["failure_kind"] == ""
+
+
+def test_diagnostic_result_failure_kind_defaults_to_empty():
+    """Passing results should always have failure_kind == ''."""
+    r = DiagnosticResult(
+        name="x", passed=True, value=0.5, threshold=0.3,
+        message="ok", details={},
+    )
+    assert r.failure_kind == ""
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +82,8 @@ def test_ve_diagnostic_fails_when_unc_uninformative():
 
 
 def test_ve_diagnostic_handles_constant_unc():
+    """Constant MI is detected via the structured ``failure_kind`` flag.
+    Substring-matching the message is brittle to phrasing changes."""
     rng = np.random.default_rng(2)
     n = 1000
     p = rng.uniform(size=n)
@@ -79,17 +91,18 @@ def test_ve_diagnostic_handles_constant_unc():
     y = (rng.uniform(size=n) < p).astype(int)
     res = ve_diagnostic(y, mean_p=p, knowledge_unc=unc)
     assert not res.passed
-    assert "constant" in res.message.lower()
+    assert res.failure_kind == "constant_input"
 
 
 def test_ve_diagnostic_handles_too_few_rows():
+    """Too-few-rows path is detected via the structured ``failure_kind``."""
     res = ve_diagnostic(
         y=np.array([0, 1, 0, 1]),
         mean_p=np.array([0.1, 0.5, 0.3, 0.7]),
         knowledge_unc=np.array([0.1, 0.2, 0.3, 0.4]),
     )
     assert not res.passed
-    assert "insufficient" in res.message.lower() or "too few" in res.message.lower()
+    assert res.failure_kind in ("insufficient_data", "too_few_above_threshold")
 
 
 # ---------------------------------------------------------------------------

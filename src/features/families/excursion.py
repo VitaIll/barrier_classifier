@@ -131,7 +131,10 @@ def _drawup_drawdown_rolling_np(
 class _ExcursionFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "excursion"
-    tier: ClassVar[int | str] = 2
+    # Tier 1: ``p`` is a base-series column on the bars frame at engine
+    # entry, not an engine-emitted column. Running in tier 1 keeps the
+    # feature out of the cross-tier dependency graph.
+    tier: ClassVar[int | str] = 1
     inputs = ("p",)
     windows = tuple(WINDOWS_EXCURSION)
 

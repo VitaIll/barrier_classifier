@@ -320,3 +320,34 @@ def test_empty_registry_returns_input_unchanged(bars):
     assert result.warmup_trimmed == 0
     assert result.tail_trimmed == 0
     assert len(result.data) == len(bars)
+
+
+def test_engine_rejects_intra_tier_column_name_collision():
+    """Two Feature subclasses emitting the same column name in the same
+    tier would silently overwrite each other inside polars'
+    ``with_columns`` call. The engine must raise at construction so the
+    collision surfaces at registration time, not as a wrong-column bug.
+    """
+
+    class CollisionLeft(Feature):
+        family = "test"
+        inputs = ("close",)
+
+        def compute(self, w=None):
+            return pl.col("close")
+
+        def column_name(self, w=None):
+            return "test__collision"
+
+    class CollisionRight(Feature):
+        family = "test"
+        inputs = ("close",)
+
+        def compute(self, w=None):
+            return pl.col("close") * 2
+
+        def column_name(self, w=None):
+            return "test__collision"
+
+    with pytest.raises(ValueError, match="collision"):
+        FeatureEngine(tiers=(1,))

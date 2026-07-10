@@ -9,6 +9,7 @@ neither bars-tier nor boundary-stage and are kept as plain functions.
 
 from __future__ import annotations
 
+import math
 from typing import Iterable
 
 import polars as pl
@@ -103,6 +104,14 @@ def create_undef_flags_and_impute_pl(
         impute_value = _legacy.get_imputation_value(
             col, p_hit_prior=p_hit_prior, cap_h_blocks=cap_h_blocks
         )
+        # A non-finite impute value (NaN / inf) would silently re-poison
+        # the column we just flagged. Catch it at the registry boundary so
+        # the error names the column responsible.
+        if not math.isfinite(impute_value):
+            raise ValueError(
+                f"Imputation registry returned non-finite value for "
+                f"column {col!r}: {impute_value}"
+            )
         fill_exprs.append(pl.col(col).fill_null(impute_value).alias(col))
 
     if flag_exprs or fill_exprs:
@@ -124,7 +133,9 @@ def create_undef_flags_and_impute_pl(
                 raise ValueError(
                     f"Float NaN remains after imputation in column {col!r}: {n_nan}"
                 )
-        if dtype.is_numeric():
+            # ``is_infinite`` is float-only — newer polars raises on integer
+            # dtypes. Integer columns cannot carry inf so the check is
+            # vacuous for them; narrow to floats.
             if bool(out[col].is_infinite().any()):
                 raise ValueError(
                     f"Infs remain after imputation in column {col!r}"

@@ -217,28 +217,32 @@ def bootstrap_roc_curve(
     idx = _choose_indices(
         len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
     )
-    samples = np.empty((B, len(fpr_grid)), dtype=float)
-    auc_samples = np.empty(B, dtype=float)
+    samples = np.full((B, len(fpr_grid)), np.nan, dtype=float)
+    auc_samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        samples[b] = _interp_roc(y[i], p[i], fpr_grid)
-        auc_samples[b] = float(roc_auc_score(y[i], p[i]))
+        try:
+            samples[b] = _interp_roc(y[i], p[i], fpr_grid)
+            auc_samples[b] = float(roc_auc_score(y[i], p[i]))
+        except ValueError:
+            # Single-class block resample — roc_auc_score raises. Leave NaN.
+            pass
 
     alpha = (1.0 - ci) / 2.0
     return CurveBootstrapResult(
         name="roc",
         x_grid=fpr_grid,
         point=point_tpr,
-        median=np.quantile(samples, 0.5, axis=0),
-        ci_low=np.quantile(samples, alpha, axis=0),
-        ci_high=np.quantile(samples, 1.0 - alpha, axis=0),
+        median=np.nanquantile(samples, 0.5, axis=0),
+        ci_low=np.nanquantile(samples, alpha, axis=0),
+        ci_high=np.nanquantile(samples, 1.0 - alpha, axis=0),
         ci=ci,
         B=B,
         samples=samples,
         auc_point=point_auc,
-        auc_median=float(np.quantile(auc_samples, 0.5)),
-        auc_ci_low=float(np.quantile(auc_samples, alpha)),
-        auc_ci_high=float(np.quantile(auc_samples, 1.0 - alpha)),
+        auc_median=float(np.nanquantile(auc_samples, 0.5)),
+        auc_ci_low=float(np.nanquantile(auc_samples, alpha)),
+        auc_ci_high=float(np.nanquantile(auc_samples, 1.0 - alpha)),
     )
 
 
@@ -273,28 +277,31 @@ def bootstrap_pr_curve(
     idx = _choose_indices(
         len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
     )
-    samples = np.empty((B, len(recall_grid)), dtype=float)
-    ap_samples = np.empty(B, dtype=float)
+    samples = np.full((B, len(recall_grid)), np.nan, dtype=float)
+    ap_samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        samples[b] = _interp_pr(y[i], p[i], recall_grid)
-        ap_samples[b] = float(average_precision_score(y[i], p[i]))
+        try:
+            samples[b] = _interp_pr(y[i], p[i], recall_grid)
+            ap_samples[b] = float(average_precision_score(y[i], p[i]))
+        except ValueError:
+            pass
 
     alpha = (1.0 - ci) / 2.0
     return CurveBootstrapResult(
         name="pr",
         x_grid=recall_grid,
         point=point_prec,
-        median=np.quantile(samples, 0.5, axis=0),
-        ci_low=np.quantile(samples, alpha, axis=0),
-        ci_high=np.quantile(samples, 1.0 - alpha, axis=0),
+        median=np.nanquantile(samples, 0.5, axis=0),
+        ci_low=np.nanquantile(samples, alpha, axis=0),
+        ci_high=np.nanquantile(samples, 1.0 - alpha, axis=0),
         ci=ci,
         B=B,
         samples=samples,
         auc_point=point_ap,
-        auc_median=float(np.quantile(ap_samples, 0.5)),
-        auc_ci_low=float(np.quantile(ap_samples, alpha)),
-        auc_ci_high=float(np.quantile(ap_samples, 1.0 - alpha)),
+        auc_median=float(np.nanquantile(ap_samples, 0.5)),
+        auc_ci_low=float(np.nanquantile(ap_samples, alpha)),
+        auc_ci_high=float(np.nanquantile(ap_samples, 1.0 - alpha)),
     )
 
 
@@ -331,12 +338,15 @@ def bootstrap_calibration_curve(
         len(y), B, rng, stratify_y=y, stratify=stratify, block_size=block_size
     )
     samples = np.full((B, n_bins), np.nan, dtype=float)
-    ece_samples = np.empty(B, dtype=float)
+    ece_samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        _, emp_y_b = _calibration_per_bin(y[i], p[i], bin_edges)
-        samples[b] = emp_y_b
-        ece_samples[b] = float(expected_calibration_error(y[i], p[i], n_bins=n_bins))
+        try:
+            _, emp_y_b = _calibration_per_bin(y[i], p[i], bin_edges)
+            samples[b] = emp_y_b
+            ece_samples[b] = float(expected_calibration_error(y[i], p[i], n_bins=n_bins))
+        except ValueError:
+            pass
 
     alpha = (1.0 - ci) / 2.0
     return CurveBootstrapResult(
@@ -350,9 +360,9 @@ def bootstrap_calibration_curve(
         B=B,
         samples=samples,
         auc_point=point_ece,
-        auc_median=float(np.quantile(ece_samples, 0.5)),
-        auc_ci_low=float(np.quantile(ece_samples, alpha)),
-        auc_ci_high=float(np.quantile(ece_samples, 1.0 - alpha)),
+        auc_median=float(np.nanmedian(ece_samples)),
+        auc_ci_low=float(np.nanquantile(ece_samples, alpha)),
+        auc_ci_high=float(np.nanquantile(ece_samples, 1.0 - alpha)),
     )
 
 

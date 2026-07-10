@@ -53,7 +53,49 @@ from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, iid_indices
 
 
 CAUSAL_SUFFIX_PATTERN = re.compile(r"__(f|h)__")  # frozen-up-to-now or instantaneous
-SUSPECT_TOKENS = ("__b__", "fwd", "future", "ahead", "lead", "next_", "_t1", "_t2", "_tplus")
+
+# Word-boundary regex avoids substring false positives like "ledger" / "bleeding"
+# (which contain "lead") or "head_count" (which contains "ahead"). Tokens are
+# matched only when not surrounded by alphanumerics, so they sit on their own
+# underscore/dash/start/end-delimited segment.
+SUSPECT_TOKENS = (
+    "fwd",
+    "future",
+    "ahead",
+    "lead",
+    "lookahead",
+    "look_ahead",
+    "peek",
+    "oracle",
+    "tplus",
+    "t+",
+    "next",
+    "_t1",
+    "_t2",
+)
+# The word-boundary regex catches every word-like token (fwd, future, ahead,
+# lead, lookahead, peek, oracle, tplus, next) — non-word lookarounds keep
+# "ledger" / "bleeding" / "head_count" from matching.
+SUSPECT_TOKEN_PATTERN = re.compile(
+    r"(?<![a-z0-9])(fwd|future|ahead|lookahead|look_ahead|lead|peek|oracle|tplus|next)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+# ``t+`` (and ``T+``) is the t+N notation for future-offset features
+# (e.g. ``feat_t+1``). The trailing digit IS part of the leak signature, so we
+# only need a left-boundary check (preceded by a non-alphanumeric).
+SUSPECT_TPLUS_PATTERN = re.compile(r"(?<![a-z0-9])t\+", re.IGNORECASE)
+# Note: we intentionally do NOT flag the ``target_`` prefix as a leak
+# signal in this codebase. Past-target features (``target__autocorr_lagN``,
+# ``target__lagN``, etc.) are causal by construction: they're emitted by
+# ``compute_past_target_features_pl`` after a ``_label_maturity_shift``
+# that only exposes ``y[<k]``. The ``__h__`` causal suffix on every such
+# column already proves this. Genuine target-leak names like
+# ``target_fwd_3`` or ``target_next_4`` are still caught by the word-
+# boundary regex above (``fwd``/``next`` tokens are preceded by ``_``,
+# which is not alphanumeric, so the lookarounds match).
+# The "__b__" window-suffix convention is a clean delimited segment, so
+# plain substring is sufficient.
+SUSPECT_SUFFIX_LITERAL = "__b__"
 
 
 @dataclass
@@ -75,7 +117,16 @@ def causal_feature_audit(feature_list: Sequence[str]) -> CausalAuditResult:
     Pass condition: every feature contains ``__f__`` (frozen window ending at
     bar ``t``) or ``__h__`` (instantaneous, computed from bar ``t`` only). No
     suspect tokens (``__b__``, ``fwd``, ``future``, ``ahead``, ``lead``,
-    ``next_``, ``_t1``, ``_t2``, ``_tplus``).
+    ``lookahead``, ``look_ahead``, ``peek``, ``oracle``, ``tplus``, ``t+``,
+    ``next``, ``_t1``, ``_t2``).
+
+    Tokens are matched on word boundaries (regex with ``(?<![a-z0-9])`` /
+    ``(?![a-z0-9])`` lookarounds), so ``ledger``, ``bleeding``, and
+    ``head_count`` do NOT trigger false positives on ``lead`` / ``ahead``.
+    The ``target__`` prefix used by past-target features is causal by
+    construction (`compute_past_target_features_pl` enforces maturity
+    shift) — not flagged here; genuine ``target_fwd_*`` / ``target_next_*``
+    variants are still caught by the word-boundary regex.
     """
     feats = list(feature_list)
     suspect: List[str] = []
@@ -83,7 +134,14 @@ def causal_feature_audit(feature_list: Sequence[str]) -> CausalAuditResult:
     unmatched: List[str] = []
     for f in feats:
         lower = f.lower()
-        if any(tok in lower for tok in SUSPECT_TOKENS):
+        is_suspect = (
+            SUSPECT_SUFFIX_LITERAL in f
+            or SUSPECT_TOKEN_PATTERN.search(f) is not None
+            or SUSPECT_TPLUS_PATTERN.search(f) is not None
+            or "_t1" in f
+            or "_t2" in f
+        )
+        if is_suspect:
             suspect.append(f)
             continue
         if CAUSAL_SUFFIX_PATTERN.search(f) is not None:
@@ -186,6 +244,7 @@ def time_block_permutation_importance(
     features_to_test: Optional[Sequence[str]] = None,
     n_repeats: int = 3,
     random_seed: int = 42,
+    timestamp_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """For each feature, compare metric drop under within-block vs across-block
     permutation.
@@ -197,6 +256,11 @@ def time_block_permutation_importance(
     leakage smell.
 
     ``metric`` ∈ {pr_auc, roc_auc}.
+
+    ``timestamp_col`` (optional): if given, ``df`` is sorted by this column
+    before block IDs are computed. If ``None``, the caller is responsible
+    for ensuring ``df`` is already chronologically sorted — block IDs are
+    otherwise meaningless.
     """
     if metric not in ("pr_auc", "roc_auc"):
         raise ValueError(f"metric must be 'pr_auc' or 'roc_auc', got '{metric}'")
@@ -207,8 +271,21 @@ def time_block_permutation_importance(
         features_to_test = feature_list
     features_to_test = [f for f in features_to_test if f in feature_list]
 
+    if timestamp_col is not None:
+        if timestamp_col not in df.columns:
+            raise ValueError(
+                f"timestamp_col {timestamp_col!r} not in df.columns"
+            )
+        df = df.sort_values(timestamp_col).reset_index(drop=True)
+
     rng = np.random.default_rng(random_seed)
     n = len(df)
+    if n_blocks < 1:
+        raise ValueError(f"n_blocks must be >= 1, got {n_blocks}")
+    if n < n_blocks:
+        raise ValueError(
+            f"n={n} rows < n_blocks={n_blocks}; need at least one row per block"
+        )
     block_id = np.minimum(np.arange(n) * n_blocks // n, n_blocks - 1)
     y = df[label_col].astype(int).to_numpy()
     X = df[feature_list].to_numpy(dtype=float).copy()
@@ -336,6 +413,8 @@ def expected_max_sharpe(n_trials: int) -> float:
         E[max] ≈ (1 - γ) * Φ⁻¹(1 - 1/N) + γ * Φ⁻¹(1 - 1/(N e))
     where γ is Euler-Mascheroni and Φ⁻¹ is the inverse standard normal CDF.
     """
+    if not isinstance(n_trials, (int, np.integer)) or isinstance(n_trials, bool):
+        raise ValueError(f"n_trials must be an int, got {type(n_trials).__name__}")
     if n_trials < 1:
         raise ValueError("n_trials must be >= 1")
     if n_trials == 1:
@@ -477,7 +556,7 @@ def half_vs_half_drift_audit(
     p_first = m1.predict_proba(X_test)[:, 1]
     p_second = m2.predict_proba(X_test)[:, 1]
 
-    spear = float(stats.spearmanr(p_first, p_second).correlation)
+    spear = float(stats.spearmanr(p_first, p_second).statistic)
     pear = float(stats.pearsonr(p_first, p_second).statistic)
     abs_diff = np.abs(p_first - p_second)
     a1 = (p_first >= threshold).astype(int)

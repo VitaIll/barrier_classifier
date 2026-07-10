@@ -18,7 +18,10 @@ import pytest
 
 from src.analytics.fast_train import (
     CACHE_REQUIRED_COLS,
+    CACHE_SCHEMA_VERSION,
+    CacheKeyMismatchError,
     TrainSliceConfig,
+    _cache_meta_path,
     compute_predictions,
     fit_research_model,
     load_predictions_cache,
@@ -28,6 +31,12 @@ from src.analytics.fast_train import (
 )
 
 pytestmark = pytest.mark.analytics_phase1
+
+
+# Shared identity keys for the cache tests.
+_DATA_HASH = "data_v1_abc"
+_MODEL_ID = "model_v1_xyz"
+_FEATURE_LIST_HASH = "feats_v1_123"
 
 
 def _make_synthetic_dataset(
@@ -171,10 +180,9 @@ def test_select_recent_train_slice_months_dominates_frac():
     assert len(sliced) < 50
 
 
-def test_save_load_predictions_cache_roundtrip(tmp_path: Path):
-    """parquet I/O preserves all rows and column types."""
-    n = 50
-    df = pd.DataFrame(
+def _make_valid_cache_df(n: int = 50) -> pd.DataFrame:
+    """Helper: minimal valid cache DataFrame for I/O tests."""
+    return pd.DataFrame(
         {
             "k": np.arange(n),
             "ts": pd.date_range("2024-01-01", periods=n, freq="10min", tz="UTC"),
@@ -187,19 +195,192 @@ def test_save_load_predictions_cache_roundtrip(tmp_path: Path):
             "split": ["val"] * n,
         }
     )
+
+
+def test_save_load_predictions_cache_roundtrip(tmp_path: Path):
+    """parquet I/O preserves all rows and column types, and the sidecar
+    metadata stamps identity keys so load can verify them."""
+    df = _make_valid_cache_df()
     path = tmp_path / "cache.parquet"
-    save_predictions_cache(df, path)
-    loaded = load_predictions_cache(path)
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH,
+        model_id=_MODEL_ID,
+        feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    loaded = load_predictions_cache(
+        path,
+        expected_data_hash=_DATA_HASH,
+        expected_model_id=_MODEL_ID,
+        expected_feature_list_hash=_FEATURE_LIST_HASH,
+    )
     assert list(loaded.columns) == CACHE_REQUIRED_COLS
     pd.testing.assert_frame_equal(
         loaded.reset_index(drop=True), df.reset_index(drop=True), check_dtype=False
     )
+    # Sidecar exists and is JSON-parseable.
+    import json as _json
+    meta = _json.loads(_cache_meta_path(path).read_text(encoding="utf-8"))
+    assert meta["data_hash"] == _DATA_HASH
+    assert meta["model_id"] == _MODEL_ID
+    assert meta["feature_list_hash"] == _FEATURE_LIST_HASH
+    assert meta["schema_version"] == CACHE_SCHEMA_VERSION
+
+
+def test_load_predictions_cache_raises_on_data_hash_mismatch(tmp_path: Path):
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH, model_id=_MODEL_ID, feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    with pytest.raises(CacheKeyMismatchError, match="data_hash"):
+        load_predictions_cache(
+            path,
+            expected_data_hash="DIFFERENT",
+            expected_model_id=_MODEL_ID,
+            expected_feature_list_hash=_FEATURE_LIST_HASH,
+        )
+
+
+def test_load_predictions_cache_raises_on_model_id_mismatch(tmp_path: Path):
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH, model_id=_MODEL_ID, feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    with pytest.raises(CacheKeyMismatchError, match="model_id"):
+        load_predictions_cache(
+            path,
+            expected_data_hash=_DATA_HASH,
+            expected_model_id="DIFFERENT_MODEL",
+            expected_feature_list_hash=_FEATURE_LIST_HASH,
+        )
+
+
+def test_load_predictions_cache_raises_on_feature_list_hash_mismatch(tmp_path: Path):
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH, model_id=_MODEL_ID, feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    with pytest.raises(CacheKeyMismatchError, match="feature_list_hash"):
+        load_predictions_cache(
+            path,
+            expected_data_hash=_DATA_HASH,
+            expected_model_id=_MODEL_ID,
+            expected_feature_list_hash="DIFFERENT_FEATS",
+        )
+
+
+def test_load_predictions_cache_partial_expected_keys(tmp_path: Path):
+    """Passing only some ``expected_*`` keys checks just those and skips the
+    rest. Always-on schema_version check still runs once the sidecar exists."""
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH, model_id=_MODEL_ID, feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    # Only check model_id — pass.
+    loaded = load_predictions_cache(path, expected_model_id=_MODEL_ID)
+    assert len(loaded) == len(df)
+    # Only check model_id with wrong value — fail.
+    with pytest.raises(CacheKeyMismatchError, match="model_id"):
+        load_predictions_cache(path, expected_model_id="WRONG")
+
+
+def test_load_predictions_cache_no_sidecar_with_expected_keys_raises(tmp_path: Path):
+    """If the caller passes an expected_* key but no sidecar exists,
+    load raises CacheKeyMismatchError rather than silently passing."""
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    # Write parquet without sidecar (simulate a pre-versioning cache).
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    with pytest.raises(CacheKeyMismatchError, match="sidecar"):
+        load_predictions_cache(path, expected_data_hash=_DATA_HASH)
+
+
+def test_load_predictions_cache_no_expected_keys_no_sidecar_passes(tmp_path: Path):
+    """Backwards compat: if no expected_* keys are passed AND no sidecar
+    exists, load returns the data with only schema validation."""
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path, index=False)
+    loaded = load_predictions_cache(path)
+    assert len(loaded) == len(df)
+
+
+def test_save_predictions_cache_atomic_under_failure(tmp_path: Path, monkeypatch):
+    """If the sidecar write crashes mid-write, the destination parquet must
+    be untouched (the original on disk — or nothing — survives). The
+    interrupted write must leave no half-written cache.parquet at ``path``.
+    """
+    df = _make_valid_cache_df()
+    path = tmp_path / "cache.parquet"
+    # First write a known-good cache so we can verify it's NOT clobbered on
+    # a subsequent failed write.
+    save_predictions_cache(
+        df, path,
+        data_hash=_DATA_HASH, model_id=_MODEL_ID, feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    original_bytes = path.read_bytes()
+
+    # Patch json.dumps in the fast_train module to raise during the second
+    # write — simulating a crash after the parquet tmp is written.
+    import src.analytics.fast_train as ft_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(ft_mod.json, "dumps", boom)
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        save_predictions_cache(
+            df, path,
+            data_hash="NEW_HASH",
+            model_id="NEW_MODEL",
+            feature_list_hash="NEW_FEATS",
+        )
+
+    # Destination untouched: still has the original bytes.
+    assert path.read_bytes() == original_bytes
+    # And the temp file was cleaned up (no leftover .tmp pollution).
+    tmp_parquet = path.with_suffix(path.suffix + ".tmp")
+    assert not tmp_parquet.exists()
 
 
 def test_save_predictions_cache_missing_column_raises(tmp_path: Path):
     df = pd.DataFrame({"k": [1, 2, 3]})
     with pytest.raises(ValueError, match="missing required columns"):
-        save_predictions_cache(df, tmp_path / "bad.parquet")
+        save_predictions_cache(
+            df, tmp_path / "bad.parquet",
+            data_hash=_DATA_HASH, model_id=_MODEL_ID,
+            feature_list_hash=_FEATURE_LIST_HASH,
+        )
+
+
+def test_save_predictions_cache_empty_keys_raise(tmp_path: Path):
+    """Identity keys must be non-empty strings — an empty data_hash is
+    almost certainly a bug (e.g. the hasher returned '' on missing input)."""
+    df = _make_valid_cache_df()
+    for kwargs in (
+        {"data_hash": ""},
+        {"model_id": ""},
+        {"feature_list_hash": ""},
+    ):
+        all_kwargs = {
+            "data_hash": _DATA_HASH,
+            "model_id": _MODEL_ID,
+            "feature_list_hash": _FEATURE_LIST_HASH,
+            **kwargs,
+        }
+        with pytest.raises(ValueError, match="non-empty"):
+            save_predictions_cache(df, tmp_path / "x.parquet", **all_kwargs)
 
 
 def test_load_predictions_cache_missing_column_raises(tmp_path: Path):
@@ -341,8 +522,18 @@ def test_full_pipeline_save_load_roundtrip(tmp_path: Path):
     model = fit_research_model(train_df, val_df, feats, params=params)
     cache = compute_predictions(model, {"val": val_df, "test": test_df}, feats)
     path = tmp_path / "cache.parquet"
-    save_predictions_cache(cache, path)
-    loaded = load_predictions_cache(path)
+    save_predictions_cache(
+        cache, path,
+        data_hash=_DATA_HASH,
+        model_id=_MODEL_ID,
+        feature_list_hash=_FEATURE_LIST_HASH,
+    )
+    loaded = load_predictions_cache(
+        path,
+        expected_data_hash=_DATA_HASH,
+        expected_model_id=_MODEL_ID,
+        expected_feature_list_hash=_FEATURE_LIST_HASH,
+    )
     pd.testing.assert_frame_equal(
         loaded.reset_index(drop=True),
         cache.reset_index(drop=True),

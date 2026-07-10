@@ -48,6 +48,19 @@ class BootstrapResult:
     ci: float
     B: int
     samples: np.ndarray = field(repr=False)
+    # B_effective: count of bootstrap replicates that produced a finite metric
+    # value. Block bootstrap on small / single-class datasets can yield
+    # resamples on which roc_auc_score / precision_recall_curve raise
+    # ValueError; those replicates contribute NaN to ``samples``, are
+    # excluded from ``median`` / ``ci_low`` / ``ci_high`` (computed with
+    # ``np.nanquantile`` / ``np.nanmedian``), and are counted out of
+    # B_effective. Defaults to ``B`` so existing call sites that pre-date
+    # the field continue to work — :py:meth:`__post_init__` fills it.
+    B_effective: int = field(default=-1)
+
+    def __post_init__(self) -> None:
+        if self.B_effective < 0:
+            self.B_effective = int(self.B)
 
     def to_dict(self, *, include_samples: bool = False) -> dict:
         d = {
@@ -57,6 +70,7 @@ class BootstrapResult:
             "ci_high": float(self.ci_high),
             "ci": float(self.ci),
             "B": int(self.B),
+            "B_effective": int(self.B_effective),
         }
         if include_samples:
             d["samples"] = self.samples.tolist()
@@ -81,6 +95,21 @@ def block_indices(
     Preserves the within-block correlation structure of the original
     sequence. Required for autocorrelated label streams (e.g. 1-min cadence
     barrier labels where adjacent labels share M−1 future bars).
+
+    Tail-truncation behavior
+    ------------------------
+    The ``ceil(n / block_size) * block_size`` matrix may slightly exceed
+    ``n`` rows; we **truncate** the last (partial) block to length ``n``
+    rather than wrapping the indices to the head of the sequence. The
+    alternative — *circular wrap*, where indices ``>= n`` fold back to
+    the start — is deliberately rejected: in a chronological label stream
+    the wrap would splice the sequence tail to its head, manufacturing a
+    cross-boundary "neighbor" relationship that does not exist in the
+    underlying data and leaking the test period's distribution back into
+    earlier resamples. Truncation introduces a mild edge bias (the last
+    ``block_size - 1`` indices are slightly under-represented near the
+    tail) but preserves the no-cross-boundary invariant that matters for
+    time-series CIs.
     """
     if block_size <= 0:
         raise ValueError(f"block_size must be > 0, got {block_size}")
@@ -159,15 +188,22 @@ def bootstrap_metric(
         idx = block_indices(len(y_arr), B, rng, block_size=int(block_size))
     else:
         idx = iid_indices(len(y_arr), B, rng, stratify=y_arr if stratify else None)
-    samples = np.empty(B, dtype=float)
+    samples = np.full(B, np.nan, dtype=float)
     for b in range(B):
         i = idx[b]
-        samples[b] = float(fn(y_arr[i], p_arr[i]))
+        try:
+            samples[b] = float(fn(y_arr[i], p_arr[i]))
+        except ValueError:
+            # Block resamples can produce single-class slices that crash
+            # roc_auc_score / precision_recall_curve. Record NaN, drop from
+            # CI aggregation, expose count via B_effective.
+            samples[b] = np.nan
     point = float(fn(y_arr, p_arr))
     alpha = (1.0 - ci) / 2.0
-    ci_low = float(np.quantile(samples, alpha))
-    ci_high = float(np.quantile(samples, 1.0 - alpha))
-    median = float(np.quantile(samples, 0.5))
+    ci_low = float(np.nanquantile(samples, alpha))
+    ci_high = float(np.nanquantile(samples, 1.0 - alpha))
+    median = float(np.nanmedian(samples))
+    b_effective = int(np.count_nonzero(~np.isnan(samples)))
     return BootstrapResult(
         point=point,
         median=median,
@@ -176,4 +212,5 @@ def bootstrap_metric(
         ci=ci,
         B=B,
         samples=samples,
+        B_effective=b_effective,
     )

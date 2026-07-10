@@ -200,21 +200,20 @@ def test_portfolio_close_one_rejects_unknown_position():
 
 
 def test_portfolio_mtm_sums_size_weighted():
+    """Two positions on the same instrument, same entry price, summed MTM.
+
+    Note: ``Portfolio.mtm_log_return`` evaluates all open positions at one
+    ``current_price``, so this test only fits if every position shares
+    that instrument. We do NOT compose positions with different entry
+    prices and one current price — that would be meaningless. See the
+    next test if a multi-instrument portfolio is added later.
+    """
     p = Portfolio()
     p.open_one(_mk_position(entry_price=100.0, size=0.5))
-    p.open_one(_mk_position(entry_price=200.0, size=0.3))
-    # Mark at price 105 / 210 — both up 5% — log(1.05)
-    # Aggregate mtm = 0.5*log(1.05) + 0.3*log(1.05) = 0.8*log(1.05)
-    p_mtm = p.mtm_log_return(current_price=105.0)
-    # Both have same entry-fraction price assumption — mtm uses one current price
-    # so this test only fits if both share the same instrument.
-    # For test simplicity treat both as the same instrument with same current_price.
-    # We re-do with same entry to keep semantics clean:
-    p2 = Portfolio()
-    p2.open_one(_mk_position(entry_price=100.0, size=0.5))
-    p2.open_one(_mk_position(entry_price=100.0, size=0.3))
+    p.open_one(_mk_position(entry_price=100.0, size=0.3))
+    # Both up 5% => log(1.05); size-weighted aggregate = 0.8 * log(1.05)
     expected = 0.8 * math.log(1.05)
-    assert math.isclose(p2.mtm_log_return(105.0), expected, abs_tol=1e-12)
+    assert math.isclose(p.mtm_log_return(105.0), expected, abs_tol=1e-12)
 
 
 def test_portfolio_close_all_bulk_close():
@@ -252,10 +251,18 @@ def test_portfolio_realized_subtracts_cost_per_trade():
     )
 
 
+def _expected_closed_columns() -> list[str]:
+    """The set of columns ``Portfolio.closed_to_frame`` produces on empty."""
+    return list(Portfolio().closed_to_frame().columns)
+
+
 def test_portfolio_closed_to_frame_empty():
     p = Portfolio()
     df = p.closed_to_frame()
-    assert df.shape == (0, 16)
+    # Reference the schema from inventory.py rather than a hardcoded
+    # column count — adding a field there will then break this test
+    # loudly rather than silently desynchronizing.
+    assert df.shape == (0, len(_expected_closed_columns()))
 
 
 def test_portfolio_closed_to_frame_columns_present():
@@ -269,9 +276,13 @@ def test_portfolio_closed_to_frame_columns_present():
         exit_reason="tp",
     )
     df = p.closed_to_frame()
-    assert df.shape == (1, 16)
+    expected_cols = _expected_closed_columns()
+    assert df.shape == (1, len(expected_cols))
     for col in (
         "k_entry", "k_exit", "exit_reason", "gross_log_return",
         "p_at_entry", "knowledge_unc_at_entry", "regime_quantile_at_entry",
     ):
         assert col in df.columns
+    # Strong cross-check: ledger has every column the schema declares
+    for col in expected_cols:
+        assert col in df.columns, f"schema declares {col} but frame is missing it"

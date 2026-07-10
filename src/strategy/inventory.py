@@ -12,7 +12,7 @@ at close time via ``ClosedPosition.net_log_return(cost)``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Optional
 
 import math

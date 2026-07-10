@@ -86,6 +86,95 @@ def test_causal_audit_flags_future_token():
     assert "feature__f__w10" not in res.suspect
 
 
+def test_causal_audit_flags_expanded_suspect_tokens():
+    """The expanded SUSPECT_TOKENS list catches additional leakage signatures:
+    forward/lookahead/oracle/peek/target_fwd/tplus/t+/plain-next. Note that
+    the bare ``target_`` prefix is NOT flagged — see
+    ``test_causal_audit_past_target_features_with_h_suffix_are_causal``.
+    """
+    feats = [
+        # New positive cases
+        "look_ahead_5",
+        "lookahead_w10",
+        "oracle_signal",
+        "peek_at_y",
+        "target_fwd_3",       # genuine leak: 'fwd' token catches it
+        "target_next_4",      # genuine leak: 'next' token catches it
+        "feat_tplus_1",
+        "feat_t+1",
+        "feat_next",          # plain "next" (was only "next_" before)
+        "feature__f__w10",    # clean
+    ]
+    res = causal_feature_audit(feats)
+    assert not res.passed
+    suspect_set = set(res.suspect)
+    assert "look_ahead_5" in suspect_set
+    assert "lookahead_w10" in suspect_set
+    assert "oracle_signal" in suspect_set
+    assert "peek_at_y" in suspect_set
+    assert "target_fwd_3" in suspect_set
+    assert "target_next_4" in suspect_set
+    assert "feat_tplus_1" in suspect_set
+    assert "feat_t+1" in suspect_set
+    assert "feat_next" in suspect_set
+    assert "feature__f__w10" not in suspect_set
+
+
+def test_causal_audit_past_target_features_with_h_suffix_are_causal():
+    """Past-target features (``target__autocorr_lagN__h__wW``,
+    ``target__lagN__h__wW``) are emitted by
+    ``compute_past_target_features_pl`` after a label-maturity shift, so
+    they only ever read ``y[<k]`` — causal by construction. The audit
+    must classify them as causal, not suspect."""
+    feats = [
+        "target__autocorr_lag1__h__w60",
+        "target__autocorr_lag5__h__w240",
+        "target__lag1__h__w0",
+        "target__hit_rate__h__w60",
+    ]
+    res = causal_feature_audit(feats)
+    assert res.passed, (
+        "past-target features with __h__ suffix should be causal, "
+        f"got suspect={res.suspect}, unmatched={res.unmatched}"
+    )
+    assert res.n_suspect == 0
+    assert res.n_causal == len(feats)
+
+
+def test_causal_audit_no_false_positive_on_word_boundary_substrings():
+    """Word-boundary regex must NOT flag innocent substrings. The old
+    substring-``in`` check would have flagged ``ledger`` ('lead'),
+    ``bleeding`` ('lead'), and ``head_count`` ('ahead'). The regex
+    upgrade rules out these false positives.
+    """
+    feats = [
+        "ledger__f__w10",
+        "bleeding_edge__f__w5",
+        "head_count__f__w20",
+        "ahead_for_real__f__w0",  # ALSO innocent: 'ahead' is followed by '_for_real'... wait, 'ahead' IS the token. Let me pick a different example.
+    ]
+    # Replace the genuinely-ambiguous one
+    feats[-1] = "spearman_corr__f__w10"  # "spear" + "man" — no token
+    res = causal_feature_audit(feats)
+    # ledger / bleeding / head_count must NOT be in suspect — those would be
+    # false positives. The "__f__" suffix means they pass the causal check.
+    assert "ledger__f__w10" not in res.suspect
+    assert "bleeding_edge__f__w5" not in res.suspect
+    assert "head_count__f__w20" not in res.suspect
+    assert "spearman_corr__f__w10" not in res.suspect
+    # All four are clean causal features.
+    assert res.passed, f"suspect={res.suspect}, unmatched={res.unmatched}"
+
+
+def test_causal_audit_b_suffix_still_flagged():
+    """The __b__ window-suffix marker is matched via plain substring (it
+    always appears as a clean delimited segment), so it still flags."""
+    feats = ["ret__rms__b__w10", "vol__std__f__w20"]
+    res = causal_feature_audit(feats)
+    assert "ret__rms__b__w10" in res.suspect
+    assert "vol__std__f__w20" not in res.suspect
+
+
 def test_causal_audit_flags_unmatched_when_no_known_suffix():
     """A feature with neither __f__ / __h__ nor a leak token is 'unmatched'."""
     feats = ["mystery_feature", "open"]
@@ -96,12 +185,12 @@ def test_causal_audit_flags_unmatched_when_no_known_suffix():
 
 
 def test_causal_audit_real_feature_list_passes():
-    """The actual project feature_list.json should pass the audit."""
+    """The active 1-min feature_list_1min.json should pass the audit."""
     import json
     from pathlib import Path
-    p = Path("data/model_dataset/feature_list.json")
+    p = Path("data/model_dataset/feature_list_1min.json")
     if not p.exists():
-        pytest.skip("feature_list.json not available")
+        pytest.skip("feature_list_1min.json not available")
     with p.open() as fh:
         feats = json.load(fh)
     res = causal_feature_audit(feats)
@@ -258,6 +347,50 @@ def test_time_block_permutation_invalid_metric_raises():
     model = _ToyModel(weights=np.array([1.0]))
     with pytest.raises(ValueError, match="metric"):
         time_block_permutation_importance(model, df, ["a"], metric="garbage")
+
+
+def test_time_block_permutation_n_less_than_n_blocks_raises():
+    """If n < n_blocks the block IDs would have empty blocks — must raise
+    a clear error instead of silently producing degenerate output."""
+    df = pd.DataFrame({"a": [0.0, 1.0, 0.0], "y": [0, 1, 0]})
+    model = _ToyModel(weights=np.array([1.0]))
+    with pytest.raises(ValueError, match="n.*n_blocks|at least one row"):
+        time_block_permutation_importance(
+            model, df, ["a"], metric="roc_auc", n_blocks=10
+        )
+
+
+def test_time_block_permutation_timestamp_col_sorts_before_blocking():
+    """When ``timestamp_col`` is passed, the function must sort df by it
+    before computing block IDs. We construct a df where the rows are in
+    REVERSE chronological order; if the function ignored timestamp_col,
+    the first block would contain the latest rows. We can detect this by
+    permuting the input and verifying the output is identical to the
+    sorted case.
+    """
+    rng = np.random.default_rng(0)
+    n = 200
+    t = np.arange(n) / n
+    block_id = np.minimum(np.arange(n) * 8 // n, 7)
+    # Time-localized leaky signal (same as test_time_block_permutation_time_leak_signature)
+    leaky = block_id.astype(float) + rng.normal(0, 0.05, size=n)
+    y = (block_id >= 4).astype(int)
+    ts = pd.date_range("2025-01-01", periods=n, freq="1min")
+    df_sorted = pd.DataFrame({"ts": ts, "leaky": leaky, "y": y})
+    df_shuffled = df_sorted.sample(frac=1.0, random_state=0).reset_index(drop=True)
+    model = _ToyModel(weights=np.array([2.0]), intercept=-4.0)
+
+    out_sorted = time_block_permutation_importance(
+        model, df_sorted, ["leaky"], metric="roc_auc",
+        n_blocks=8, n_repeats=2, random_seed=0, timestamp_col=None,
+    )
+    out_resorted_inside = time_block_permutation_importance(
+        model, df_shuffled, ["leaky"], metric="roc_auc",
+        n_blocks=8, n_repeats=2, random_seed=0, timestamp_col="ts",
+    )
+    # When the function sorts internally, the result should match the
+    # already-sorted invocation exactly (same RNG seed, same data after sort).
+    pd.testing.assert_frame_equal(out_sorted, out_resorted_inside)
 
 
 # ---------------------------------------------------------------------------

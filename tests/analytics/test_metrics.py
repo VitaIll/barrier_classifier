@@ -196,3 +196,69 @@ def test_by_regime_to_summary_dict_is_json_safe():
     for label in d2:
         assert "roc_auc" in d2[label]
         assert "samples" not in d2[label]["roc_auc"]
+
+
+# ---------------------------------------------------------------------------
+# Oracle tests: known-value verification on a perfectly-calibrated dataset.
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_all_metrics_oracle_perfect_classifier():
+    """On a balanced binary classifier where ``p = y`` exactly:
+    Brier = 0, log_loss → 0 (small ``eps`` clip), roc_auc = 1.
+
+    This is the strongest known-value check: it ties every metric to the
+    exact analytic value on a degenerate-perfect predictor, so any future
+    change to metric wiring or sklearn defaults breaks the assertion.
+    """
+    rng = np.random.default_rng(0)
+    n = 600
+    y = rng.integers(0, 2, size=n)
+    # Use 0.001 / 0.999 instead of 0/1 to keep log_loss finite (sklearn
+    # clips internally but we want a deterministic small target).
+    p = np.where(y == 1, 0.999, 0.001).astype(float)
+    res = bootstrap_all_metrics(y, p, B=20, seed=0)
+    # Brier on near-perfect predictions: (0.001)^2 = 1e-6 per row.
+    assert res["brier_score"].point == pytest.approx(1e-6, abs=1e-9)
+    # log_loss: -log(0.999) ≈ 0.001 per row.
+    assert res["log_loss"].point < 0.002
+    # ROC-AUC: every positive scored higher than every negative -> 1.0 exactly.
+    assert res["roc_auc"].point == pytest.approx(1.0, abs=1e-12)
+    # PR-AUC: also 1.0 on a perfect ranker.
+    assert res["pr_auc"].point == pytest.approx(1.0, abs=1e-12)
+
+
+def test_bootstrap_all_metrics_oracle_brier_exactly_zero_when_p_eq_y():
+    """If p = y (literal 0/1), Brier is mathematically zero."""
+    rng = np.random.default_rng(1)
+    n = 400
+    y = rng.integers(0, 2, size=n)
+    p = y.astype(float)  # identical to y
+    res = bootstrap_all_metrics(y, p, B=10, seed=0)
+    assert res["brier_score"].point == pytest.approx(0.0, abs=1e-12)
+
+
+def test_bootstrap_all_metrics_block_size_single_class_does_not_crash():
+    """Block bootstrap on autocorrelated labels can produce single-class
+    block resamples; the new try/except in bootstrap_metric must keep these
+    metrics finite (NaN replicates fall out of the quantile aggregation).
+
+    Construct a hard case: a long stream where positives cluster in a few
+    contiguous runs. With ``block_size=20`` and a high positive cluster
+    density some block-resamples sample only negatives -> roc_auc_score
+    would raise.
+    """
+    rng = np.random.default_rng(0)
+    n = 600
+    # Positives appear only in two contiguous blocks; everywhere else y=0.
+    y = np.zeros(n, dtype=int)
+    y[100:140] = 1
+    y[400:430] = 1
+    p = np.clip(0.1 + 0.5 * y + rng.normal(0, 0.1, n), 0.001, 0.999)
+    res = bootstrap_all_metrics(y, p, B=120, stratify=False, seed=0, block_size=20)
+    # Every metric finite at the point estimate
+    for name, r in res.items():
+        assert np.isfinite(r.point), f"{name}.point not finite"
+        # Median/CI should also be finite when at least one replicate survived
+        assert r.B_effective >= 1, f"{name}.B_effective={r.B_effective}"
+        assert np.isfinite(r.median), f"{name}.median not finite"

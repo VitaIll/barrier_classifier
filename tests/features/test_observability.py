@@ -220,6 +220,128 @@ def test_flag_issues_priorities_residual_nan_first():
     assert issues.row(0, named=True)["issue"] == "residual_nan"
 
 
+def test_flag_issues_full_priority_order():
+    """Enumerate the full priority ladder of :func:`flag_issues`. One
+    column per issue class so the first-match-wins logic shows up.
+
+    Order under test (highest first):
+      residual_nan > inf > scattered_missing > all_missing >
+      extreme_outlier > imputed_constant > non_stationary >
+      organic_constant > high_undef > heavy_skew
+
+    For each column we provide just-enough inputs so that exactly that
+    priority bucket fires (and lower-priority buckets may also be
+    triggered by side effect, but the test asserts the higher-priority
+    label is the one emitted).
+    """
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    n = 600  # large enough for stationarity chunks
+    chunk = n // 3
+
+    # 1. residual_nan: contains float NaN, plus high undef rate
+    nan_col = np.concatenate([[float("nan")], rng.normal(0.0, 1.0, n - 1)])
+    nan_undef = np.zeros(n, dtype=np.int8)
+    nan_undef[0] = 1
+
+    # 2. inf: contains +inf
+    inf_col = rng.normal(0.0, 1.0, n)
+    inf_col[10] = float("inf")
+
+    # 3. scattered_missing: a single hole in the middle
+    scattered_col = rng.normal(0.0, 1.0, n).tolist()
+    scattered_col[100] = None
+
+    # 4. all_missing: every cell null
+    all_missing_col = [None] * n
+
+    # 5. extreme_outlier: one row blow-up
+    extreme_col = rng.normal(0.0, 1.0, n)
+    extreme_col[20] = 1.0e12
+
+    # 6. imputed_constant: constant col + matching undef flag everywhere
+    imp_const_col = np.full(n, 7.5)
+    imp_const_undef = np.ones(n, dtype=np.int8)
+
+    # 7. non_stationary: step shift across thirds (no inf / no NaN)
+    ns_col = np.concatenate(
+        [
+            rng.normal(0.0, 1.0, chunk),
+            rng.normal(0.0, 1.0, chunk),
+            rng.normal(10.0, 1.0, n - 2 * chunk),
+        ]
+    )
+
+    # 8. organic_constant: constant col with NO undef flag
+    organic_col = np.full(n, 3.14)
+
+    # 9. high_undef: high undef rate, but column itself is NOT constant
+    # and has no nan / inf / scattered
+    high_undef_col = rng.normal(0.0, 1.0, n)
+    high_undef_flags = np.where(rng.random(n) < 0.8, 1, 0).astype(np.int8)
+
+    # 10. heavy_skew: lognormal tail, no other issues
+    skew_col = np.exp(rng.normal(0.0, 3.0, n))
+
+    df = pl.DataFrame(
+        {
+            "ret__nan__f__w0": pl.Series(nan_col, dtype=pl.Float64),
+            "undef__ret__nan__f__w0": pl.Series(nan_undef, dtype=pl.Int8),
+            "ret__inf__f__w0": pl.Series(inf_col, dtype=pl.Float64),
+            "ret__scattered__f__w0": pl.Series(scattered_col, dtype=pl.Float64),
+            "ret__allmiss__f__w0": pl.Series(all_missing_col, dtype=pl.Float64),
+            "ret__outlier__f__w0": pl.Series(extreme_col, dtype=pl.Float64),
+            "ret__impconst__f__w0": pl.Series(imp_const_col, dtype=pl.Float64),
+            "undef__ret__impconst__f__w0": pl.Series(imp_const_undef, dtype=pl.Int8),
+            "ret__nonstat__f__w0": pl.Series(ns_col, dtype=pl.Float64),
+            "ret__orgconst__f__w0": pl.Series(organic_col, dtype=pl.Float64),
+            "ret__highundef__f__w0": pl.Series(high_undef_col, dtype=pl.Float64),
+            "undef__ret__highundef__f__w0": pl.Series(high_undef_flags, dtype=pl.Int8),
+            "ret__heavyskew__f__w0": pl.Series(skew_col, dtype=pl.Float64),
+        }
+    )
+    feature_cols = [
+        "ret__nan__f__w0",
+        "ret__inf__f__w0",
+        "ret__scattered__f__w0",
+        "ret__allmiss__f__w0",
+        "ret__outlier__f__w0",
+        "ret__impconst__f__w0",
+        "ret__nonstat__f__w0",
+        "ret__orgconst__f__w0",
+        "ret__highundef__f__w0",
+        "ret__heavyskew__f__w0",
+    ]
+    health = compute_feature_health(
+        df,
+        feature_cols,
+        outlier_ratio_threshold=1.0e6,
+        mean_drift_threshold=1.0,
+        std_drift_ratio_threshold=100.0,
+    )
+    issues = flag_issues(health, max_undef_rate=0.5, max_abs_skew=2.0)
+    label_by_name = dict(zip(issues["name"].to_list(), issues["issue"].to_list()))
+
+    expected = {
+        "ret__nan__f__w0": "residual_nan",
+        "ret__inf__f__w0": "inf",
+        "ret__scattered__f__w0": "scattered_missing",
+        "ret__allmiss__f__w0": "all_missing",
+        "ret__outlier__f__w0": "extreme_outlier",
+        "ret__impconst__f__w0": "imputed_constant",
+        "ret__nonstat__f__w0": "non_stationary",
+        "ret__orgconst__f__w0": "organic_constant",
+        "ret__highundef__f__w0": "high_undef",
+        "ret__heavyskew__f__w0": "heavy_skew",
+    }
+    for col, want in expected.items():
+        got = label_by_name.get(col)
+        assert got == want, (
+            f"{col}: expected priority {want!r} but flag_issues emitted {got!r}"
+        )
+
+
 def test_flag_issues_picks_up_scattered_missing():
     df = pl.DataFrame(
         {

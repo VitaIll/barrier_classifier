@@ -38,6 +38,8 @@ class _EventFeature(Feature):
 
 class EventRunDir(_EventFeature):
     output_prefix = "run_dir"
+    # signed_run_dir returns Int8 (-1 / 0 / +1).
+    expected_dtype: ClassVar[pl.DataType] = pl.Int8
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return signed_run_dir(pl.col("r"))
@@ -45,6 +47,8 @@ class EventRunDir(_EventFeature):
 
 class EventRunLen(_EventFeature):
     output_prefix = "run_len"
+    # signed_run_length returns Int32 (bars in current run).
+    expected_dtype: ClassVar[pl.DataType] = pl.Int32
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return signed_run_length(pl.col("r"))

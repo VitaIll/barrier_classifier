@@ -80,9 +80,22 @@ def concurrency_counts(intervals: np.ndarray, n_bars: Optional[int] = None) -> n
         n_bars = int(intervals[:, 1].max()) if len(intervals) else 0
     if n_bars <= 0:
         return np.zeros(0, dtype=np.int64)
+    # Reject out-of-range inputs explicitly rather than silently clamping —
+    # negative start or end > n_bars means the caller passed inconsistent
+    # data and a clamped result would corrupt downstream concurrency math.
+    if len(intervals):
+        if int(intervals[:, 0].min()) < 0:
+            raise ValueError(
+                f"intervals[:, 0].min()={int(intervals[:, 0].min())} < 0"
+            )
+        if int(intervals[:, 1].max()) > n_bars:
+            raise ValueError(
+                f"intervals[:, 1].max()={int(intervals[:, 1].max())} "
+                f"> n_bars={n_bars}"
+            )
     diff = np.zeros(n_bars + 1, dtype=np.int64)
-    starts = np.clip(intervals[:, 0], 0, n_bars).astype(np.int64)
-    ends = np.clip(intervals[:, 1], 0, n_bars).astype(np.int64)
+    starts = intervals[:, 0].astype(np.int64)
+    ends = intervals[:, 1].astype(np.int64)
     np.add.at(diff, starts, 1)
     np.add.at(diff, ends, -1)
     return np.cumsum(diff)[:n_bars]
@@ -125,15 +138,32 @@ def compute_uniqueness_weights(
     M: int,
     *,
     bar_stride: int = 1,
-    normalize: bool = True,
+    normalize: bool = False,
 ) -> np.ndarray:
-    """Convenience: per-row label-uniqueness weight vector.
+    """Per-row label-uniqueness weight vector ``u_i = mean(1/c_l, l in I_i)``.
 
-    With ``normalize=True`` the weights are rescaled so their mean is 1
-    — this preserves the effective sample size that gradient boosting
-    treats as ``sum(weight)``. Without normalization, an M=20 1-min
-    dataset would have a mean weight near 1/M and most rows would carry
-    near-zero importance from CatBoost's perspective.
+    Use the default ``normalize=False`` for any overlapping-label model
+    (1-min cadence, M-bar barrier labels, CPCV folds). The raw
+    uniqueness for an interior 1-min row is ``~1/M``; multiplying it
+    onto a CatBoost training-weight vector shrinks effective N from
+    ``n`` to roughly ``n/M`` — which is the *correct* number of
+    independent labels and what gradient boosting must "see" to avoid
+    overfitting to redundant adjacent rows.
+
+    ``normalize=True`` divides ``u`` by its mean, mapping every interior
+    row back to ~1 with only boundary rows carrying ``>1``. That cancels
+    the M-fold downweighting and lets the model treat overlapping labels
+    as independent — the empirical signature is best-iteration < 50 on
+    a high-frequency cache, a tiny model file, and a virtual ensemble
+    whose snapshots cluster too tightly to give useful epistemic
+    uncertainty. **Do not enable unless you have a specific reason and
+    have verified the consequences end-to-end.** It is retained only
+    for the unusual case of using uniqueness as the sole weight (with
+    no barrier-distance multiplier), where rescaling to mean-1 keeps
+    the per-iteration learning-rate effective.
+
+    See ``memory/overlapping_target_refactor.md`` for the diagnosis of
+    the original normalize=True regression.
     """
     intervals = label_intervals(n_rows, M, bar_stride=bar_stride)
     n_bars = int(intervals[:, 1].max()) if len(intervals) else 0
@@ -153,23 +183,39 @@ def compute_uniqueness_weights(
 
 def _interval_overlaps_any(starts: np.ndarray, ends: np.ndarray,
                             other_starts: np.ndarray, other_ends: np.ndarray) -> np.ndarray:
-    """Vectorized overlap check: returns boolean mask of shape (len(starts),).
+    """Vectorized per-test-interval overlap check.
 
-    For each ``i``, returns True iff ``[starts[i], ends[i])`` overlaps any
-    ``[other_starts[j], other_ends[j])``. Implementation: sort the "other"
-    intervals by start and, for each query, binary-search for the first
-    other interval whose start is < query.end; check whether that other's
-    end is > query.start (sufficient because all intervals are aligned).
-    Since the other intervals here are themselves overlapping (consecutive
-    1-min samples), we use the simpler bound check that overlap with the
-    *union* equals overlap with the union's bounding interval expanded
-    by an embargo on either side.
+    For each query interval ``[starts[i], ends[i])``, returns True iff it
+    overlaps any "other" interval ``[other_starts[j], other_ends[j])``.
+
+    Implementation: sort the "other" intervals by start. For a query
+    ``[s, e)``, use ``np.searchsorted`` to find ``k`` = number of "other"
+    intervals whose start is ``< e`` (i.e. start strictly to the left of
+    the query end — touching does not overlap for half-open intervals).
+    Among those first ``k`` sorted by start, overlap exists iff the
+    *maximum end* is ``> s``. We precompute the cumulative-max of ends
+    sorted by start so each query is answered in O(log N) by a single
+    searchsorted + array lookup.
+
+    This is the correct algorithm when "other" intervals can be
+    non-contiguous (e.g. a test set that is the union of multiple disjoint
+    folds). For the contiguous-fold case from ``purged_chronological_splits``,
+    it produces the same result as the simpler bounding-box check.
     """
     if len(other_starts) == 0:
         return np.zeros(len(starts), dtype=bool)
-    union_lo = int(other_starts.min())
-    union_hi = int(other_ends.max())
-    return (ends > union_lo) & (starts < union_hi)
+    order = np.argsort(other_starts, kind="mergesort")
+    os_sorted = other_starts[order].astype(np.int64)
+    oe_sorted = other_ends[order].astype(np.int64)
+    cummax_end = np.maximum.accumulate(oe_sorted)
+    # side="left" so other_start == ends[i] is NOT counted (half-open).
+    k = np.searchsorted(os_sorted, ends, side="left")
+    out = np.zeros(len(starts), dtype=bool)
+    has_any = k > 0
+    idx = np.where(has_any)[0]
+    if len(idx) > 0:
+        out[idx] = cummax_end[k[idx] - 1] > starts[idx]
+    return out
 
 
 def purged_train_indices(
@@ -200,22 +246,31 @@ def purged_train_indices(
     test_idx = np.asarray(test_idx, dtype=np.int64)
     if len(test_idx) == 0:
         return train_idx
-    train_intervals = label_intervals(int(train_idx.max()) + 1, M, bar_stride=bar_stride)
-    test_intervals = label_intervals(int(test_idx.max()) + 1, M, bar_stride=bar_stride)
-    train_starts = train_intervals[train_idx, 0]
-    train_ends = train_intervals[train_idx, 1]
-    test_starts = test_intervals[test_idx, 0]
-    test_ends = test_intervals[test_idx, 1]
+    # Per-row label interval is [i*bar_stride + 1, i*bar_stride + 1 + M) by
+    # the definition in :func:`label_intervals`; compute directly to avoid
+    # allocating intervals for every index up to max(idx).
+    bs = int(bar_stride)
+    train_starts = train_idx * bs + 1
+    train_ends = train_starts + int(M)
+    test_starts = test_idx * bs + 1
+    test_ends = test_starts + int(M)
 
     overlap = _interval_overlaps_any(train_starts, train_ends, test_starts, test_ends)
 
-    # Embargo: drop train rows immediately AFTER the test region (within
-    # ``embargo_rows`` row-indices of the last test row). The before-side
-    # is already handled by the overlap test (train rows whose label window
-    # spills into the test region).
+    # Embargo: drop train rows in the row-index neighborhood of EVERY test
+    # row (within ``embargo_rows`` indices AFTER each test row). The
+    # before-side is already handled by the overlap test (train rows whose
+    # label window spills into a test region). This generalizes to disjoint
+    # multi-fold test sets where each fold has its own embargo region.
     if embargo_rows > 0:
-        test_max = int(test_idx.max())
-        in_embargo = (train_idx > test_max) & (train_idx <= test_max + embargo_rows)
+        sorted_test = np.sort(test_idx)
+        k = np.searchsorted(sorted_test, train_idx, side="left")
+        prev_test = np.where(k > 0, sorted_test[np.maximum(k - 1, 0)], -1 - embargo_rows)
+        in_embargo = (
+            (prev_test >= 0)
+            & (train_idx > prev_test)
+            & (train_idx - prev_test <= embargo_rows)
+        )
     else:
         in_embargo = np.zeros(len(train_idx), dtype=bool)
     keep = (~overlap) & (~in_embargo)

@@ -51,9 +51,15 @@ def headline_row(
     equity: pd.DataFrame,
     *,
     cost_per_trade: float,
-    cadence_minutes: float = 20.0,
+    cadence_minutes: float,
 ) -> dict:
     """Compute the headline metrics row for one SimResult.
+
+    ``cadence_minutes`` is REQUIRED — at 1-min cadence (M=20) the simulator
+    walks one row per minute (cadence_minutes=1), whereas the legacy 20-min-
+    boundary mode uses cadence_minutes=20. A default of 20 used to under-
+    annualize 1-min Sharpe by sqrt(20). Pass ``r.config.get('cadence_minutes', 20.0)``
+    or wire the value explicitly from upstream.
 
     Returns a dict ready to be appended to a DataFrame.
     """
@@ -62,7 +68,10 @@ def headline_row(
         return {
             "spec": spec_name, "n_trades": 0, "hit_rate": float("nan"),
             "mean_net_log_pnl": 0.0, "std_net_log_pnl": float("nan"),
-            "total_log_pnl": 0.0, "ann_sharpe": float("nan"),
+            "total_log_pnl": 0.0,
+            "ann_sharpe": float("nan"),
+            "sharpe_realized": float("nan"),
+            "sharpe_equity_step": float("nan"),
             "max_drawdown_log": 0.0,
             "trades_per_day": 0.0,
             "tp_rate": float("nan"), "expiry_rate": float("nan"),
@@ -72,14 +81,26 @@ def headline_row(
     is_hit = closed["exit_reason"].eq("tp").astype(int)
     annualization = _annualization_factor_from_cadence_minutes(cadence_minutes)
 
-    # Per-step returns from the equity panel (already net) — first-difference
+    # Per-step returns from the equity panel (mixes realized + unrealized
+    # MTM) — annualized on the per-bar cadence.
     eq = equity["equity"].to_numpy() if "equity" in equity.columns else np.zeros(0)
     step_returns = np.diff(eq, prepend=0.0) if len(eq) else np.zeros(0)
+    sharpe_equity_step = _sharpe(step_returns, annualization=annualization)
 
+    # Per-closed-trade realized Sharpe: weighted_net_log_return per trade,
+    # annualized on a *trade-frequency* basis (n_trades / span). Avoids the
+    # MTM contribution that contaminates the equity-step series.
     span_days = (
         (equity["ts"].max() - equity["ts"].min()).total_seconds() / 86400.0
         if "ts" in equity.columns and len(equity) >= 2 else 0.0
     )
+    if span_days > 0 and n_trades > 1:
+        trades_per_year = n_trades * (365.0 / span_days)
+        sharpe_realized = _sharpe(
+            net_per_trade.to_numpy(dtype=float), annualization=trades_per_year
+        )
+    else:
+        sharpe_realized = float("nan")
 
     tp_rate = float((closed["exit_reason"] == "tp").mean())
     expiry_rate = float((closed["exit_reason"] == "expiry").mean())
@@ -94,7 +115,11 @@ def headline_row(
         "mean_net_log_pnl": float(net_per_trade.mean()),
         "std_net_log_pnl": float(net_per_trade.std(ddof=1)) if n_trades > 1 else float("nan"),
         "total_log_pnl": float(eq[-1]) if len(eq) else float(net_per_trade.sum()),
-        "ann_sharpe": _sharpe(step_returns, annualization=annualization),
+        # ``ann_sharpe`` retained as alias of ``sharpe_equity_step`` for
+        # back-compat with notebooks / sort logic in headline_table.
+        "ann_sharpe": sharpe_equity_step,
+        "sharpe_equity_step": sharpe_equity_step,
+        "sharpe_realized": sharpe_realized,
         "max_drawdown_log": _max_drawdown_log(eq),
         "trades_per_day": float(n_trades / span_days) if span_days > 0 else float("nan"),
         "tp_rate": tp_rate,
@@ -103,21 +128,35 @@ def headline_row(
     }
 
 
-def headline_table(results: Iterable, *, cadence_minutes: float = 20.0) -> pd.DataFrame:
-    """One row per ``SimResult`` with the headline metrics. Sorted by Sharpe."""
+def headline_table(
+    results: Iterable, *, cadence_minutes: float | None = None
+) -> pd.DataFrame:
+    """One row per ``SimResult`` with the headline metrics. Sorted by Sharpe.
+
+    ``cadence_minutes`` is the per-row cadence the simulator was driven at —
+    20.0 for the legacy 20-min-boundary mode, 1.0 for the 1-min canonical
+    spec. If ``None``, the function reads ``r.config['cadence_minutes']``
+    from each SimResult and falls back to 20.0 only if absent (preserves
+    the old default for legacy callers but logs no warning).
+    """
     rows = []
     for r in results:
         cost = r.config.get("cost_per_trade_override")
         if cost is None:
             # Fall back to phi-default if not in config
             cost = 0.0005
+        cad = (
+            float(cadence_minutes)
+            if cadence_minutes is not None
+            else float(r.config.get("cadence_minutes", 20.0))
+        )
         rows.append(
             headline_row(
                 r.spec_name,
                 r.closed,
                 r.equity,
                 cost_per_trade=float(cost),
-                cadence_minutes=cadence_minutes,
+                cadence_minutes=cad,
             )
         )
     df = pd.DataFrame(rows)
@@ -181,10 +220,17 @@ def regime_attribution(
         return pd.DataFrame()
     df = closed.copy()
     df["net_log_pnl"] = (df["gross_log_return"] - cost_per_trade) * df["size"]
-    # Tercile rank within entries (alternative: by raw quantile thresholds)
-    df["regime_tercile"] = pd.qcut(
+    # Tercile rank within entries (alternative: by raw quantile thresholds).
+    # Use ``labels=False`` then map to names — ``pd.qcut`` with explicit
+    # ``labels=[...]`` crashes when ``duplicates="drop"`` shrinks the bucket
+    # count below the label-list length.
+    name_map = {0: "low", 1: "med", 2: "high"}
+    tercile_idx = pd.qcut(
         df["regime_quantile_at_entry"], n_terciles,
-        labels=["low", "med", "high"][:n_terciles], duplicates="drop",
+        labels=False, duplicates="drop",
+    )
+    df["regime_tercile"] = tercile_idx.map(name_map).astype(
+        pd.CategoricalDtype(categories=["low", "med", "high"], ordered=True)
     )
     grouped = df.groupby("regime_tercile", observed=False).agg(
         n_trades=("net_log_pnl", "size"),

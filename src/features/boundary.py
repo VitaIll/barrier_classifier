@@ -135,8 +135,18 @@ def construct_labels_pl(
             continue
         base = close[n_k]
         future_up = upper_series[n_k + 1 : n_k + M + 1]
-        future_up_ret = np.log(future_up / base)
+        # numpy emits a RuntimeWarning for ``log(<=0)``. Silence it locally
+        # because we explicitly handle the resulting ``-inf`` / NaN below.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            future_up_ret = np.log(future_up / base)
         m_val = float(np.max(future_up_ret))
+        # Non-finite ``m_val`` (negative or NaN OHLC anywhere in the window
+        # poisons the max with NaN). Treat as "no observed hit" (label 0)
+        # and leave m_k / tau_k null so the data-quality flag still
+        # reflects the anomaly — better than letting NaN propagate into y.
+        if not np.isfinite(m_val):
+            y[k] = 0.0
+            continue
         m_k[k] = m_val
         hit = m_val >= phi
         y[k] = 1.0 if hit else 0.0
@@ -144,8 +154,12 @@ def construct_labels_pl(
             tau_k[k] = float(np.argmax(future_up_ret >= phi) + 1)
         if add_dn:
             future_dn = low[n_k + 1 : n_k + M + 1]
-            future_dn_ret = np.log(future_dn / base)
-            m_dn[k] = float(-np.min(future_dn_ret))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                future_dn_ret = np.log(future_dn / base)
+            m_dn_val = float(-np.min(future_dn_ret))
+            if not np.isfinite(m_dn_val):
+                continue
+            m_dn[k] = m_dn_val
             dn_hit = future_dn_ret <= -phi
             if dn_hit.any():
                 tau_dn[k] = float(np.argmax(dn_hit) + 1)
@@ -170,7 +184,7 @@ def construct_labels_pl(
 # =============================================================================
 
 
-def _label_maturity_shift(bar_stride: int | None, M: int) -> int:
+def _label_maturity_shift(bar_stride: int | None, M: int | None) -> int:
     """Number of df rows to shift to land on a mature label.
 
     At time ``t`` (row index in the ``df``), label ``y_t`` has its
@@ -180,11 +194,24 @@ def _label_maturity_shift(bar_stride: int | None, M: int) -> int:
     ``t <= t_now − M//bar_stride``. So a shift of ``M // bar_stride``
     rows is the smallest causal shift.
 
-    For legacy boundary cadence (``bar_stride = M``), this is 1 (one
-    boundary back). For 1-min cadence (``bar_stride = 1``), this is M.
+    For legacy boundary cadence (``bar_stride = None`` defaults to M-cadence
+    with a shift of 1 boundary row). For 1-min cadence (``bar_stride = 1``),
+    this is M.
+
+    Defense-in-depth: if ``bar_stride`` is given but ``M`` is None (or
+    inconsistent with bar_stride), the shift would silently collapse to
+    1 and the caller would leak overlapping 1-min labels into features.
+    Require ``M`` explicitly whenever a non-default ``bar_stride`` is
+    supplied.
     """
     if bar_stride is None or bar_stride <= 0:
         return 1
+    if M is None:
+        raise ValueError(
+            "M must be provided when bar_stride is explicitly set; "
+            "without it the label-maturity shift would silently collapse "
+            "to 1 row and leak overlapping 1-min labels into features."
+        )
     return max(1, int(M) // int(bar_stride))
 
 
@@ -195,8 +222,10 @@ def compute_past_target_features_pl(
     *,
     bar_stride: int | None = None,
     M: int | None = None,
+    mature_alpha: float = 0.75,
+    phi: float | None = None,
 ) -> pl.DataFrame:
-    """Add hit__prev, hit__rate, hit__since columns.
+    """Add hit__prev, hit__rate, hit__since columns, plus matured-label memory.
 
     Mirrors utils.compute_past_target_features (utils.py:2460-2482).
 
@@ -204,8 +233,40 @@ def compute_past_target_features_pl(
     under both boundary cadence (default; shift = 1 row) and 1-min cadence
     (shift = M rows). ``windows_h`` is accepted for legacy signature parity
     but only ``hitrate_windows_h`` is actually used.
+
+    Additional matured-label memory columns (Round 2):
+
+      - target__mature_m_mean__h__w{W}          rolling mean of matured upside
+                                                 excursion ``m_k``. Captures
+                                                 average burst capacity of
+                                                 recent CLOSED windows.
+      - target__mature_pos_count__h__w{W}       count of matured positives.
+                                                 Distinguishes "no hits" from
+                                                 "many slow hits" when paired
+                                                 with mature_tau_pos_mean.
+      - target__mature_tau_pos_mean__h__w{W}    rolling mean of ``tau_k``
+                                                 over matured positives only.
+                                                 Null when no matured positive
+                                                 in window (impute to ``M``).
+      - target__mature_near_miss_up__h__w{W}    fraction of matured rows where
+                                                 ``alpha*phi <= m_k < phi`` (upside
+                                                 near-miss).
+      - target__mature_near_miss_dn__h__w{W}    fraction of matured rows where
+                                                 ``alpha*phi <= m_dn < phi``
+                                                 (downside near-miss). Emitted
+                                                 only if ``m_dn`` is present
+                                                 (i.e. labels were constructed
+                                                 with ``add_triple_barrier_aux=True``).
+
+    All shifts use ``_label_maturity_shift(bar_stride, M)`` — same primitive
+    that already gates ``hit__prev``, ``hit__rate``, and ``hit__since``.
+
+    ``mature_alpha`` defines the near-miss band (default ``0.75 * phi``).
+    ``phi`` is read from the boundary frame's ``phi`` column if available,
+    else the caller may pass it explicitly. The near-miss columns are
+    skipped silently when neither source can resolve phi.
     """
-    shift_units = _label_maturity_shift(bar_stride, M if M is not None else 1)
+    shift_units = _label_maturity_shift(bar_stride, M)
 
     new_cols = [pl.col("y").shift(shift_units).alias("hit__prev__h__w0")]
 
@@ -218,6 +279,70 @@ def compute_past_target_features_pl(
     hit_k = pl.when(pl.col("y") == 1).then(pl.col("k")).otherwise(None)
     last_hit_before = hit_k.shift(shift_units).forward_fill()
     new_cols.append((pl.col("k") - last_hit_before).alias("hit__since__h__w0"))
+
+    # ---- matured-label memory --------------------------------------------------
+    # ``m_k`` is the future-window max log-return; shifting by ``shift_units``
+    # makes the value at row n point to the m_k of a label whose horizon has
+    # fully closed by row n. No leakage from open horizons.
+    if "m_k" in df_boundaries.columns:
+        m_mature = pl.col("m_k").shift(shift_units)
+        y_mature = y_shift  # already computed above; same shift
+        m_pos = pl.when(y_mature == 1).then(m_mature).otherwise(None)
+        tau_mature = pl.col("tau_k").shift(shift_units) if "tau_k" in df_boundaries.columns else None
+        tau_pos = (
+            pl.when(y_mature == 1).then(tau_mature).otherwise(None)
+            if tau_mature is not None
+            else None
+        )
+
+        # Resolve phi for near-miss bands.
+        phi_value: float | None = phi
+        if phi_value is None and "phi" in df_boundaries.columns:
+            phi_series = df_boundaries["phi"].drop_nulls()
+            if len(phi_series) > 0:
+                phi_value = float(phi_series[0])
+
+        for W in hitrate_windows_h:
+            new_cols.append(rolling_mean(m_mature, W).alias(f"target__mature_m_mean__h__w{W}"))
+            # Strict rolling_mean of m_pos returns null when any value in the
+            # window is null. Use min_samples=1 so a window with at least one
+            # matured positive emits the mean of the positives present; if the
+            # whole window has zero positives, polars returns null (we then
+            # impute to 0 via the registry).
+            # NOTE: the "count of positives" is exactly ``W * hit__rate``,
+            # already emitted by the legacy column — no separate count column.
+            new_cols.append(
+                m_pos.rolling_mean(window_size=W, min_samples=1).alias(
+                    f"target__mature_m_pos_mean__h__w{W}"
+                )
+            )
+            if tau_pos is not None:
+                new_cols.append(
+                    tau_pos.rolling_mean(window_size=W, min_samples=1).alias(
+                        f"target__mature_tau_pos_mean__h__w{W}"
+                    )
+                )
+
+            if phi_value is not None and phi_value > 0:
+                band_lo = float(mature_alpha) * phi_value
+                near_miss_up = (
+                    (m_mature >= band_lo) & (m_mature < phi_value)
+                ).cast(pl.Float64)
+                new_cols.append(
+                    rolling_mean(near_miss_up, W).alias(
+                        f"target__mature_near_miss_up__h__w{W}"
+                    )
+                )
+                if "m_dn" in df_boundaries.columns:
+                    m_dn_mature = pl.col("m_dn").shift(shift_units)
+                    near_miss_dn = (
+                        (m_dn_mature >= band_lo) & (m_dn_mature < phi_value)
+                    ).cast(pl.Float64)
+                    new_cols.append(
+                        rolling_mean(near_miss_dn, W).alias(
+                            f"target__mature_near_miss_dn__h__w{W}"
+                        )
+                    )
 
     return df_boundaries.with_columns(new_cols)
 
@@ -256,7 +381,7 @@ def compute_past_target_autocorrelation_pl(
     lags : iterable of int
         Lag offsets at which to compute the autocorrelation.
     """
-    shift_units = _label_maturity_shift(bar_stride, M if M is not None else 1)
+    shift_units = _label_maturity_shift(bar_stride, M)
     y_mature = pl.col("y").shift(shift_units)
 
     new_cols: list[pl.Expr] = []
@@ -300,6 +425,23 @@ def compute_barrier_aware_features_pl(
     Cadence-independent: every operation is row-wise on the boundary frame,
     referencing ``vol__rs__f__w{W}`` columns that are already produced at
     whatever the engine's row cadence is.
+
+    Round 3 additions (only when both vol__rs__f__w{W} and ret__mean__f__w{W}
+    are present on the frame):
+
+      - barrier__p_hit_drifted__f__w{W}   Drifted-Brownian first-passage
+                                            probability for an upper barrier
+                                            at ``phi`` over horizon ``M``, given
+                                            trailing per-bar mean and std of
+                                            returns.
+
+                                            Single-sided absorption: the formula
+                                            ignores a lower wall, so it is a
+                                            proxy/baseline, not a survival
+                                            probability. Numerical guard clamps
+                                            the exponent argument to a finite
+                                            range before ``exp`` to avoid
+                                            overflow on near-zero vol windows.
     """
     if c is None:
         c = float(C)
@@ -320,6 +462,26 @@ def compute_barrier_aware_features_pl(
             ((vol * sqrt_2logM) / (phi + EPS)).alias(f"barrier__emax_ratio__f__w{W}")
         )
 
+        # Drift-aware first-passage probability — only emitted when the
+        # trailing rolling mean of returns at the same window is available.
+        ret_mean_col = f"ret__mean__f__w{W}"
+        if ret_mean_col in df_boundaries.columns:
+            mu = pl.col(ret_mean_col)
+            # T = M (horizon in 1-min bars); a = phi (upper barrier).
+            # Drifted-Brownian one-sided first-passage probability:
+            #     P_mu = Phi((mu*T - a) / (sigma*sqrt(T)))
+            #          + exp(2*mu*a / sigma^2) * Phi((-a - mu*T) / (sigma*sqrt(T)))
+            denom = vol * sqrt_M + EPS
+            arg_a = (mu * float(M) - phi) / denom
+            arg_b = (-phi - mu * float(M)) / denom
+            # Numerical guard: clamp the exponent argument to [-50, 50] so
+            # exp() stays finite on near-zero vol windows. The contribution
+            # of the right-hand term is negligible when |arg| is huge.
+            exp_arg = (2.0 * mu * phi / (vol ** 2 + EPS)).clip(lower_bound=-50.0, upper_bound=50.0)
+            p_drifted = _norm_cdf(arg_a) + exp_arg.exp() * _norm_cdf(arg_b)
+            p_drifted = p_drifted.clip(lower_bound=0.0, upper_bound=1.0)
+            new_cols.append(p_drifted.alias(f"barrier__p_hit_drifted__f__w{W}"))
+
     for ws, wl in vol_pairs:
         col_s = f"vol__rs__f__w{ws}"
         col_l = f"vol__rs__f__w{wl}"
@@ -337,6 +499,24 @@ def compute_barrier_aware_features_pl(
     new_cols.append(pl.lit(float(phi)).alias("barrier__phi__h__w0"))
 
     return df_boundaries.with_columns(new_cols)
+
+
+def _norm_cdf(x: pl.Expr) -> pl.Expr:
+    """Standard normal CDF, computed elementwise via scipy.
+
+        Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
+
+    Polars does not expose ``erf`` on Expr in the pinned 1.21 baseline, so
+    we route through a vectorised numpy + scipy kernel via ``map_batches``.
+    Pure transform — no rolling state, no future leakage.
+    """
+    from scipy.special import erf as _scipy_erf  # local import: scipy in deps
+
+    def _kernel(s: pl.Series) -> pl.Series:
+        arr = s.to_numpy().astype(float, copy=False)
+        return pl.Series(0.5 * (1.0 + _scipy_erf(arr / math.sqrt(2.0))))
+
+    return x.map_batches(_kernel, return_dtype=pl.Float64)
 
 
 # =============================================================================

@@ -184,6 +184,45 @@ class TestSeasonalityWeekdayConvention:
         out = df.select(spec.compute().alias("v"))["v"].item()
         assert abs(out - 0.0) < 1e-12
 
+    def test_dow_zero_indexed_full_week_coverage(self):
+        """Exercise every weekday so a one-off subtraction error gets
+        caught at every day, not just Monday. The Feature computes
+        ``sin(2π * dayofweek / 7)`` with ``dayofweek`` in
+        pandas convention (Mon=0..Sun=6). Verify against pandas-derived
+        expectations on Sunday, Monday, Saturday, and Wednesday.
+        """
+        import datetime as dt
+        from src.features.families.seasonality import (
+            SeasonalityCosDow,
+            SeasonalitySinDow,
+        )
+
+        # (date, expected_pandas_dow). Picked dates pinned by calendar.
+        cases = [
+            (dt.datetime(2023, 12, 31), 6),  # Sunday
+            (dt.datetime(2024, 1, 1), 0),    # Monday
+            (dt.datetime(2024, 1, 3), 2),    # Wednesday
+            (dt.datetime(2024, 1, 6), 5),    # Saturday
+        ]
+        sin_spec = SeasonalitySinDow()
+        cos_spec = SeasonalityCosDow()
+        for date, expected_dow in cases:
+            # Cross-check the calendar assumption with pandas itself
+            assert pd.Timestamp(date).dayofweek == expected_dow, (
+                f"calendar drift for {date!r}"
+            )
+            df = pl.DataFrame({"ts": [date]})
+            sin_out = df.select(sin_spec.compute().alias("v"))["v"].item()
+            cos_out = df.select(cos_spec.compute().alias("v"))["v"].item()
+            expected_sin = math.sin(2.0 * math.pi * expected_dow / 7.0)
+            expected_cos = math.cos(2.0 * math.pi * expected_dow / 7.0)
+            assert abs(sin_out - expected_sin) < 1e-12, (
+                f"{date!r}: sin={sin_out} != expected={expected_sin}"
+            )
+            assert abs(cos_out - expected_cos) < 1e-12, (
+                f"{date!r}: cos={cos_out} != expected={expected_cos}"
+            )
+
 
 class TestCandleBreakoutZeroDenom:
     """When p_max == p_min over the window, position is null."""

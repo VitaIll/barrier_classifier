@@ -175,8 +175,16 @@ def test_size_bayesian_kelly_with_samples_uses_quantile():
     samples = np.linspace(0.4, 0.7, 11)
     s2 = State(**{**vars(s), "p_ve_samples": samples})
     f = size_bayesian_kelly(s2, b_ratio=1.0, percentile=0.25, fraction=1.0)
-    # f_samples = 2p - 1 -> spans -0.2..0.4; q25 between -0.05 and 0.05
-    assert 0.0 <= f <= 0.20
+    # At b_ratio=1, Kelly per replicate = 2p - 1. Samples span
+    # [0.4, 0.7] in 11 evenly-spaced steps; f_samples spans
+    # [-0.2, 0.4]. ``np.quantile(..., 0.25)`` on those 11 evenly-spaced
+    # values returns -0.05 exactly (the 25th-percentile linear interp
+    # between -0.2 and 0.4 is -0.05). The negative quantile clips to 0.
+    expected_q25 = np.quantile(2.0 * samples - 1.0, 0.25)
+    assert expected_q25 < 0.0  # sanity: q25 is negative
+    assert f == pytest.approx(0.0, abs=1e-12), (
+        f"expected Kelly clamp to 0 when q25={expected_q25:.4f} < 0; got {f}"
+    )
 
 
 def test_size_bayesian_kelly_falls_back_to_point_kelly_when_no_samples():
@@ -267,7 +275,65 @@ def test_exit_tp_sl_or_expiry_sl_takes_precedence_when_both_in_same_bar():
         low=99.70,
         close=100.0,
     )
+    # Default is pessimistic_sl
     assert exit_tp_sl_or_expiry(pos, bar, k_now=5) == "sl"
+
+
+def test_exit_tp_sl_or_expiry_pessimistic_sl_explicit():
+    """Explicit pessimistic_sl param matches default."""
+    pos = _mk_position(
+        side=1, entry_price=100.0,
+        tp_price=100.0 * math.exp(0.0025),
+        sl_price=100.0 * math.exp(-0.0025),
+    )
+    bar = IntraBar(
+        n=101, ts=pd.Timestamp("2025-06-01 00:01:00"),
+        open=100.0, high=100.30, low=99.70, close=100.0,
+    )
+    assert exit_tp_sl_or_expiry(pos, bar, k_now=5, bar_resolution="pessimistic_sl") == "sl"
+
+
+def test_exit_tp_sl_or_expiry_optimistic_tp_takes_tp_when_both_hit():
+    """The optimistic_tp branch resolves TP-and-SL-in-same-bar as TP."""
+    pos = _mk_position(
+        side=1, entry_price=100.0,
+        tp_price=100.0 * math.exp(0.0025),
+        sl_price=100.0 * math.exp(-0.0025),
+    )
+    bar = IntraBar(
+        n=101, ts=pd.Timestamp("2025-06-01 00:01:00"),
+        open=100.0, high=100.30, low=99.70, close=100.0,
+    )
+    assert exit_tp_sl_or_expiry(pos, bar, k_now=5, bar_resolution="optimistic_tp") == "tp"
+
+
+def test_exit_tp_sl_or_expiry_neutral_returns_ambiguous_label():
+    """The neutral branch surfaces the ambiguity to the caller."""
+    pos = _mk_position(
+        side=1, entry_price=100.0,
+        tp_price=100.0 * math.exp(0.0025),
+        sl_price=100.0 * math.exp(-0.0025),
+    )
+    bar = IntraBar(
+        n=101, ts=pd.Timestamp("2025-06-01 00:01:00"),
+        open=100.0, high=100.30, low=99.70, close=100.0,
+    )
+    assert exit_tp_sl_or_expiry(pos, bar, k_now=5, bar_resolution="neutral") == "tp_or_sl"
+
+
+def test_exit_tp_sl_or_expiry_unrecognized_resolution_raises():
+    """Unknown bar_resolution must raise ValueError, not silently fall through."""
+    pos = _mk_position(
+        side=1, entry_price=100.0,
+        tp_price=100.0 * math.exp(0.0025),
+        sl_price=100.0 * math.exp(-0.0025),
+    )
+    bar = IntraBar(
+        n=101, ts=pd.Timestamp("2025-06-01 00:01:00"),
+        open=100.0, high=100.30, low=99.70, close=100.0,
+    )
+    with pytest.raises(ValueError, match="bar_resolution"):
+        exit_tp_sl_or_expiry(pos, bar, k_now=5, bar_resolution="bogus")
 
 
 def test_exit_tp_sl_or_expiry_returns_none_when_no_event():
@@ -379,7 +445,65 @@ def test_make_bayesian_kelly_spec_requires_ve_diag():
 
 
 def test_risk_config_defaults_match_phi_constants():
-    """3 * phi = 0.0075 — the cluster-loss cap default."""
+    """3 * PHI is the cluster-loss cap default. Reference ``utils.PHI``
+    directly so the test follows constant changes."""
+    from src.utils import PHI
     rc = RiskConfig()
-    assert rc.cluster_loss_cap == pytest.approx(3 * 0.0025)
+    assert rc.cluster_loss_cap == pytest.approx(3 * PHI)
     assert rc.cost_per_trade == pytest.approx(0.0005)
+
+
+def test_make_bayesian_kelly_spec_gate_drawdown_decoupled_from_cap():
+    """``gate_no_concurrent_loss_cluster`` must use ``gate_drawdown_threshold``,
+    NOT ``cluster_loss_cap``. If the gate and the cap were equal, the cap
+    would always liquidate before the gate could matter — making the gate
+    a no-op.
+
+    Verify by: build a spec with cap=0.020 and the default gate
+    (which should be 0.5 * cap = 0.010). At cluster_pnl = -0.012:
+    - the bulk-close cap (0.020) hasn't been hit (pnl > -0.020),
+    - but the gate threshold (0.010) HAS (pnl < -0.010),
+    => the gate must reject new entries while bulk_close stays silent.
+    """
+    spec = make_bayesian_kelly_spec(
+        threshold=0.30, cluster_loss_cap=0.020,
+        # gate_drawdown_threshold defaults to 0.5 * cluster_loss_cap = 0.010
+    )
+    # State with cluster_pnl = -0.012: between the gate's 0.010 and the cap's 0.020
+    s = _mk_state(
+        p=0.5, p_calibrated=0.5,
+        cluster_pnl=-0.012,
+        regime_quantile=0.8,
+        knowledge_unc=0.01,
+        knowledge_unc_quantile=0.1,
+    )
+    s = State(**{**vars(s), "score": 0.5})  # plant a passing score
+
+    # The entry-gate composition AND-chains every gate. With cluster_pnl
+    # at -0.012, ``gate_no_concurrent_loss_cluster(s, 0.010)`` should reject.
+    assert spec.evaluate_entry(s) is False, (
+        "the drawdown-gate should fire at half the cap, suppressing entries"
+    )
+    # And bulk_close should NOT trigger at the same cluster_pnl (cap is 0.020)
+    assert spec.bulk_close(s) is None, (
+        "bulk_close should NOT fire at cluster_pnl=-0.012 with cap=0.020"
+    )
+
+
+def test_make_bayesian_kelly_spec_explicit_gate_threshold():
+    """An explicit ``gate_drawdown_threshold`` overrides the default."""
+    spec = make_bayesian_kelly_spec(
+        threshold=0.30, cluster_loss_cap=0.020,
+        gate_drawdown_threshold=0.005,  # tighter than 0.5*0.020=0.010
+    )
+    # cluster_pnl = -0.006 is past the explicit gate (0.005) but well above the cap
+    s = _mk_state(
+        p=0.5, p_calibrated=0.5,
+        cluster_pnl=-0.006,
+        regime_quantile=0.8,
+        knowledge_unc=0.01,
+        knowledge_unc_quantile=0.1,
+    )
+    s = State(**{**vars(s), "score": 0.5})
+    assert spec.evaluate_entry(s) is False
+    assert spec.bulk_close(s) is None

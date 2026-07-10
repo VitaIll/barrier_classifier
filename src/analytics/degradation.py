@@ -732,13 +732,13 @@ def plot_conditional_precision_heatmap(
     if annotate == "none":
         annot = False
     elif annotate == "value_n":
-        annot = pivot.applymap(lambda v: "" if np.isnan(v) else f"{v:.2f}").combine(
-            n_pivot.applymap(lambda v: "" if pd.isna(v) else f"\\n(n={int(v)})"),
+        annot = pivot.map(lambda v: "" if np.isnan(v) else f"{v:.2f}").combine(
+            n_pivot.map(lambda v: "" if pd.isna(v) else f"\n(n={int(v)})"),
             lambda a, b: a + b,
         )
         annot = annot.where(~pivot.isna(), "")
     else:  # "value"
-        annot = pivot.applymap(lambda v: "" if np.isnan(v) else f"{v:.2f}")
+        annot = pivot.map(lambda v: "" if np.isnan(v) else f"{v:.2f}")
 
     sns.heatmap(
         pivot,

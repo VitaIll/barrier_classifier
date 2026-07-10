@@ -65,8 +65,12 @@ def _expected_widening(block_width: float, iid_width: float) -> str:
 
 
 def test_block_widens_ci_in_bootstrap_all_metrics():
+    """Pin stratify=False on BOTH sides — only block_size varies. Avoids
+    conflating block-bootstrap widening with the (separate) stratification
+    tightening. The widening assertion is the falsifiable contract that
+    block_size is honoured end-to-end."""
     y, p = _make_autocorrelated_stream(n=4000, M=M_HORIZON, seed=0)
-    iid = bootstrap_all_metrics(y, p, B=300, stratify=True, seed=0)
+    iid = bootstrap_all_metrics(y, p, B=300, stratify=False, seed=0)
     blk = bootstrap_all_metrics(y, p, B=300, stratify=False, seed=0, block_size=M_HORIZON)
     iid_w = iid["pr_auc"].ci_high - iid["pr_auc"].ci_low
     blk_w = blk["pr_auc"].ci_high - blk["pr_auc"].ci_low
@@ -82,8 +86,9 @@ def test_block_widens_ci_in_bootstrap_all_metrics():
 
 
 def test_block_widens_ci_in_bootstrap_pr_curve():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=1)
-    iid = bootstrap_pr_curve(y, p, B=300, stratify=True, seed=0)
+    iid = bootstrap_pr_curve(y, p, B=300, stratify=False, seed=0)
     blk = bootstrap_pr_curve(y, p, B=300, stratify=False, seed=0, block_size=M_HORIZON)
     iid_w = iid.auc_ci_high - iid.auc_ci_low
     blk_w = blk.auc_ci_high - blk.auc_ci_low
@@ -91,8 +96,9 @@ def test_block_widens_ci_in_bootstrap_pr_curve():
 
 
 def test_block_widens_ci_in_bootstrap_roc_curve():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=2)
-    iid = bootstrap_roc_curve(y, p, B=300, stratify=True, seed=0)
+    iid = bootstrap_roc_curve(y, p, B=300, stratify=False, seed=0)
     blk = bootstrap_roc_curve(y, p, B=300, stratify=False, seed=0, block_size=M_HORIZON)
     iid_w = iid.auc_ci_high - iid.auc_ci_low
     blk_w = blk.auc_ci_high - blk.auc_ci_low
@@ -103,8 +109,9 @@ def test_block_widens_ci_in_bootstrap_roc_curve():
 
 
 def test_block_widens_ci_in_bootstrap_calibration_curve():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=3)
-    iid = bootstrap_calibration_curve(y, p, n_bins=10, B=300, stratify=True, seed=0)
+    iid = bootstrap_calibration_curve(y, p, n_bins=10, B=300, stratify=False, seed=0)
     blk = bootstrap_calibration_curve(
         y, p, n_bins=10, B=300, stratify=False, seed=0, block_size=M_HORIZON
     )
@@ -119,6 +126,7 @@ def test_block_widens_ci_in_bootstrap_calibration_curve():
 
 
 def test_block_widens_ci_in_bootstrap_threshold_sweep():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=4)
     cache = pd.DataFrame(
         {
@@ -130,7 +138,7 @@ def test_block_widens_ci_in_bootstrap_threshold_sweep():
         }
     )
     iid = bootstrap_threshold_sweep(
-        cache, split="test", B=200, stratify=True, seed=0,
+        cache, split="test", B=200, stratify=False, seed=0,
         thresholds=np.linspace(0.3, 0.8, 20),
     )
     blk = bootstrap_threshold_sweep(
@@ -144,8 +152,9 @@ def test_block_widens_ci_in_bootstrap_threshold_sweep():
 
 
 def test_block_widens_ci_in_bootstrap_partial_pr_auc():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=5)
-    iid = bootstrap_partial_pr_auc(y, p, recall_max=0.5, B=300, stratify=True, seed=0)
+    iid = bootstrap_partial_pr_auc(y, p, recall_max=0.5, B=300, stratify=False, seed=0)
     blk = bootstrap_partial_pr_auc(
         y, p, recall_max=0.5, B=300, stratify=False, seed=0, block_size=M_HORIZON
     )
@@ -155,8 +164,9 @@ def test_block_widens_ci_in_bootstrap_partial_pr_auc():
 
 
 def test_block_widens_ci_in_bootstrap_partial_roc_auc():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=6)
-    iid = bootstrap_partial_roc_auc(y, p, fpr_max=0.10, B=300, stratify=True, seed=0)
+    iid = bootstrap_partial_roc_auc(y, p, fpr_max=0.10, B=300, stratify=False, seed=0)
     blk = bootstrap_partial_roc_auc(
         y, p, fpr_max=0.10, B=300, stratify=False, seed=0, block_size=M_HORIZON
     )
@@ -171,8 +181,9 @@ def test_block_widens_ci_in_bootstrap_partial_roc_auc():
 
 
 def test_block_widens_ci_in_bootstrap_brier_decomposition():
+    """Pin stratify=False on both sides — only block_size varies."""
     y, p = _make_autocorrelated_stream(seed=7)
-    iid = bootstrap_brier_decomposition(y, p, B=300, stratify=True, seed=0)
+    iid = bootstrap_brier_decomposition(y, p, B=300, stratify=False, seed=0)
     blk = bootstrap_brier_decomposition(
         y, p, B=300, stratify=False, seed=0, block_size=M_HORIZON
     )

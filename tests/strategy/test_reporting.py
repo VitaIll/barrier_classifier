@@ -78,8 +78,48 @@ def test_annualization_factor_for_20min_cadence():
     assert _annualization_factor_from_cadence_minutes(20.0) == pytest.approx(expected)
 
 
+def test_annualization_factor_for_1min_cadence():
+    """1-min cadence sets the bar count = 365 * 24 * 60 = 525_600 per year.
+    A buggy default of 20.0 would under-annualize a 1-min Sharpe by sqrt(20)."""
+    expected = 365 * 24 * 60  # 525_600
+    assert _annualization_factor_from_cadence_minutes(1.0) == pytest.approx(expected)
+
+
 def test_annualization_factor_zero_cadence_is_one():
     assert _annualization_factor_from_cadence_minutes(0) == 1.0
+
+
+def test_headline_table_reads_cadence_from_simresult_config():
+    """When cadence_minutes is not passed to headline_table, it must read
+    the value from each SimResult.config so 1-min and 20-min runs in the
+    same table get correctly-annualized Sharpes."""
+    r1 = SimResult(
+        spec_name="20min_spec",
+        closed=_mk_closed(n=20, base_ret=0.001, hit_frac=0.6),
+        equity=_mk_equity(n=200, slope=0.0005, noise=0.0002, seed=0),
+        cluster_log=pd.DataFrame(),
+        diagnostics_used={},
+        config={"cost_per_trade_override": 0.0005, "cadence_minutes": 20.0},
+    )
+    r2 = SimResult(
+        spec_name="1min_spec",
+        closed=_mk_closed(n=20, base_ret=0.001, hit_frac=0.6),
+        equity=_mk_equity(n=200, slope=0.0005, noise=0.0002, seed=1),
+        cluster_log=pd.DataFrame(),
+        diagnostics_used={},
+        config={"cost_per_trade_override": 0.0005, "cadence_minutes": 1.0},
+    )
+    df = headline_table([r1, r2])  # no cadence_minutes passed
+    # Per-spec annualization should differ — 1-min run has sqrt(20)x more
+    # bars per year, so its annualized Sharpe is ~ sqrt(20)x higher for
+    # the same per-step distribution.
+    sharpe_20 = float(df[df["spec"] == "20min_spec"]["ann_sharpe"].iloc[0])
+    sharpe_1 = float(df[df["spec"] == "1min_spec"]["ann_sharpe"].iloc[0])
+    # Same equity-step distribution, different annualization factor
+    ratio = sharpe_1 / sharpe_20
+    assert ratio == pytest.approx(math.sqrt(20.0), rel=0.10), (
+        f"1-min Sharpe should be ~sqrt(20)x the 20-min Sharpe; got ratio={ratio}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +156,10 @@ def test_max_drawdown_captures_peak_to_trough():
 
 
 def test_headline_row_empty_ledger():
-    row = headline_row("noop", pd.DataFrame(), pd.DataFrame(), cost_per_trade=0.0005)
+    row = headline_row(
+        "noop", pd.DataFrame(), pd.DataFrame(),
+        cost_per_trade=0.0005, cadence_minutes=20.0,
+    )
     assert row["n_trades"] == 0
     assert math.isnan(row["hit_rate"])
     assert row["total_log_pnl"] == 0.0
@@ -125,7 +168,10 @@ def test_headline_row_empty_ledger():
 def test_headline_row_reports_expected_fields():
     closed = _mk_closed(n=10, hit_frac=0.6)
     eq = _mk_equity(n=10, slope=0.0005)
-    row = headline_row("test_spec", closed, eq, cost_per_trade=0.0001)
+    row = headline_row(
+        "test_spec", closed, eq,
+        cost_per_trade=0.0001, cadence_minutes=20.0,
+    )
     assert row["spec"] == "test_spec"
     assert row["n_trades"] == 10
     assert row["hit_rate"] == pytest.approx(0.6)

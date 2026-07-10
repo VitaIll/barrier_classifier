@@ -51,6 +51,22 @@ class FeatureEngine:
         self.specs: list[Feature] = [
             cls() for cls in get_registry(tiers=self.tiers, families=self.families)
         ]
+        # Dedupe check: two specs in the same tier emitting the same column
+        # name would have one silently overwrite the other inside the
+        # tier's ``with_columns`` call. Fail loudly at engine construction
+        # instead of producing a wrong column.
+        seen: dict[tuple[int | str, str], type[Feature]] = {}
+        for spec in self.specs:
+            for _w, name in spec.expanded():
+                key = (spec.tier, name)
+                prev = seen.get(key)
+                if prev is not None and prev is not type(spec):
+                    raise ValueError(
+                        f"FeatureEngine column-name collision in tier "
+                        f"{spec.tier!r}: column {name!r} is emitted by both "
+                        f"{prev.__name__} and {type(spec).__name__}"
+                    )
+                seen[key] = type(spec)
 
     def plan(self) -> list[tuple[Feature, int | None, str]]:
         return [(spec, w, name) for spec in self.specs for w, name in spec.expanded()]

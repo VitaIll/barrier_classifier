@@ -107,30 +107,67 @@ def test_impute_coerces_float_nan_to_null_then_fills():
     assert int(out["ret__rsi__f__w14"].is_nan().sum()) == 0
 
 
-def test_impute_raises_on_residual_nan_after_fill():
-    """If the registry returns a value but a downstream column still
-    contains NaN (shouldn't happen, but the assertion is the safety
-    net), the impute step must raise rather than silently emit a
-    poisoned dataset."""
-    # Build a frame where the impute branch is skipped (no nulls visible
-    # to fill_null) but float NaN is present — the post-impute NaN check
-    # must catch it.
-    df = pl.DataFrame(
-        {"ret__rsi__f__w14": pl.Series([50.0, 1.0, 2.0], dtype=pl.Float64)}
-    )
-    # Inject a NaN AFTER the coercion would normally run, by patching
-    # the column post-fill_nan-coercion. Easiest way: monkey via with_columns.
-    # In practice the coercion catches NaN; this test confirms the
-    # downstream assertion is what saves us when the coercion is bypassed.
-    from src.features.quality import create_undef_flags_and_impute_pl as fn
+def test_impute_raises_on_residual_nan_after_fill(monkeypatch):
+    """If the imputation registry returns a non-finite value (NaN/inf),
+    the impute step must raise rather than silently fill the column
+    with NaN and ship a poisoned dataset to training.
 
-    # Rebuild a frame whose Float column carries NaN AFTER the function
-    # has converted it once — we cannot easily simulate this without
-    # patching, so the equivalent end-to-end check is in
-    # test_impute_coerces_float_nan_to_null_then_fills above.
-    # Here we simply run the happy path and verify it doesn't raise.
-    out, _ = fn(df, ["ret__rsi__f__w14"], p_hit_prior=0.5)
-    assert int(out["ret__rsi__f__w14"].null_count()) == 0
+    Patches ``utils.get_imputation_value`` to return ``float('nan')`` so
+    we exercise the safety check at the registry boundary."""
+    from src.features import quality as quality_mod
+
+    df = pl.DataFrame(
+        {
+            "ret__rsi__f__w14": pl.Series(
+                [50.0, None, 60.0, 55.0], dtype=pl.Float64
+            )
+        }
+    )
+
+    def _nan_registry(col, *, p_hit_prior, cap_h_blocks):  # noqa: ARG001
+        return float("nan")
+
+    monkeypatch.setattr(
+        quality_mod._legacy, "get_imputation_value", _nan_registry
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        quality_mod.create_undef_flags_and_impute_pl(
+            df, ["ret__rsi__f__w14"], p_hit_prior=0.5
+        )
+
+
+def test_impute_runs_on_mixed_float_int_dtypes():
+    """``is_infinite`` is float-only — older code paths that called it on
+    every numeric dtype broke on Int8 / Int32 columns under newer polars.
+    Verify the impute pipeline handles a mixed-dtype frame without
+    raising."""
+    df = pl.DataFrame(
+        {
+            "ret__rsi__f__w14": pl.Series(
+                [50.0, None, 60.0, 55.0], dtype=pl.Float64
+            ),
+            "event__run_dir__f__w0": pl.Series(
+                [1, -1, 0, 1], dtype=pl.Int8
+            ),
+            "event__run_len__f__w0": pl.Series(
+                [1, 1, 2, 3], dtype=pl.Int32
+            ),
+        }
+    )
+    out, undef_cols = create_undef_flags_and_impute_pl(
+        df,
+        [
+            "ret__rsi__f__w14",
+            "event__run_dir__f__w0",
+            "event__run_len__f__w0",
+        ],
+        p_hit_prior=0.5,
+    )
+    # Only the float column had a null; integer columns must pass through
+    # unchanged with no undef flag.
+    assert undef_cols == ["undef__ret__rsi__f__w14"]
+    assert out["event__run_dir__f__w0"].dtype == pl.Int8
+    assert out["event__run_len__f__w0"].dtype == pl.Int32
 
 
 def test_undef_and_impute_parity():

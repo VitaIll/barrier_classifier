@@ -317,6 +317,50 @@ def test_construct_labels_high_source_implies_close_source(fixtures_1min):
     assert y_high_arr[both_matured].sum() >= y_close_arr[both_matured].sum()
 
 
+def test_construct_labels_high_source_strictly_dominates_on_wick():
+    """Construct a synthetic scenario where an intrabar wick (high) crosses
+    the +phi barrier but the close does not — assert y_high == 1 and
+    y_close == 0 at the same row. This is the strict ``>`` case that
+    proves the high-source variant is a STRICT superset, not just a
+    non-strict ``>=`` superset."""
+    phi = float(COST_C + ETA)
+    M_small = 4
+    base = 100.0
+
+    # Build close + high series so that within rows [1..M_small=4] after
+    # row 0, the close stays below the +phi barrier but one high crosses it.
+    close_seq = [base, base, base, base, base, base]
+    high_seq = list(close_seq)
+    # Make sure the close stays inside [-phi, +phi] vs base = close[0].
+    # Pick a high at index 3 = exp(phi * 2) * base, well above the barrier.
+    overshoot = float(np.exp(2.0 * phi))
+    high_seq[3] = base * overshoot
+    # Pad with zeros for cols that construct_labels_pl needs.
+    df_raw_pl = pl.DataFrame(
+        {
+            "close": close_seq,
+            "high": high_seq,
+            "low": close_seq,
+        }
+    )
+    df_b = pl.DataFrame({"k": list(range(len(close_seq)))})
+
+    labels_close = construct_labels_pl(
+        df_b, df_raw_pl, M_small, ETA, COST_C,
+        bar_stride=1, barrier_source="close",
+    )
+    labels_high = construct_labels_pl(
+        df_b, df_raw_pl, M_small, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+    )
+    # Row 0 looks at rows [1..M_small=4]; the wick at row 3 makes y_high=1
+    # but no future close crosses phi, so y_close=0.
+    y_close_0 = labels_close["y"][0]
+    y_high_0 = labels_high["y"][0]
+    assert y_close_0 == 0.0, f"expected y_close=0, got {y_close_0}"
+    assert y_high_0 == 1.0, f"expected y_high=1 (wick crosses), got {y_high_0}"
+
+
 def test_construct_labels_triple_barrier_aux_emits_downside(fixtures_1min):
     """add_triple_barrier_aux=True emits m_dn / tau_dn from future lows."""
     df_raw_pl = fixtures_1min["df_raw_pl"]
@@ -357,6 +401,73 @@ def test_construct_labels_high_source_requires_high_column():
         construct_labels_pl(
             df_b, df_close_only, 2, ETA, COST_C, bar_stride=1, barrier_source="high"
         )
+
+
+def test_construct_labels_handles_non_positive_future_high():
+    """Inject a synthetic ``high[k+3] = 0.0`` row inside the future window of
+    row k=0. The corresponding ``log(0/base) = -inf`` poisons the future-
+    return slice — without the defensive guard, the max would either
+    propagate NaN (if any negative makes it in) or produce a spurious
+    label. The implementation must label the row 0 (no observed hit)
+    and never emit NaN for y at that position.
+    """
+    phi = float(COST_C + ETA)
+    M_small = 4
+    base = 100.0
+    # close[0] = 100; future closes (1..M) stay flat at 100 so y_close=0
+    # via the normal path. high[0+3] = 0.0 is the injected anomaly.
+    close = [base] * (M_small + 2)
+    high = list(close)
+    high[3] = 0.0
+    df_raw = pl.DataFrame(
+        {"close": close, "high": high, "low": close}
+    )
+    df_b = pl.DataFrame({"k": list(range(len(close)))})
+
+    labels_high = construct_labels_pl(
+        df_b, df_raw, M_small, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+    )
+    # On row 0, the window is [1..4]. high[3]=0 emits -inf for that point;
+    # max over the rest is 0 (flat). 0 < phi → label 0, no NaN.
+    y0 = labels_high["y"][0]
+    assert y0 == 0.0, f"expected y=0 (no spurious hit), got {y0}"
+
+    # Now flip to a negative high — NaN-poisoning scenario. The guard
+    # must short-circuit the same way and yield y=0 / non-null.
+    high_neg = list(close)
+    high_neg[3] = -1.0
+    df_raw_neg = pl.DataFrame(
+        {"close": close, "high": high_neg, "low": close}
+    )
+    labels_neg = construct_labels_pl(
+        df_b, df_raw_neg, M_small, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+    )
+    y0_neg = labels_neg["y"][0]
+    assert y0_neg == 0.0, (
+        f"expected y=0 on negative-high row (no NaN leak), got {y0_neg}"
+    )
+
+
+def test_label_maturity_shift_requires_M_when_bar_stride_given():
+    """The 1-min cadence shift is ``M // bar_stride`` rows. If callers pass
+    ``bar_stride=1`` but forget ``M=...``, the shift would silently
+    collapse to 1 row and leak overlapping labels into past-target
+    features. The guard raises ValueError instead.
+    """
+    from src.features.boundary import _label_maturity_shift
+
+    # Legacy boundary cadence still works without M (bar_stride is None).
+    assert _label_maturity_shift(None, None) == 1
+    # Explicit M=144 + bar_stride=1 returns 144.
+    assert _label_maturity_shift(1, 144) == 144
+    # bar_stride=1 with M=None must raise.
+    with pytest.raises(ValueError, match="M must be provided"):
+        _label_maturity_shift(1, None)
+    # bar_stride=2 with M=None must also raise.
+    with pytest.raises(ValueError, match="M must be provided"):
+        _label_maturity_shift(2, None)
 
 
 def test_construct_labels_rejects_bad_barrier_source(fixtures_1min):
@@ -532,3 +643,248 @@ def test_block_features_boundary_vs_1min_align_at_boundary_rows(fixtures):
         assert math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-12), (
             f"boundary i={i} (n={i*M}): boundary={a} vs 1min={b}"
         )
+
+
+# ===========================================================================
+# Round 2 + Round 3 — matured-label memory & drift-aware barrier feature
+# ===========================================================================
+
+
+def test_mature_m_mean_strictly_causal(fixtures_1min):
+    """``target__mature_m_mean__h__w{W}`` at row n must depend only on
+    m_k for k <= n - M. Masking all m_k for k > n MUST leave the column
+    unchanged at row n."""
+    df_raw_pl = fixtures_1min["df_raw_pl"]
+    df_b1min_pl = fixtures_1min["df_boundaries_1min_pl"]
+
+    labels = construct_labels_pl(
+        df_b1min_pl, df_raw_pl, M, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+        add_triple_barrier_aux=True,
+    )
+    past_full = compute_past_target_features_pl(
+        labels, [3, 6, 12], [3, 6, 12], bar_stride=1, M=M
+    )
+    # Pick a probe row well past warmup.
+    t_probe = 5000
+    # Mask all m_k / y / tau_k for rows > t_probe.
+    n_rows = len(labels)
+    m_full = labels["m_k"].to_list()
+    y_full = labels["y"].to_list()
+    tau_full = labels["tau_k"].to_list()
+    m_masked = [v if i <= t_probe else None for i, v in enumerate(m_full)]
+    y_masked = [v if i <= t_probe else None for i, v in enumerate(y_full)]
+    tau_masked = [v if i <= t_probe else None for i, v in enumerate(tau_full)]
+    labels_masked = labels.with_columns(
+        pl.Series("m_k", m_masked),
+        pl.Series("y", y_masked),
+        pl.Series("tau_k", tau_masked),
+    )
+    past_masked = compute_past_target_features_pl(
+        labels_masked, [3, 6, 12], [3, 6, 12], bar_stride=1, M=M
+    )
+    # All Round 2 columns at row t_probe must match between full and masked.
+    new_cols = [
+        c for c in past_full.columns
+        if c.startswith("target__mature_")
+    ]
+    assert new_cols, "expected at least one target__mature_ column"
+    for col in new_cols:
+        v_full = past_full[col][t_probe]
+        v_masked = past_masked[col][t_probe]
+        if v_full is None and v_masked is None:
+            continue
+        assert v_full == v_masked, (
+            f"causality violation in {col} at row {t_probe}: "
+            f"full={v_full} != masked={v_masked}"
+        )
+
+
+def test_mature_m_mean_matches_direct_compute(fixtures_1min):
+    """``target__mature_m_mean__h__w{W}`` at row n must equal
+    ``mean(m_k[n-M-W+1 : n-M+1])`` from raw labels."""
+    df_raw_pl = fixtures_1min["df_raw_pl"]
+    df_b1min_pl = fixtures_1min["df_boundaries_1min_pl"]
+    labels = construct_labels_pl(
+        df_b1min_pl, df_raw_pl, M, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+        add_triple_barrier_aux=True,
+    )
+    W_probe = 6  # one of the windows passed in hitrate_windows_h below
+    past = compute_past_target_features_pl(
+        labels, [3, 6, 12], [3, 6, 12], bar_stride=1, M=M
+    )
+    col = f"target__mature_m_mean__h__w{W_probe}"
+    assert col in past.columns
+
+    m_arr = np.array(
+        [float(v) if v is not None else np.nan for v in labels["m_k"].to_list()],
+        dtype=float,
+    )
+    feat = np.array(
+        [float(v) if v is not None else np.nan for v in past[col].to_list()],
+        dtype=float,
+    )
+    # For sample row n, mature m_k history is m_arr[n-M-W+1 .. n-M+1].
+    # Sample several rows past warmup and check.
+    rng = np.random.default_rng(13)
+    n_total = len(labels)
+    rows_to_check = rng.choice(
+        np.arange(M + W_probe, n_total - 1), size=15, replace=False
+    )
+    for n in rows_to_check:
+        window = m_arr[n - M - W_probe + 1 : n - M + 1]
+        if np.any(np.isnan(window)):
+            continue  # rolling_mean(strict) returns null on any-null window
+        expected = float(window.mean())
+        got = feat[int(n)]
+        assert math.isclose(got, expected, rel_tol=1e-10, abs_tol=1e-12), (
+            f"row {n}: mature_m_mean={got} != expected={expected}"
+        )
+
+
+def test_mature_near_miss_uses_alpha_phi_band(fixtures_1min):
+    """Near-miss column counts matured m_k in [alpha*phi, phi).
+
+    Build labels, compute the column, then verify the rate against a
+    direct numpy calculation on the same window.
+    """
+    df_raw_pl = fixtures_1min["df_raw_pl"]
+    df_b1min_pl = fixtures_1min["df_boundaries_1min_pl"]
+    labels = construct_labels_pl(
+        df_b1min_pl, df_raw_pl, M, ETA, COST_C,
+        bar_stride=1, barrier_source="high",
+        add_triple_barrier_aux=True,
+    )
+    phi = float(COST_C + ETA)
+    alpha = 0.75
+    W_probe = 12
+    past = compute_past_target_features_pl(
+        labels, [3, 6, 12], [3, 6, 12],
+        bar_stride=1, M=M, mature_alpha=alpha,
+    )
+    col = f"target__mature_near_miss_up__h__w{W_probe}"
+    assert col in past.columns
+    m_arr = np.array(
+        [float(v) if v is not None else np.nan for v in labels["m_k"].to_list()],
+        dtype=float,
+    )
+    feat = np.array(
+        [float(v) if v is not None else np.nan for v in past[col].to_list()],
+        dtype=float,
+    )
+    rng = np.random.default_rng(14)
+    n_total = len(labels)
+    rows_to_check = rng.choice(
+        np.arange(M + W_probe, n_total - 1), size=10, replace=False
+    )
+    for n in rows_to_check:
+        window = m_arr[n - M - W_probe + 1 : n - M + 1]
+        if np.any(np.isnan(window)):
+            continue
+        band_lo = alpha * phi
+        expected = float(((window >= band_lo) & (window < phi)).mean())
+        got = feat[int(n)]
+        assert math.isclose(got, expected, rel_tol=1e-12, abs_tol=1e-12), (
+            f"row {n}: near_miss_up={got} != expected={expected}"
+        )
+
+
+def test_mature_near_miss_dn_emitted_only_with_aux(fixtures_1min):
+    """Without ``add_triple_barrier_aux=True`` the m_dn column is absent
+    and the dn near-miss column must NOT be emitted."""
+    df_raw_pl = fixtures_1min["df_raw_pl"]
+    df_b1min_pl = fixtures_1min["df_boundaries_1min_pl"]
+    labels_no_aux = construct_labels_pl(
+        df_b1min_pl, df_raw_pl, M, ETA, COST_C, bar_stride=1
+    )
+    past = compute_past_target_features_pl(
+        labels_no_aux, [3, 6], [3, 6], bar_stride=1, M=M
+    )
+    assert not any(
+        c.startswith("target__mature_near_miss_dn") for c in past.columns
+    )
+    # With aux, the column IS emitted.
+    labels_aux = construct_labels_pl(
+        df_b1min_pl, df_raw_pl, M, ETA, COST_C,
+        bar_stride=1, add_triple_barrier_aux=True,
+    )
+    past_aux = compute_past_target_features_pl(
+        labels_aux, [3, 6], [3, 6], bar_stride=1, M=M
+    )
+    assert any(
+        c.startswith("target__mature_near_miss_dn") for c in past_aux.columns
+    )
+
+
+def test_p_hit_drifted_in_unit_interval(fixtures):
+    """``barrier__p_hit_drifted__f__w{W}`` is a probability in [0, 1]."""
+    df_raw_pl = fixtures["df_raw_pl"]
+    df_boundaries_pl = fixtures["df_boundaries_pl"]
+
+    # Need ret__mean__f__w{W} on the boundary frame for p_hit_drifted to
+    # be emitted. Run the rolling family at bar level, then sample.
+    from src.features import FeatureEngine
+
+    engine = FeatureEngine(tiers=(1,), families=("rolling", "vol"))
+    df_with_features = engine.transform(df_raw_pl, trim=False).data
+    df_b = df_with_features.gather_every(M)
+
+    out = compute_barrier_aware_features_pl(
+        df_b, WINDOWS_BARRIER, PHI, M, VOL_PAIRS, c=float(COST_C)
+    )
+    for W in (60, 240):
+        col = f"barrier__p_hit_drifted__f__w{W}"
+        if col not in out.columns:
+            continue
+        vals = np.array(
+            [float(v) if v is not None else np.nan for v in out[col].to_list()],
+            dtype=float,
+        )
+        valid = ~np.isnan(vals)
+        if valid.any():
+            assert (vals[valid] >= 0.0 - 1e-9).all()
+            assert (vals[valid] <= 1.0 + 1e-9).all()
+
+
+def test_p_hit_drifted_increases_with_positive_drift():
+    """For the same volatility, a series with positive drift should have
+    a higher p_hit_drifted than one with zero drift."""
+    # Build two boundary frames with the same vol but different ret__mean.
+    W = 60
+    vol_value = 0.001  # per-bar vol
+    # Construct a 10-row frame with constant vol and ret_mean, then run the
+    # drifted-barrier formula via the boundary function.
+    base_frame = pl.DataFrame({
+        "k": list(range(10)),
+        f"vol__rs__f__w{W}": [vol_value] * 10,
+    })
+    for other_W in WINDOWS_BARRIER:
+        if other_W != W:
+            base_frame = base_frame.with_columns(
+                pl.lit(vol_value).alias(f"vol__rs__f__w{other_W}")
+            )
+    # Pairs need both ws and wl present.
+    for ws, wl in VOL_PAIRS:
+        for w in (ws, wl):
+            colname = f"vol__rs__f__w{w}"
+            if colname not in base_frame.columns:
+                base_frame = base_frame.with_columns(
+                    pl.lit(vol_value).alias(colname)
+                )
+
+    frame_drift = base_frame.with_columns(pl.lit(1e-5).alias(f"ret__mean__f__w{W}"))
+    frame_zero = base_frame.with_columns(pl.lit(0.0).alias(f"ret__mean__f__w{W}"))
+    out_drift = compute_barrier_aware_features_pl(
+        frame_drift, WINDOWS_BARRIER, PHI, M, VOL_PAIRS, c=float(COST_C)
+    )
+    out_zero = compute_barrier_aware_features_pl(
+        frame_zero, WINDOWS_BARRIER, PHI, M, VOL_PAIRS, c=float(COST_C)
+    )
+    col = f"barrier__p_hit_drifted__f__w{W}"
+    p_drift = float(out_drift[col][0])
+    p_zero = float(out_zero[col][0])
+    assert p_drift > p_zero, (
+        f"positive drift should raise p_hit_drifted; got p_drift={p_drift} "
+        f"<= p_zero={p_zero}"
+    )

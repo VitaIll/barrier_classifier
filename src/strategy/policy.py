@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -134,6 +134,22 @@ def gate_unc_below(state: State, q_max: float) -> bool:
     if not np.isfinite(qu):
         return True
     return bool(qu <= float(q_max))
+
+
+def gate_knowledge_unc_cap(state: State, cap: float) -> bool:
+    """Open only if raw knowledge uncertainty is at or below ``cap``.
+
+    Unlike ``gate_unc_below`` (which compares the streaming-quantile rank
+    of MI to a quantile threshold), this gate uses the raw MI value
+    directly. Use it with a cap frozen from a training-period reference
+    distribution — e.g. the median of MI among training rows that pass the
+    score gate. Fail-closed on NaN: if the cache doesn't carry MI, this
+    gate rejects every row rather than silently waving them through.
+    """
+    qu = state.knowledge_unc
+    if not np.isfinite(qu):
+        return False
+    return bool(qu <= float(cap))
 
 
 def gate_no_concurrent_loss_cluster(state: State, max_drawdown: float) -> bool:
@@ -278,37 +294,276 @@ def exit_tp_or_expiry(
 
 
 def exit_tp_sl_or_expiry(
-    position: Position, intra_bar: Optional[IntraBar], k_now: int
+    position: Position,
+    intra_bar: Optional[IntraBar],
+    k_now: int,
+    *,
+    bar_resolution: str = "pessimistic_sl",
 ) -> Optional[str]:
     """Triple-barrier two-phase exit. Same split as ``exit_tp_or_expiry``:
     intra-bar phase returns TP/SL only, end-of-path phase returns expiry.
 
-    Tie-break when both TP and SL would have fired in the same bar: we
-    pessimistically take SL (worst case for the long; conservative). This is
-    a known artifact of bar-level path simulation; finer 1-second/tick paths
-    would resolve the order, but bars don't carry that info.
+    Tie-break when both TP and SL would have fired in the same bar — note
+    that this is a *train/exec mismatch artifact*: training labels treat the
+    upper barrier as hit on intrabar high (TP-on-high label), but the
+    execution simulator pessimistically takes SL here. The choices are:
+
+    - ``"pessimistic_sl"`` (default; current behavior): assume the path
+      hit SL before TP. Lower bound on realized return — what a risk-
+      averse audit wants to see.
+    - ``"neutral"``: return ``"tp_or_sl"`` to surface the ambiguity to
+      the caller; the caller decides at policy level (e.g. take the
+      midpoint or flag for hand review). The simulator's ledger will
+      record this as ``"tp_or_sl"`` so analytics can audit how often
+      this fires.
+    - ``"optimistic_tp"``: assume the path hit TP before SL. Upper
+      bound; only honest if the label source is also high-source.
+
+    Finer 1-second/tick paths would resolve the order; bars don't carry
+    that info.
     """
+    if bar_resolution not in ("pessimistic_sl", "neutral", "optimistic_tp"):
+        raise ValueError(
+            f"bar_resolution must be 'pessimistic_sl', 'neutral', or "
+            f"'optimistic_tp'; got {bar_resolution!r}"
+        )
     if intra_bar is not None:
         sl = position.sl_price
         if position.side == 1:
             tp_hit = intra_bar.high >= position.tp_price
             sl_hit = sl is not None and intra_bar.low <= sl
-            if sl_hit:
-                return "sl"
-            if tp_hit:
-                return "tp"
         else:
             tp_hit = intra_bar.low <= position.tp_price
             sl_hit = sl is not None and intra_bar.high >= sl
-            if sl_hit:
+        if tp_hit and sl_hit:
+            if bar_resolution == "pessimistic_sl":
                 return "sl"
-            if tp_hit:
+            if bar_resolution == "optimistic_tp":
                 return "tp"
+            return "tp_or_sl"
+        if sl_hit:
+            return "sl"
+        if tp_hit:
+            return "tp"
         return None
     # End-of-path
     if k_now >= position.expiry_k:
         return "expiry"
     return None
+
+
+# ---------------------------------------------------------------------------
+# "Let winners run" exit policy
+#
+# Architecture note: exit_policy's signature is (pos, intra_bar, k_now) — no
+# access to the current model score p_t. To condition the exit on the model's
+# continued conviction we build a closure that captures a {ts -> p_t}
+# mapping at strategy-construction time; the closure looks up p_now keyed on
+# intra_bar.ts every step.
+#
+# Behavior contract:
+#   - If MTM <= -sl_log_return (when sl_log_return is provided): close "sl"
+#     at the pre-set sl_price (or bar.close if no sl_price was set on the
+#     position).
+#   - Otherwise, if price has reached the original tp_price (in-the-money):
+#       * If model still bullish (p_now >= hold_threshold): SKIP the TP fill
+#         — keep holding. The position rides any further upside.
+#       * If model has lost conviction (p_now < hold_threshold): close at
+#         bar.close (market exit) with reason "tp_market". Note this fills
+#         at the *actual* path price, not the static tp_price, so any extra
+#         upside the position rode while we waited is captured.
+#   - Otherwise (price hasn't crossed tp_price yet): hold (None).
+#   - End-of-path phase: standard expiry check at k_now >= expiry_k.
+#
+# Failure mode to know: if p_now is NaN (not in the map) the policy treats
+# it as "no signal" and falls through to the standard TP behavior — i.e.
+# closes at tp_price. The cache is dense at 1-min cadence so this should
+# never fire in normal operation, but it's the safe fallback.
+# ---------------------------------------------------------------------------
+
+
+def make_exit_let_winners_run(
+    p_map: dict[pd.Timestamp, float] | "pd.Series[float]",
+    *,
+    hold_threshold: float,
+    sl_log_return: float | None = None,
+) -> Callable[[Position, Optional[IntraBar], int], Optional[str]]:
+    """Build a let-winners-run exit policy bound to a {ts -> p} mapping.
+
+    Parameters
+    ----------
+    p_map : mapping pd.Timestamp -> float
+        Lookup table of model probability at each 1-min boundary. Built
+        once at strategy-construction time from the prediction cache.
+        Accessed as ``p_map[intra_bar.ts]`` (pandas Series with a
+        DatetimeIndex satisfies this interface).
+    hold_threshold : float
+        Probability cut-off below which we stop holding. When the path
+        crosses the original TP target AND ``p_now >= hold_threshold``,
+        the TP fill is skipped (we ride upside). When ``p_now <
+        hold_threshold``, we close at bar.close (market exit).
+    sl_log_return : float or None, optional
+        If provided, close at "sl" whenever the position's MTM (log-return
+        from entry to bar.close) falls below ``-sl_log_return``. Use a
+        positive number, e.g. ``2 * PHI = 0.005`` for a 2x phi stop.
+        ``None`` (default) matches the existing patient-wait baseline:
+        no stop, lots can sit underwater indefinitely.
+    """
+    if not np.isfinite(hold_threshold):
+        raise ValueError(f"hold_threshold must be finite; got {hold_threshold!r}")
+    if sl_log_return is not None and (sl_log_return <= 0 or not np.isfinite(sl_log_return)):
+        raise ValueError(
+            f"sl_log_return must be positive and finite when set; got {sl_log_return!r}"
+        )
+    hold_threshold = float(hold_threshold)
+    sl_log_return_f: float | None = float(sl_log_return) if sl_log_return is not None else None
+
+    # pandas Series .at[] is the fastest scalar lookup on a DatetimeIndex.
+    # Support both dict-like and Series-like lookups via try/except.
+    def _lookup_p(ts: pd.Timestamp) -> float:
+        try:
+            return float(p_map[ts])  # Series with DatetimeIndex, or dict
+        except (KeyError, IndexError):
+            return float("nan")
+
+    def exit_let_winners_run(
+        position: Position, intra_bar: Optional[IntraBar], k_now: int
+    ) -> Optional[str]:
+        if intra_bar is None:
+            # End-of-path expiry check (mirrors exit_tp_or_expiry).
+            if k_now >= position.expiry_k:
+                return "expiry"
+            return None
+
+        side = position.side
+        entry = float(position.entry_price)
+        close_now = float(intra_bar.close)
+
+        # MTM in log-return space (positive for in-the-money).
+        if side == 1:
+            mtm_log = float(np.log(close_now / entry)) if (close_now > 0 and entry > 0) else float("nan")
+        else:
+            mtm_log = float(np.log(entry / close_now)) if (close_now > 0 and entry > 0) else float("nan")
+
+        # Stop loss check (if enabled and finite MTM).
+        if sl_log_return_f is not None and np.isfinite(mtm_log) and mtm_log <= -sl_log_return_f:
+            return "sl"
+
+        # TP trigger: bar's range touched the original TP barrier.
+        if side == 1:
+            tp_hit = intra_bar.high >= position.tp_price
+        else:
+            tp_hit = intra_bar.low <= position.tp_price
+
+        if not tp_hit:
+            return None
+
+        # In-the-money this bar. Check model conviction.
+        p_now = _lookup_p(intra_bar.ts)
+        if np.isfinite(p_now) and p_now >= hold_threshold:
+            # Model still says go: skip the TP fill, ride upside.
+            return None
+
+        # Conviction dropped (or NaN p_now treated as "no signal"):
+        # close at market. The simulator fills "tp_market" at bar.close
+        # via its default branch, capturing whatever price the position
+        # rode to.
+        return "tp_market"
+
+    return exit_let_winners_run
+
+
+def make_exit_let_winners_run_monotonic(
+    p_map: dict[pd.Timestamp, float] | "pd.Series[float]",
+) -> Callable[[Position, Optional[IntraBar], int], Optional[str]]:
+    """Strict-monotonic let-winners-run exit policy.
+
+    Stricter cousin of :func:`make_exit_let_winners_run`:
+
+      * Tracks, per-position, the maximum probability ``p`` observed since
+        entry (call it ``p_max``).
+      * **Hold contract**: at each bar, if the bar crosses the original
+        TP barrier AND ``p_now > p_max``, **skip the TP fill** and update
+        ``p_max``. The position rides any further upside.
+      * **Exit contract**: at each bar that crosses TP AND ``p_now <=
+        p_max`` (conviction has stopped growing), close at ``bar.close``
+        with reason ``"tp_market"``.
+      * **Don't release into loss**: if the bar does NOT cross the TP
+        barrier (price < entry+phi), do nothing. Even if conviction has
+        clearly stopped growing, we wait for price to recover into the TP
+        zone before considering exit. This matches the baseline patient-
+        wait behavior: never exit at a loss; only ever close +TP.
+
+    There is no SL. Underwater lots sit open indefinitely, just like in
+    the baseline. The "winner-running" gain comes from capturing realized
+    upside above +phi when the model's conviction keeps growing.
+
+    Per-position state is stored in a closure-local dict keyed by the
+    position's ``entry_k`` (unique across the simulator's lifetime, since
+    each 1-min boundary fires at most one entry). The state is cleaned
+    up on close/expiry.
+    """
+    # Per-position state. Key = position.k_entry → p_max so far.
+    p_max_per_position: dict[int, float] = {}
+
+    def _lookup_p(ts: pd.Timestamp) -> float:
+        try:
+            return float(p_map[ts])
+        except (KeyError, IndexError):
+            return float("nan")
+
+    def exit_let_winners_run_monotonic(
+        position: Position, intra_bar: Optional[IntraBar], k_now: int
+    ) -> Optional[str]:
+        # End-of-path expiry phase.
+        if intra_bar is None:
+            if k_now >= position.expiry_k:
+                p_max_per_position.pop(position.k_entry, None)
+                return "expiry"
+            return None
+
+        # Decide if this bar is in the TP zone.
+        if position.side == 1:
+            tp_hit = intra_bar.high >= position.tp_price
+        else:
+            tp_hit = intra_bar.low <= position.tp_price
+
+        # Update p_max tracker on every bar (whether or not TP hits).
+        p_now = _lookup_p(intra_bar.ts)
+        if np.isfinite(p_now):
+            p_max = p_max_per_position.get(position.k_entry, float("-inf"))
+            still_growing = p_now > p_max
+            if still_growing:
+                p_max_per_position[position.k_entry] = p_now
+        else:
+            # No probability data for this ts: treat as "not growing"
+            # (conservative — defaults to taking TP if it hits).
+            still_growing = False
+
+        if not tp_hit:
+            # Below TP zone: never release into loss. Wait.
+            return None
+
+        # In TP zone.
+        if still_growing:
+            # Conviction making a new high → skip TP, ride upside.
+            return None
+
+        # Conviction has flattened or dropped from peak. Before closing
+        # at market, verify bar.close is on the profit side of entry — the
+        # user's "don't release into loss" rule applies at the actual fill
+        # price, not just the TP-touched indicator. If the bar's high
+        # crossed TP but the close has reverted below entry, defer: wait
+        # for a future bar whose close lands above entry.
+        if position.side == 1 and intra_bar.close < position.entry_price:
+            return None
+        if position.side == -1 and intra_bar.close > position.entry_price:
+            return None
+
+        p_max_per_position.pop(position.k_entry, None)
+        return "tp_market"
+
+    return exit_let_winners_run_monotonic
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +796,7 @@ def make_1min_cluster_aware_spec(
     cost_per_trade: float = 0.0005,
     max_horizon_boundaries: int | None = None,
     cluster_loss_cap: float = 0.020,
+    gate_drawdown_threshold: float | None = None,
     regime_exit_q: float | None = None,
 ) -> StrategySpec:
     """1-min-cadence spec aligned to the high-source overlapping label.
@@ -558,6 +814,15 @@ def make_1min_cluster_aware_spec(
       cluster only add the marginal headroom.
     - **Cluster-loss circuit breaker** at ``-cluster_loss_cap`` log-
       return on the open inventory.
+    - **Drawdown-gate** suppresses NEW entries when cluster MTM is
+      already underwater by ``gate_drawdown_threshold``. Distinct from
+      ``cluster_loss_cap``: the gate prevents stacking into a losing
+      cluster (suppressing entries) while the cap liquidates the
+      cluster outright. Defaults to ``0.5 * cluster_loss_cap`` so the
+      gate fires at half the liquidation level — gives existing
+      inventory room to recover before slamming the brakes. If the
+      gate and the cap were equal, the cap would always liquidate
+      before the gate could matter (the gate would be a no-op).
     - Optional ``regime_exit_q`` bulk-close on regime drop. Set to
       ``None`` for an unconditional spec; set to e.g. 0.4 for a
       regime-gated patient variant.
@@ -567,6 +832,11 @@ def make_1min_cluster_aware_spec(
     event this spec trades (long TP fills on intrabar high crossing).
     """
     horizon = int(max_horizon_boundaries) if max_horizon_boundaries is not None else int(M)
+    gate_drawdown = (
+        float(gate_drawdown_threshold)
+        if gate_drawdown_threshold is not None
+        else 0.5 * float(cluster_loss_cap)
+    )
 
     def _sizer(state: State) -> float:
         return size_clip(
@@ -591,7 +861,7 @@ def make_1min_cluster_aware_spec(
         score_fn=score_raw_p,
         entry_gates=(
             lambda s, t=threshold: gate_score_above(s, t),
-            lambda s, cap=cluster_loss_cap: gate_no_concurrent_loss_cluster(s, cap),
+            lambda s, cap=gate_drawdown: gate_no_concurrent_loss_cluster(s, cap),
         ),
         sizer=_sizer,
         exit_policy=exit_tp_or_expiry,
@@ -607,6 +877,7 @@ def make_1min_cluster_aware_spec(
             f"1-min cluster-aware long-TP: enter at p>={threshold}, "
             f"cluster cap {cluster_target_size} (first lot {first_lot_size}, "
             f"subsequent rows add marginal headroom), horizon={horizon} rows, "
+            f"drawdown-gate at -{gate_drawdown}, "
             f"bulk-close on cluster loss>={cluster_loss_cap}"
             + (f" or regime drop<{regime_exit_q}" if regime_exit_q is not None else "")
         ),
@@ -621,6 +892,7 @@ def make_bayesian_kelly_spec(
     unc_q_max: float = 0.9,
     unc_spike_q: float = 0.95,
     cluster_loss_cap: float = 0.020,        # 8·φ — the cluster-level circuit breaker
+    gate_drawdown_threshold: float | None = None,
     max_horizon_boundaries: int = 360,
     fraction_kelly: float = 0.25,
     kelly_percentile: float = 0.25,
@@ -635,7 +907,19 @@ def make_bayesian_kelly_spec(
     ``ve_diag`` is a hard requirement (``vol_gate`` is advisory rather than
     blocking — the regime gate here primarily controls *when* to enter, not
     whether the gate improves point precision in the data).
+
+    ``gate_drawdown_threshold`` controls the entry-suppression level for
+    ``gate_no_concurrent_loss_cluster``; defaults to ``0.5 *
+    cluster_loss_cap`` so the gate fires at half the liquidation level,
+    suppressing new entries before the bulk-close cap triggers. Coupling
+    them (gate fires at the same level as liquidation) would make the
+    gate a no-op because the bulk-close would have already liquidated.
     """
+    gate_drawdown = (
+        float(gate_drawdown_threshold)
+        if gate_drawdown_threshold is not None
+        else 0.5 * float(cluster_loss_cap)
+    )
 
     def _sizer(state: State) -> float:
         f = size_bayesian_kelly(
@@ -662,7 +946,7 @@ def make_bayesian_kelly_spec(
             lambda s, t=threshold: gate_score_above(s, t),
             lambda s, q=regime_entry_q: gate_regime_high(s, q),
             lambda s, qu=unc_q_max: gate_unc_below(s, qu),
-            lambda s, cap=cluster_loss_cap: gate_no_concurrent_loss_cluster(s, cap),
+            lambda s, cap=gate_drawdown: gate_no_concurrent_loss_cluster(s, cap),
         ),
         sizer=_sizer,
         exit_policy=exit_tp_or_expiry,
@@ -675,6 +959,7 @@ def make_bayesian_kelly_spec(
         ),
         description=(
             "patient wait-for-level + vol-gated + MI-gated entry + Bayesian-Kelly sizing; "
+            f"drawdown-gate at -{gate_drawdown}; "
             "bulk-close on regime drop OR MI spike OR cluster-loss"
         ),
     )
