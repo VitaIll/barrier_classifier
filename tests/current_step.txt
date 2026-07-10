@@ -1,3 +1,13 @@
-# Active delivery — see tests/conftest.py for the contract.
-# One step per line, or comma-separated. Lines starting with # are ignored.
-analytics_phase0,analytics_phase1,analytics_phase2,analytics_phase3,analytics_phase4,analytics_phase5,analytics_phase6,strategy_v1
+# Active theme(s) for the daily test loop.
+#
+# Themes are declared in pytest.ini and mapped to test files via
+# tests/conftest.py:_THEME_BY_PATH. Cross-cutting `framework` tests
+# always run regardless of this file's contents.
+#
+# Format: one theme per line OR comma-separated. Lines starting with
+# `#` are ignored. Malformed (empty after parsing) files raise
+# UsageError — see conftest.py for the contract.
+#
+# Run everything: `pytest --all`
+# Override from CLI: `CURRENT_STEP=features_pipeline pytest`
+framework

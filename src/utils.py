@@ -11,6 +11,7 @@ import json
 import math
 import re
 import time
+import warnings
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -135,6 +136,13 @@ LAGS_F: List[int] = [
     1440,
     2880,
     4320,
+    # Long-horizon lags added for hourly-target-friendly feature design
+    # (longer-term dynamics carry more signal at M >= 45). Capped at 14400
+    # so N_WARMUP stays at 20159 (dominated by max(WINDOWS_F)-1).
+    5760,
+    7200,
+    10080,
+    14400,
 ]
 VOL_PAIRS: List[Tuple[int, int]] = [
     (10, 60),
@@ -161,8 +169,54 @@ WINDOWS_BARRIER: List[int] = [10, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 7
 WINDOWS_CANDLE_ROLL: List[int] = [10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480]
 WINDOWS_BREAKOUT: List[int] = [20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 960, 1440, 1920, 2880, 4320]
 
-WINDOWS_EXCURSION: List[int] = [10, 20, 30, 60, 120, 240, 480, 960, 1440]
+# Excursion windows extended to multi-day scales for hourly-target-friendly
+# feature design (P2 from the strategy-improvement plan). The added windows
+# capture multi-day drawdown / drawup context that 20-min trades barely use
+# but hourly / 45-min trades care about. Calendar-stable at 1-min cadence.
+WINDOWS_EXCURSION: List[int] = [10, 20, 30, 60, 120, 240, 480, 960, 1440, 2880, 4320, 7200, 10080]
 WINDOWS_MAXRET: List[int] = [10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 960, 1440]
+
+# Causal local-extreme structure: dist-to-trailing-low/high (volatility-normalized)
+# and bounded price rank. Mirrors the WINDOWS_EXCURSION ladder so the two
+# families compose on the same scales.
+WINDOWS_EXTREME: List[int] = [30, 60, 120, 240, 480, 960, 1440]
+
+# Quadratic trend fits: slope and curvature over a trailing window. Limited
+# to mid-sized windows — quadratic fits over very short windows are noise,
+# and over very long windows the linear term dominates.
+WINDOWS_QUAD_TREND: List[int] = [30, 60, 120, 240, 480]
+
+# Pivot (Hi/Lo) carry-forward window length. Q (confirmation lag) is fixed
+# per emitted column and listed separately.
+WINDOWS_PIVOT: List[int] = [240, 480, 960]
+# Q values: confirmed swing pivots require Q bars before AND after the
+# candidate extremum. Two Q values let the model see fast and slow pivots.
+PIVOT_Q_VALUES: List[int] = [5, 15]
+
+# Signed semivariance ratio and bipower-jump share. Match the WINDOWS_VOL_DECOMP
+# ladder so the model can compare them against existing decomposition features.
+WINDOWS_VOL_SIGNED: List[int] = [60, 120, 240, 480, 960, 1440]
+WINDOWS_VOL_JUMP: List[int] = [60, 120, 240, 480, 960, 1440]
+
+# Rolling signed flow pressure + sell-absorption / buy-exhaustion interactions.
+WINDOWS_FLOW_PRESSURE: List[int] = [60, 120, 240, 480, 960, 1440]
+
+# OI regime decomposition (long_build / short_build / short_cover / long_liq):
+# two windows because most OI snapshot feeds publish at coarser cadence than
+# 1m, and the short window has to be large enough for ΔOI to register.
+WINDOWS_OI_REGIME: List[int] = [60, 240, 480]
+
+# Equilibrium-residual ladder. All ``eq__*`` features use strictly past-only
+# windows (``rolling_X(...).shift(1)`` semantics) so the equilibrium estimate
+# at row n is built from rows {n-W, ..., n-1} only. Mid-range windows: too
+# short ⇒ noisy equilibrium, too long ⇒ stale fair value.
+WINDOWS_EQ: List[int] = [30, 60, 120, 240, 480, 960]
+# EWMA half-lives (in bars) for the recursive equilibrium proxy. Span used
+# internally is ``2H - 1`` to match the canonical half-life parametrization.
+HALFLIVES_EQ: List[int] = [30, 120, 480]
+# (short, long) window pairs for rising-equilibrium pullback / falling-eq
+# overextension interaction features. Short < long by construction.
+WINDOWS_EQ_PAIRS: List[Tuple[int, int]] = [(30, 240), (60, 480), (120, 960)]
 
 WINDOWS_LOGP_Z: List[int] = [30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 960, 1440, 2880, 4320]
 WINDOWS_RSI: List[int] = [7, 10, 14, 20, 30, 45, 60, 90, 120, 180, 240, 360]
@@ -192,15 +246,7 @@ CB_LEARNING_RATE: float = 0.03
 CB_DEPTH: int = 6
 CB_EARLY_STOPPING: int = 100
 CB_SEED: int = 42
-N_ENSEMBLE_MODELS: int = 5  # Number of models in ensemble
 CB_L2_LEAF_REG: float = 3.0
-
-# Optuna hyperparameter search
-ENABLE_HPO: bool = False
-OPTUNA_N_TRIALS: int = 500
-OPTUNA_SEED: int = 42
-# HPO train truncation (drop oldest fraction of observations; HPO-only)
-HPO_DROP_OLDEST_FRAC: float = 0.6
 
 # Observation weighting (optional)
 WEIGHT_USE_BARRIER_DISTANCE: bool = True
@@ -222,7 +268,7 @@ CB_FIXED_PARAMS: Dict[str, Any] = {
     "custom_metric": ["Logloss", "AUC", "PRAUC"],
 
     # Training control
-    "iterations": 1000,
+    "iterations": CB_ITERATIONS,
     "early_stopping_rounds": 100,
     "use_best_model": True,
 
@@ -241,7 +287,7 @@ CB_FIXED_PARAMS: Dict[str, Any] = {
 
     # Quantization
     "feature_border_type": "GreedyLogSum",
-    "border_count": 128,
+    "border_count": 700,
 
     # Tree shape
     "grow_policy": "SymmetricTree",
@@ -257,17 +303,6 @@ CB_FIXED_PARAMS: Dict[str, Any] = {
     "langevin": True,
 }
 
-# Hyperparameter search ranges (Optuna)
-CB_HP_RANGES: Dict[str, Any] = {
-    "learning_rate": (0.001, 0.05),
-    "l2_leaf_reg": (0.1, 5.0),
-    "diffusion_temperature": (5000,15000),
-    "depth": (5, 8),
-    "rsm": (0.65, 0.9),
-    "subsample": (0.8, 1.0),
-    "mvs_reg": (1.0, 10.0),
-}
-
 # =============================================================================
 # Appendix E: Derivatives Configuration Constants
 # =============================================================================
@@ -281,9 +316,6 @@ ENABLE_FUNDING_RATE: bool = True
 ENABLE_FUTURES_METRICS: bool = True
 ENABLE_EOH_SUMMARY: bool = True
 ENABLE_BVOL_INDEX: bool = True
-
-# Optional extension (Section E.3.3)
-ENABLE_DELIVERY_TERM_STRUCTURE: bool = False
 
 # Derivatives feature windows
 WINDOWS_BASIS: List[int] = [0, 5, 60]
@@ -320,47 +352,6 @@ BVOL_DATA_START: str = "2023-06-20"
 # =============================================================================
 
 
-class CatBoostEnsemble:
-    """Wrapper for ensemble of CatBoost models with averaged predictions."""
-
-    def __init__(self, models: List[Any]):
-        if not models:
-            raise ValueError("CatBoostEnsemble requires at least one model.")
-        self.models = list(models)
-
-    def predict_proba(self, X):
-        probas = np.stack([m.predict_proba(X) for m in self.models], axis=0)
-        return probas.mean(axis=0)
-
-    def get_feature_importance(self, data=None, type: str = "PredictionValuesChange"):
-        imps = [np.asarray(m.get_feature_importance(data=data, type=type), dtype=float) for m in self.models]
-        return np.mean(imps, axis=0)
-
-    def get_best_iteration(self) -> int:
-        return int(np.mean([m.get_best_iteration() for m in self.models]))
-
-    def get_evals_result(self) -> Dict[str, Dict[str, List[float]]]:
-        results = [m.get_evals_result() for m in self.models]
-        averaged: Dict[str, Dict[str, List[float]]] = {}
-        for split_name, metrics in results[0].items():
-            averaged[split_name] = {}
-            for metric_name in metrics:
-                curves = [r[split_name][metric_name] for r in results]
-                min_len = min(len(c) for c in curves)
-                if min_len == 0:
-                    averaged[split_name][metric_name] = []
-                    continue
-                truncated = [np.asarray(c[:min_len], dtype=float) for c in curves]
-                averaged[split_name][metric_name] = np.mean(truncated, axis=0).tolist()
-        return averaged
-
-    def save_model(self, path: str | Path) -> None:
-        base = Path(path)
-        for i, m in enumerate(self.models):
-            m.save_model(str(base.with_suffix(f".{i}.cbm")))
-        self.models[0].save_model(str(base))
-
-
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, (np.bool_,)):
         return bool(obj)
@@ -385,6 +376,30 @@ def save_json(path: str | Path, payload: Any, *, indent: int = 2) -> None:
 def load_json(path: str | Path) -> Any:
     with Path(path).open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def get_git_sha(repo_dir: str | Path | None = None) -> str:
+    """Return the current git HEAD sha (40 chars) or ``"unknown"`` if
+    ``git`` is unavailable / the path is not a repo.
+
+    Used by metadata writers (build/train notebooks) so every artifact
+    can be traced back to a commit. Stdlib-only — no new dependencies.
+    """
+    import subprocess
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "unknown"
+    if res.returncode != 0:
+        return "unknown"
+    return res.stdout.strip() or "unknown"
 
 
 def assert_columns(df: pd.DataFrame, required: Iterable[str], *, context: str) -> None:
@@ -625,20 +640,6 @@ def generate_all_derivatives_urls(
     }
 
 
-def generate_derivatives_download_urls(
-    start_year: int = START_YEAR,
-    start_month: int = START_MONTH,
-    end_year: int = END_YEAR,
-    end_month: int = END_MONTH,
-) -> Dict[str, List[Dict[str, Any]]]:
-    return generate_all_derivatives_urls(
-        start_year=start_year,
-        start_month=start_month,
-        end_year=end_year,
-        end_month=end_month,
-    )
-
-
 def download_file(
     url: str,
     output_path: Path,
@@ -723,6 +724,13 @@ def extract_and_load_csv(zip_path: Path) -> pd.DataFrame:
 
 
 def _repair_out_of_bounds_open_time(open_time_ms: pd.Series, step_ms: int) -> Tuple[pd.Series, int]:
+    """Best-effort repair of out-of-pandas-bounds ``open_time`` values.
+
+    Emits a ``UserWarning`` whenever any rescaling (us/ns mistakenly interpreted
+    as ms) or linear extrapolation fires, since either path invents timestamps
+    that were not present in the source CSV. Callers that need strict semantics
+    should validate upstream rather than rely on this repair.
+    """
     ts = pd.to_datetime(open_time_ms + step_ms, unit="ms", utc=True, errors="coerce")
     invalid = ts.isna()
     n_invalid = int(invalid.sum())
@@ -731,6 +739,7 @@ def _repair_out_of_bounds_open_time(open_time_ms: pd.Series, step_ms: int) -> Tu
 
     values = open_time_ms.to_numpy(copy=True, dtype="int64")
     invalid_mask = invalid.to_numpy()
+    n_rescaled = 0
     if invalid_mask.any():
         min_ms = pd.Timestamp.min.value // 1_000_000
         max_ms = pd.Timestamp.max.value // 1_000_000
@@ -742,6 +751,7 @@ def _repair_out_of_bounds_open_time(open_time_ms: pd.Series, step_ms: int) -> Tu
             invalid_idx = np.flatnonzero(invalid_mask)
             values[invalid_idx[in_range_1k]] = scaled_1k[in_range_1k]
             invalid_mask[invalid_idx[in_range_1k]] = False
+            n_rescaled += int(in_range_1k.sum())
 
         if invalid_mask.any():
             invalid_values = values[invalid_mask]
@@ -751,10 +761,12 @@ def _repair_out_of_bounds_open_time(open_time_ms: pd.Series, step_ms: int) -> Tu
                 invalid_idx = np.flatnonzero(invalid_mask)
                 values[invalid_idx[in_range_1m]] = scaled_1m[in_range_1m]
                 invalid_mask[invalid_idx[in_range_1m]] = False
+                n_rescaled += int(in_range_1m.sum())
     valid_idx = np.flatnonzero(~invalid_mask)
     if valid_idx.size == 0:
         raise ValueError("convert_timestamps: all open_time values out of bounds")
 
+    n_extrapolated = int(invalid_mask.sum())
     last_valid = None
     for i in range(len(values)):
         if not invalid_mask[i]:
@@ -770,6 +782,16 @@ def _repair_out_of_bounds_open_time(open_time_ms: pd.Series, step_ms: int) -> Tu
     if ts_check.isna().any():
         bad = int(ts_check.isna().sum())
         raise ValueError(f"convert_timestamps: {bad} timestamps remain out of bounds after repair")
+
+    if n_rescaled or n_extrapolated:
+        warnings.warn(
+            "_repair_out_of_bounds_open_time: invented timestamps "
+            f"(rescaled={n_rescaled}, extrapolated={n_extrapolated}, total_invalid={n_invalid}). "
+            "These rows did not have a valid open_time in the source CSV; downstream "
+            "timestamps are best-effort and may not match exchange data.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     return pd.Series(values, index=open_time_ms.index), n_invalid
 
@@ -966,11 +988,6 @@ def align_to_1m_grid(
         aligned.loc[aligned.index < df.index.min(), :] = np.nan
         aligned.loc[aligned.index > df.index.max(), :] = np.nan
     return aligned
-
-
-def expected_bar_count(start_open: datetime, end_open_exclusive: datetime) -> int:
-    delta = end_open_exclusive - start_open
-    return int(delta.total_seconds() / 60)
 
 
 def validate_klines(df: pd.DataFrame) -> Dict[str, Any]:
@@ -2191,34 +2208,6 @@ def compute_barrier_aware_features(
 # =============================================================================
 
 
-def permutation_entropy_normalized(x: np.ndarray, m: int = 3, tau: int = 1) -> float:
-    """
-    Compute normalized permutation entropy in [0, 1].
-
-    Tie handling: stable argsort (equivalent to NumPy argsort(..., kind='mergesort')).
-    """
-    n = len(x)
-    n_patterns = n - (m - 1) * tau
-
-    if n_patterns < 5 * math.factorial(m):
-        return float("nan")
-
-    patterns: List[Tuple[int, ...]] = []
-    for i in range(n_patterns):
-        window = [x[i + j * tau] for j in range(m)]
-        if any(not np.isfinite(v) for v in window):
-            return float("nan")
-        patterns.append(tuple(np.argsort(window, kind="mergesort")))
-
-    from collections import Counter
-
-    counts = Counter(patterns)
-    probs = np.array(list(counts.values()), dtype=float) / float(n_patterns)
-    H = -np.sum(probs * np.log(probs))
-    H_max = np.log(math.factorial(m))
-    return float(H / H_max)
-
-
 def _perm_codes_m3_tau1(x: np.ndarray) -> np.ndarray:
     """
     Vectorized ordinal-pattern encoding for m=3, tau=1 with stable tie-breaking.
@@ -2485,7 +2474,18 @@ def compute_past_target_features(
     windows_h: List[int],
     hitrate_windows_h: List[int],
 ) -> pd.DataFrame:
-    """Compute Group K past-target features using matured labels only (Section 7.20)."""
+    """Compute Group K past-target features using matured labels only (Section 7.20).
+
+    Convention note (parity contract, do not change):
+        ``hit__since__h__w0`` is computed as ``df['k'] - hit_k.shift(1).ffill()``.
+        The ``ffill()`` is intentional: before the first matured hit (i.e. across
+        the warmup region) ``last_hit_before`` is NaN, which propagates into
+        ``hit__since__h__w0`` and is dropped by downstream warmup trimming. After
+        the first hit, the value forward-fills past subsequent non-hit rows so
+        that "time since last hit" grows monotonically. This is the legacy
+        behaviour and is the parity oracle for the Polars engine; the engine
+        replicates it bit-for-bit.
+    """
     df = df_boundaries
     assert_columns(df, ["k", "y"], context="compute_past_target_features")
 
@@ -2619,8 +2619,17 @@ def compute_basis_features(df: pd.DataFrame, windows: List[int]) -> pd.DataFrame
 
 
 def compute_flow_features(df: pd.DataFrame, windows: List[int]) -> pd.DataFrame:
-    """
-    Compute derivatives volume and order flow features (Group S).
+    """Compute derivatives volume and order flow features (Group S).
+
+    Convention note (parity contract, do not change):
+        ``liq__avg_trade_size__f__w15`` and ``activity__trades_zscore__f__w30``
+        are emitted UNCONDITIONALLY regardless of whether 15 / 30 appear in
+        ``windows``. ``windows`` here only gates the ``flow__net_vol_csum__f__w*``
+        series (5/10/20). The legacy Polars engine
+        (``src/features/families/derivatives.py``: ``FlowAvgTradeSize15`` /
+        ``FlowTradesZscore30``) mirrors this with empty ``windows = ()``, so
+        both 15 and 30 are always produced. Do not gate these columns — it
+        would break the parity oracle in tests/features/test_family_step11.py.
     """
     required = [
         "tb_ratio_fut",
@@ -2803,7 +2812,18 @@ def get_imputation_value(feature_name: str, p_hit_prior: float = 0.5, cap_h_bloc
         (r"^barrier__phi", None),
         (r"^barrier__z_tight", 10.0),
         (r"^barrier__emax_ratio", 0.0),
+        # Drifted-Brownian first-passage probability. Float in [0, 1].
+        # Default fill = 0.5 (uninformative) when the underlying mu/sigma
+        # window has not yet warmed up. The undef__ flag distinguishes
+        # missing-due-to-warmup from a genuine 0.5 estimate.
+        (r"^barrier__p_hit_drifted", 0.5),
         (r"^vol__bpv_ratio", 1.0),
+        # Bipower-jump share in [0, 1]; "no detectable jump" is the safe
+        # default when the window has not yet warmed up.
+        (r"^vol__jump_ratio", 0.0),
+        # Signed semivariance ratio in [-1, 1]; "no asymmetry" is the
+        # safe neutral default.
+        (r"^vol__semivar_signed", 0.0),
         (r"^vol__semivar_ratio", 1.0),
         (r"^vol__ratio", 1.0),
         (r"^vol__", 0.0),
@@ -2813,6 +2833,62 @@ def get_imputation_value(feature_name: str, p_hit_prior: float = 0.5, cap_h_bloc
         (r"^tb_ratio", 0.5),
         (r"^block__close_to_high", 0.5),
         (r"^pentropy_norm", 0.5),
+        # Causal local-extreme features (Round 1a). Distance features get a
+        # large "not near the extreme" fallback; price rank gets 0.5
+        # (median of the bounded support).
+        (r"^extreme__dist_low_z", 5.0),
+        (r"^extreme__dist_high_z", 5.0),
+        (r"^extreme__price_rank", 0.5),
+        # Quadratic trend features (Round 1b). Both are real-valued and
+        # centred at 0 in expectation; "no detected slope / curvature" is
+        # the right neutral fill.
+        (r"^trend__quad_slope_z", 0.0),
+        (r"^trend__quad_curv_z", 0.0),
+        # Pivot features (Round 1c). Distance neutral = 0; age sentinel
+        # already lives in the column (= W) for no-pivot rows, so the
+        # imputation handles only true warmup nulls — pick "old pivot" as
+        # the safer default (high age = stale).
+        (r"^pivot__last_low_dist_z", 0.0),
+        (r"^pivot__last_high_dist_z", 0.0),
+        (r"^pivot__last_low_age", 0.0),
+        (r"^pivot__last_high_age", 0.0),
+        # Rolling flow pressure and the two interactions. All bounded and
+        # zero-centred in expectation; neutral fill = 0.
+        (r"^flow__pressure", 0.0),
+        (r"^flow__sell_absorption", 0.0),
+        (r"^flow__buy_exhaustion", 0.0),
+        # Equilibrium-residual family (Round 2).
+        #
+        # Residuals / innovations (``eq__*_resid_*``, ``eq__*_innov_*``,
+        # ``eq__upside_to_eq_over_phi``, ``eq__barrier_vs_eq_hz``): real-
+        # valued, zero-centred in expectation, so 0.0 is the neutral
+        # ``no-information`` fill. The ``undef`` flag distinguishes warmup
+        # from a genuine zero residual.
+        #
+        # Non-negative interactions (``eq__proxy_dispersion``,
+        # ``eq__pullback_rising_eq``, ``eq__above_falling_eq``): 0.0 = "no
+        # detected dispersion / pullback / overextension"; correct neutral
+        # for a max-zero-clamped feature.
+        #
+        # Raw proxy / scale columns (``eq__mu_*``, ``eq__sigma_*``,
+        # ``eq__mad_p``, ``eq__trend_sresid``): used only as tier-2 inputs;
+        # post-impute values land downstream of the residual columns. Mu's
+        # of log price filled at 0 is far from any real BTC log close
+        # (~ln(50_000) ≈ 10.8), so a 0 fill is detectable as ``warmup`` via
+        # the ``undef__`` flag; sigma / scale columns filled at 0 reduce
+        # the residual denominator to EPS, which the residual feature
+        # itself handles via the EPS guard. Catch-all 0.0 is correct for
+        # all of them.
+        (r"^eq__", 0.0),
+        # Target-derived matured-label memory (Round 2). m_mean is a
+        # log-return; 0 is the right "no observed burst" default. tau
+        # gets the horizon M as the "slow / absent" sentinel. Near-miss
+        # rates are in [0, 1]; 0 means "no near-misses observed".
+        (r"^target__mature_m_mean", 0.0),
+        (r"^target__mature_m_pos_mean", 0.0),
+        (r"^target__mature_tau_pos_mean", float(cap_h_blocks)),
+        (r"^target__mature_near_miss_up", 0.0),
+        (r"^target__mature_near_miss_dn", 0.0),
         (r"^hit__rate", float(p_hit_prior)),
         (r"^hit__since", float(cap_h_blocks)),
         (r"^hit__prev", 0.0),
@@ -2838,9 +2914,22 @@ def get_imputation_value(feature_name: str, p_hit_prior: float = 0.5, cap_h_bloc
         (r"^oi__chg", 0.0),
         (r"^oi__vol_ratio", 0.0),
         (r"^oi__price_corr", 0.0),
+        # OI regime decomposition (Round 4a). Each quadrant feature is in
+        # [0, 1], with the four columns mutually exclusive on any given
+        # row. Neutral fill = 0 (no regime detected).
+        (r"^oi__long_build", 0.0),
+        (r"^oi__short_build", 0.0),
+        (r"^oi__short_cover", 0.0),
+        (r"^oi__long_liq", 0.0),
         (r"^funding__rate", 0.0),
         (r"^funding__trend", 0.0),
         (r"^funding__ewma", 0.0),
+        # Funding phase (Round 4b). phase ∈ (0, 1]; default = 0.5 puts
+        # the imputed row "halfway between settlements", which is the
+        # least informative value. Sin/cos ∈ [-1, 1] with neutral 0.
+        (r"^funding__phase_sin", 0.0),
+        (r"^funding__phase_cos", 0.0),
+        (r"^funding__phase", 0.5),
         (r"^opt_pcr__oi", 1.0),
         (r"^opt_pcr__vol", 1.0),
         (r"^opt_pcr__oi_chg", 0.0),
@@ -3175,98 +3264,6 @@ def compute_training_weights(
     return w_combined, w_dist, w_time, info
 
 
-def checkpoint_weights(
-    w_combined: np.ndarray,
-    w_dist: np.ndarray,
-    w_time: np.ndarray,
-    info: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Validate computed weights for consistency."""
-    results: Dict[str, Any] = {}
-
-    w_combined = np.asarray(w_combined, dtype=float)
-    w_dist = np.asarray(w_dist, dtype=float)
-    w_time = np.asarray(w_time, dtype=float)
-
-    if not (len(w_combined) == len(w_dist) == len(w_time)):
-        raise ValueError("Weight arrays must have the same length")
-
-    results["all_positive"] = {
-        "w_dist": bool((w_dist > 0).all()),
-        "w_time": bool((w_time > 0).all()),
-        "w_combined": bool((w_combined > 0).all()),
-        "ok": bool((w_dist > 0).all() and (w_time > 0).all() and (w_combined > 0).all()),
-    }
-    if not results["all_positive"]["ok"]:
-        def _count_nonpos(x: np.ndarray) -> int:
-            return int(np.sum(~(x > 0)))
-
-        raise ValueError(
-            "Weights must be strictly positive "
-            f"(min w_dist={float(np.nanmin(w_dist))}, nonpos={_count_nonpos(w_dist)}; "
-            f"min w_time={float(np.nanmin(w_time))}, nonpos={_count_nonpos(w_time)}; "
-            f"min w_combined={float(np.nanmin(w_combined))}, nonpos={_count_nonpos(w_combined)})"
-        )
-
-    recomputed = w_dist * w_time
-    results["multiplicative_consistent"] = {
-        "max_diff": float(np.abs(w_combined - recomputed).max()) if len(w_combined) > 0 else 0.0,
-        "ok": bool(np.allclose(w_combined, recomputed)),
-    }
-    if not results["multiplicative_consistent"]["ok"]:
-        raise ValueError("Combined weights not equal to w_dist * w_time")
-
-    dist_info = info.get("barrier_distance", {})
-    if dist_info.get("enabled", False):
-        params = dist_info.get("params", {})
-        w_max_neg = params.get("w_max_neg", params.get("w_max", None))
-        w_max_pos = params.get("w_max_pos", None)
-        max_weight_neg = dist_info.get("max_weight_neg", None)
-        max_weight_pos = dist_info.get("max_weight_pos", None)
-        if w_max_neg is not None:
-            max_weight_neg = float(max_weight_neg) if max_weight_neg is not None else 1.0
-            results["dist_bounded"] = {
-                "max_weight": max_weight_neg,
-                "w_max": float(w_max_neg),
-                "ok": bool(max_weight_neg <= float(w_max_neg) + 1e-9),
-            }
-            if not results["dist_bounded"]["ok"]:
-                raise ValueError(
-                    f"Barrier-distance weight exceeds w_max (negative side): {max_weight_neg} > {w_max_neg}"
-                )
-        if dist_info.get("enabled_pos", False) and w_max_pos is not None and max_weight_pos is not None:
-            max_weight_pos = float(max_weight_pos)
-            results["dist_bounded_pos"] = {
-                "max_weight": max_weight_pos,
-                "w_max": float(w_max_pos),
-                "ok": bool(max_weight_pos <= float(w_max_pos) + 1e-9),
-            }
-            if not results["dist_bounded_pos"]["ok"]:
-                raise ValueError(
-                    f"Barrier-distance weight exceeds w_max_pos (positive side): {max_weight_pos} > {w_max_pos}"
-                )
-
-    time_info = info.get("time_discount", {})
-    if time_info.get("enabled", False):
-        results["time_bounded"] = {
-            "min_weight": float(w_time.min()) if len(w_time) > 0 else 1.0,
-            "max_weight": float(w_time.max()) if len(w_time) > 0 else 1.0,
-            "ok": bool(len(w_time) == 0 or (w_time.min() > 0 and w_time.max() <= 1.0 + 1e-9)),
-        }
-        if not results["time_bounded"]["ok"]:
-            raise ValueError(f"Time-discount weight out of (0, 1]: [{w_time.min()}, {w_time.max()}]")
-
-    results["summary"] = {
-        "effective_n": info.get("combined", {}).get("effective_n", 0.0),
-        "n_observations": int(len(w_combined)),
-        "efficiency_ratio": float(info.get("combined", {}).get("effective_n", 0.0) / len(w_combined))
-        if len(w_combined) > 0
-        else 0.0,
-    }
-
-    print("OK: Weight validation passed")
-    return results
-
 
 # =============================================================================
 # Section 12.4: Output Helpers
@@ -3384,29 +3381,6 @@ def chronological_split_with_embargo(
     return train_df, val_df, test_df
 
 
-def walk_forward_cv(df: pd.DataFrame, n_folds: int = 3, embargo_k: int = 1) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
-    """Walk-forward CV folds with an embargo gap between train and val of each fold.
-
-    Same cadence caveat as ``chronological_split_with_embargo``: pass an
-    ``embargo_k`` sized to the input dataframe's cadence. At 1-min cadence
-    use ``recommended_embargo_for_cadence('1min')`` (>= M rows).
-    """
-    n = len(df)
-    fold_size = n // (n_folds + 1)
-
-    folds: List[Tuple[pd.DataFrame, pd.DataFrame]] = []
-    for i in range(n_folds):
-        train_end = (i + 1) * fold_size
-        val_start = train_end + embargo_k
-        val_end = min(val_start + fold_size, n)
-
-        train_df = df.iloc[:train_end].copy()
-        val_df = df.iloc[val_start:val_end].copy()
-        if len(val_df) > 0:
-            folds.append((train_df, val_df))
-    return folds
-
-
 # =============================================================================
 # Section 11: Evaluation Metrics
 # =============================================================================
@@ -3449,427 +3423,3 @@ def expected_calibration_error(y_true: np.ndarray, y_pred_proba: np.ndarray, n_b
         ece += bin_weight * abs(bin_accuracy - bin_confidence)
 
     return float(ece)
-
-
-def calibration_by_regime(
-    y_true: np.ndarray,
-    y_pred_proba: np.ndarray,
-    vol_series: np.ndarray,
-    n_bins: int = 10,
-) -> Dict[str, Dict[str, float]]:
-    from sklearn.metrics import brier_score_loss
-
-    y_true = np.asarray(y_true)
-    y_pred_proba = np.asarray(y_pred_proba)
-    vol_series = np.asarray(vol_series)
-
-    vol_terciles = pd.qcut(vol_series, 3, labels=["low", "med", "high"])
-    results: Dict[str, Dict[str, float]] = {}
-    for regime in ["low", "med", "high"]:
-        mask = np.asarray(vol_terciles == regime)
-        if mask.sum() < 50:
-            continue
-        results[regime] = {
-            "n_samples": int(mask.sum()),
-            "base_rate": float(y_true[mask].mean()),
-            "ece": float(expected_calibration_error(y_true[mask], y_pred_proba[mask], n_bins=n_bins)),
-            "brier": float(brier_score_loss(y_true[mask], y_pred_proba[mask])),
-        }
-    return results
-
-
-def threshold_analysis(y_true: np.ndarray, y_pred_proba: np.ndarray, thresholds: np.ndarray | None = None) -> pd.DataFrame:
-    if thresholds is None:
-        thresholds = np.linspace(0.0, 1.0, 101)
-
-    y_true = np.asarray(y_true).astype(int)
-    y_pred_proba = np.asarray(y_pred_proba).astype(float)
-
-    rows: List[Dict[str, Any]] = []
-    n = len(y_true)
-    n_pos = int((y_true == 1).sum())
-
-    for t in thresholds:
-        pred = y_pred_proba >= float(t)
-        n_trades = int(pred.sum())
-        tp = int(((y_true == 1) & pred).sum())
-        precision = float(tp / n_trades) if n_trades > 0 else float("nan")
-        recall = float(tp / n_pos) if n_pos > 0 else float("nan")
-        rows.append(
-            {
-                "threshold": float(t),
-                "n_trades": n_trades,
-                "trade_rate": float(n_trades / n),
-                "hit_rate": precision,
-                "precision": precision,
-                "recall": recall,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-# =============================================================================
-# Section 12.1: Plotting
-# =============================================================================
-
-
-def plot_calibration_curve(
-    y_true: np.ndarray,
-    y_pred_proba: np.ndarray,
-    n_bins: int = 10,
-    ax=None,
-    *,
-    label: str = "Model",
-    color: str | None = None,
-    plot_perfect: bool = True,
-    show_ece: bool = True,
-):
-    import matplotlib.pyplot as plt
-
-    y_true = np.asarray(y_true)
-    y_pred_proba = np.asarray(y_pred_proba)
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(6, 5))
-
-    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
-    xs: List[float] = []
-    ys: List[float] = []
-    for i in range(n_bins):
-        lo = bin_edges[i]
-        hi = bin_edges[i + 1]
-        if i == n_bins - 1:
-            mask = (y_pred_proba >= lo) & (y_pred_proba <= hi)
-        else:
-            mask = (y_pred_proba >= lo) & (y_pred_proba < hi)
-        if mask.sum() == 0:
-            continue
-        xs.append(float(y_pred_proba[mask].mean()))
-        ys.append(float(y_true[mask].mean()))
-
-    if plot_perfect:
-        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect")
-    ax.plot(xs, ys, marker="o", label=label, color=color)
-    ece = expected_calibration_error(y_true, y_pred_proba, n_bins=n_bins)
-    if show_ece:
-        ax.set_title(f"Calibration Curve (ECE={ece:.3f})")
-    ax.set_xlabel("Mean predicted probability")
-    ax.set_ylabel("Empirical frequency")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.legend()
-    return ax
-
-
-def plot_calibration_by_regime(
-    y_true: np.ndarray,
-    y_pred_proba: np.ndarray,
-    vol_series: np.ndarray,
-    n_bins: int = 10,
-    fig=None,
-):
-    import matplotlib.pyplot as plt
-
-    y_true = np.asarray(y_true)
-    y_pred_proba = np.asarray(y_pred_proba)
-    vol_series = np.asarray(vol_series)
-
-    regimes = pd.qcut(vol_series, 3, labels=["low", "med", "high"])
-    if fig is None:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharex=True, sharey=True)
-    else:
-        axes = fig.subplots(1, 3, sharex=True, sharey=True)
-
-    for ax, regime in zip(axes, ["low", "med", "high"]):
-        mask = np.asarray(regimes == regime)
-        if mask.sum() == 0:
-            ax.set_title(f"{regime} (n=0)")
-            ax.axis("off")
-            continue
-        plot_calibration_curve(y_true[mask], y_pred_proba[mask], n_bins=n_bins, ax=ax)
-        ax.set_title(f"{regime} vol (n={int(mask.sum())})")
-    fig.tight_layout()
-    return fig
-
-
-def plot_feature_importance(model, feature_names: List[str], top_n: int = 30, ax=None):
-    import matplotlib.pyplot as plt
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(10, 8))
-
-    importances = np.asarray(model.get_feature_importance(), dtype=float)
-    order = np.argsort(importances)[::-1][:top_n]
-    feats = [feature_names[i] for i in order]
-    vals = importances[order]
-
-    ax.barh(list(reversed(feats)), list(reversed(vals)))
-    ax.set_title(f"Top {top_n} Feature Importances")
-    ax.set_xlabel("Importance")
-    return ax
-
-
-def plot_threshold_curves(thresh_df: pd.DataFrame, ax=None):
-    import matplotlib.pyplot as plt
-
-    if ax is None:
-        _, ax = plt.subplots(figsize=(7, 5))
-
-    ax.plot(thresh_df["threshold"], thresh_df["trade_rate"], label="Trade rate")
-    ax.plot(thresh_df["threshold"], thresh_df["precision"], label="Precision / Hit rate")
-    ax.plot(thresh_df["threshold"], thresh_df["recall"], label="Recall")
-    ax.set_title("Threshold Analysis")
-    ax.set_xlabel("Threshold")
-    ax.set_ylabel("Metric")
-    ax.set_xlim(0, 1)
-    ax.legend()
-    return ax
-
-
-def plot_weight_profiles(
-    m_k: np.ndarray,
-    phi: float,
-    w_dist: np.ndarray,
-    w_time: np.ndarray,
-    *,
-    k_index: Optional[np.ndarray] = None,
-    info: Optional[Dict[str, Any]] = None,
-    fig: Optional[Any] = None,
-) -> Any:
-    """Plot barrier-distance and time-discount weight profiles."""
-    import matplotlib.pyplot as plt
-
-    m_k = np.asarray(m_k, dtype=float)
-    w_dist = np.asarray(w_dist, dtype=float)
-    w_time = np.asarray(w_time, dtype=float)
-    n = len(m_k)
-    if len(w_dist) != n or len(w_time) != n:
-        raise ValueError("plot_weight_profiles: m_k, w_dist, w_time must have the same length")
-
-    if fig is None:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    else:
-        axes = fig.subplots(1, 2)
-
-    ax1, ax2 = axes
-
-    # Barrier-distance profile
-    pos_mask = m_k >= phi
-    if n > 50000:
-        step = max(1, n // 50000)
-        idx = np.arange(0, n, step)
-        m_k_plot = m_k[idx]
-        w_dist_plot = w_dist[idx]
-        pos_plot = pos_mask[idx]
-    else:
-        m_k_plot = m_k
-        w_dist_plot = w_dist
-        pos_plot = pos_mask
-
-    ax1.scatter(m_k_plot[pos_plot], w_dist_plot[pos_plot], s=6, alpha=0.4, color="#2ecc71", label="m_k >= phi")
-    ax1.scatter(m_k_plot[~pos_plot], w_dist_plot[~pos_plot], s=6, alpha=0.4, color="#e74c3c", label="m_k < phi")
-    ax1.axvline(phi, color="black", linestyle="--", linewidth=1)
-    ax1.axhline(1.0, color="gray", linestyle=":", linewidth=1)
-    if info is not None:
-        dist_info = info.get("barrier_distance", {})
-        params = dist_info.get("params", {})
-        w_max_neg = params.get("w_max_neg", params.get("w_max", None))
-        w_max_pos = params.get("w_max_pos", None)
-        enabled_pos = dist_info.get("enabled_pos", False)
-        if w_max_neg is not None:
-            ax1.axhline(float(w_max_neg), color="orange", linestyle="--", linewidth=1)
-        if enabled_pos and w_max_pos is not None and w_max_pos != w_max_neg:
-            ax1.axhline(float(w_max_pos), color="#2ecc71", linestyle="--", linewidth=1)
-        lam_neg = dist_info.get("lambda", 0.0)
-        d_star = dist_info.get("d_star", 0.0)
-        if enabled_pos:
-            lam_pos = dist_info.get("lambda_pos", 0.0)
-            g_star = dist_info.get("g_star", 0.0)
-            ax1.set_title(
-                f"Barrier-distance weights (lambda-={lam_neg:.4g}, d*={d_star:.4g}; "
-                f"lambda+={lam_pos:.4g}, g*={g_star:.4g})"
-            )
-        else:
-            ax1.set_title(f"Barrier-distance weights (lambda={lam_neg:.4g}, d*={d_star:.4g})")
-    else:
-        ax1.set_title("Barrier-distance weights")
-    ax1.set_xlabel("m_k")
-    ax1.set_ylabel("w_dist")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="upper left")
-
-    # Time-discount profile
-    if k_index is None:
-        rank = np.arange(n, dtype=int)
-    else:
-        k = np.asarray(k_index)
-        if len(k) != n:
-            raise ValueError("plot_weight_profiles: k_index length mismatch")
-        order = np.argsort(k)
-        rank = np.empty(n, dtype=int)
-        rank[order] = np.arange(n, dtype=int)
-
-    if n > 1:
-        frac = rank / (n - 1)
-    else:
-        frac = rank.astype(float)
-
-    order = np.argsort(rank)
-    ax2.plot(frac[order], w_time[order], color="#3498db", linewidth=1.5)
-    ax2.axhline(1.0, color="gray", linestyle=":", linewidth=1)
-    if info is not None:
-        r_val = info.get("time_discount", {}).get("params", {}).get("r", None)
-        delta_val = info.get("time_discount", {}).get("params", {}).get("delta", None)
-        if r_val is not None:
-            ax2.axvline(1.0 - float(r_val), color="black", linestyle="--", linewidth=1)
-        ax2.set_title(f"Time-discount weights (r={r_val}, delta={delta_val})")
-    else:
-        ax2.set_title("Time-discount weights")
-    ax2.set_xlabel("Observation position (0=oldest, 1=newest)")
-    ax2.set_ylabel("w_time")
-    ax2.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    return fig
-
-
-def plot_weight_distributions(
-    w_dist: np.ndarray,
-    w_time: np.ndarray,
-    w_combined: np.ndarray,
-    *,
-    y: Optional[np.ndarray] = None,
-    info: Optional[Dict[str, Any]] = None,
-    fig: Optional[Any] = None,
-) -> Any:
-    """Plot distributions for w_dist, w_time, and combined weights."""
-    import matplotlib.pyplot as plt
-
-    w_dist = np.asarray(w_dist, dtype=float)
-    w_time = np.asarray(w_time, dtype=float)
-    w_combined = np.asarray(w_combined, dtype=float)
-
-    if fig is None:
-        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    else:
-        axes = fig.subplots(1, 3)
-
-    ax1, ax2, ax3 = axes
-
-    w_max_neg = None
-    w_max_pos = None
-    w_max_cap = None
-    enabled_pos = False
-    if info is not None:
-        dist_info = info.get("barrier_distance", {})
-        params = dist_info.get("params", {})
-        w_max_neg = params.get("w_max_neg", params.get("w_max", None))
-        w_max_pos = params.get("w_max_pos", None)
-        enabled_pos = dist_info.get("enabled_pos", False)
-        if w_max_neg is not None:
-            w_max_cap = float(w_max_neg)
-        if enabled_pos and w_max_pos is not None:
-            w_max_cap = float(w_max_pos) if w_max_cap is None else max(w_max_cap, float(w_max_pos))
-
-    if y is not None:
-        y = np.asarray(y, dtype=int)
-        pos_mask = y == 1
-        neg_mask = y == 0
-        if w_max_cap is None:
-            bins_dist = 50
-        else:
-            bins_dist = np.linspace(0.9, float(w_max_cap) + 0.1, 50)
-        ax1.hist(w_dist[neg_mask], bins=bins_dist, alpha=0.6, color="#e74c3c", label="y=0", density=True)
-        ax1.hist(w_dist[pos_mask], bins=bins_dist, alpha=0.6, color="#2ecc71", label="y=1", density=True)
-        ax1.legend(loc="upper right")
-    else:
-        ax1.hist(w_dist, bins=50, alpha=0.7, color="#2ecc71", density=True)
-    ax1.axvline(1.0, color="gray", linestyle="--", linewidth=1)
-    if w_max_neg is not None:
-        ax1.axvline(float(w_max_neg), color="orange", linestyle="--", linewidth=1)
-    if enabled_pos and w_max_pos is not None and w_max_pos != w_max_neg:
-        ax1.axvline(float(w_max_pos), color="#2ecc71", linestyle="--", linewidth=1)
-    ax1.set_title("Barrier-distance weights")
-    ax1.set_xlabel("w_dist")
-    ax1.set_ylabel("Density")
-    ax1.grid(True, alpha=0.3)
-
-    ax2.hist(w_time, bins=50, alpha=0.7, color="#3498db", density=True)
-    ax2.axvline(1.0, color="gray", linestyle="--", linewidth=1)
-    ax2.set_title("Time-discount weights")
-    ax2.set_xlabel("w_time")
-    ax2.set_ylabel("Density")
-    ax2.grid(True, alpha=0.3)
-
-    w_log = np.log10(w_combined + EPS)
-    if y is not None:
-        ax3.hist(w_log[neg_mask], bins=50, alpha=0.6, color="#e74c3c", label="y=0", density=True)
-        ax3.hist(w_log[pos_mask], bins=50, alpha=0.6, color="#2ecc71", label="y=1", density=True)
-        ax3.legend(loc="upper right")
-    else:
-        ax3.hist(w_log, bins=50, alpha=0.7, color="#8e44ad", density=True)
-    ax3.axvline(0.0, color="gray", linestyle="--", linewidth=1)
-    ax3.set_title("Combined weights (log10)")
-    ax3.set_xlabel("log10(w_combined)")
-    ax3.set_ylabel("Density")
-    ax3.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    return fig
-
-
-# =============================================================================
-# Section 13: Feature Selection Utilities
-# =============================================================================
-
-
-def importance_by_window(model, feature_names: List[str]) -> Dict[int, float]:
-    importances = dict(zip(feature_names, np.asarray(model.get_feature_importance(), dtype=float).tolist()))
-    by_window: Dict[int, float] = {}
-    for name, imp in importances.items():
-        match = re.search(r"__w(\\d+)", name)
-        if match:
-            w = int(match.group(1))
-            by_window[w] = by_window.get(w, 0.0) + float(imp)
-    return dict(sorted(by_window.items(), key=lambda x: -x[1]))
-
-
-def stability_selection(
-    df: pd.DataFrame,
-    feature_cols: List[str],
-    n_folds: int = 4,
-    importance_threshold: float = 0.001,
-) -> List[str]:
-    from catboost import CatBoostClassifier
-
-    importance_counts: Dict[str, int] = {c: 0 for c in feature_cols}
-    for train_df, val_df in walk_forward_cv(df, n_folds=n_folds, embargo_k=EMBARGO_K):
-        X_train = train_df[feature_cols]
-        y_train = train_df["y"].astype(int)
-        X_val = val_df[feature_cols]
-        y_val = val_df["y"].astype(int)
-
-        model = CatBoostClassifier(
-            iterations=CB_ITERATIONS,
-            learning_rate=CB_LEARNING_RATE,
-            depth=CB_DEPTH,
-            loss_function="Logloss",
-            eval_metric="AUC",
-            l2_leaf_reg=CB_L2_LEAF_REG,
-            early_stopping_rounds=CB_EARLY_STOPPING,
-            use_best_model=True,
-            auto_class_weights="Balanced",
-            random_seed=CB_SEED,
-            verbose=False,
-            thread_count=-1,
-        )
-        model.fit(X_train, y_train, eval_set=(X_val, y_val))
-
-        imp = np.asarray(model.get_feature_importance(), dtype=float)
-        for feat, val in zip(feature_cols, imp):
-            if float(val) > float(importance_threshold):
-                importance_counts[feat] += 1
-
-    stable = [f for f, cnt in importance_counts.items() if cnt >= n_folds // 2]
-    return stable

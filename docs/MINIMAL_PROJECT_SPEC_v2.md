@@ -1,11 +1,9 @@
-> **LEGACY — DO NOT USE AS SOURCE OF TRUTH.** This document predates the ongoing refactor and may not reflect current code. Kept for historical reference only.
-
 # Minimal Barrier-Crossing Classifier Specification (BTCUSDT 1m)
 
-**Version:** 4.0  
-**Date:** 2026-01-03  
-**Status:** Implementation-aligned (matches `src/utils.py` and the notebooks)  
-**Scope:** Offline binary classification on Binance 1-minute data: predict whether price crosses an upward log-return barrier within the next `M=10` minutes (one decision interval).
+**Version:** 4.1  
+**Date:** 2026-05-11  
+**Status:** Implementation-aligned (matches `src/utils.py`, `src/features/`, `src/analytics/`, `src/strategy/`)  
+**Scope:** Offline binary classification on Binance 1-minute data: predict whether price crosses an upward log-return barrier within the next `M=20` minutes (one decision interval).
 
 ---
 
@@ -38,7 +36,7 @@
 ## 0. Technical Executive Summary
 
 ### Project Purpose and Scope
-This repository implements an offline machine-learning pipeline that converts Binance 1-minute BTCUSDT market data into a supervised dataset and a calibrated probability model. At discrete **decision boundaries** spaced `M=10` minutes apart, the task is to estimate the probability that the price will realize an **upward barrier crossing** within the next decision interval. Formally, at decision index `k` we observe a feature snapshot `x_k` built only from information available up to the boundary time, and we predict `p(y_k=1 | x_k)` where `y_k` indicates whether the maximum future log return over the next `M` 1-minute bars exceeds a fixed barrier `phi`.
+This repository implements an offline machine-learning pipeline that converts Binance 1-minute BTCUSDT market data into a supervised dataset and a calibrated probability model. At discrete **decision boundaries** spaced `M=20` minutes apart, the task is to estimate the probability that the price will realize an **upward barrier crossing** within the next decision interval. Formally, at decision index `k` we observe a feature snapshot `x_k` built only from information available up to the boundary time, and we predict `p(y_k=1 | x_k)` where `y_k` indicates whether the maximum future log return over the next `M` 1-minute bars exceeds a fixed barrier `phi`. The 2026-05-11 refactor also supports **1-minute cadence labels** (`bar_stride=1`) with overlapping prediction windows; see Section 6.9.
 
 The primary use case is short-horizon probability forecasting for trading decision support and market regime analysis (e.g., risk-on/risk-off). The deliverables are designed for reproducible research: validated raw parquet(s), a fully materialized model dataset with an explicit feature contract, a trained CatBoost model artifact, and a complete evaluation bundle (metrics + plots) produced under a strict no-peeking protocol.
 
@@ -63,7 +61,7 @@ Binance public ZIPs (spot + optional derivatives)
 ```
 
 ### Key Design Decisions
-- **Decision cadence matches horizon:** A decision boundary every `M=10` minutes yields one label per 10-minute interval and makes the horizon explicit.
+- **Decision cadence matches horizon (legacy):** Boundary mode (`bar_stride=M`) places one decision every `M=20` minutes and yields one non-overlapping label per 20-minute interval. **1-minute cadence (`bar_stride=1`)** generates one label per bar with M-overlapping prediction windows; the canonical pipeline now runs in 1-minute mode and applies purged splits + label-uniqueness weights to handle the overlap (Section 6.9).
 - **Barrier label:** Define `m_k = max_{j=1..M} log(P_{n_k+j}/P_{n_k})` and `y_k = 1[m_k >= phi]` with a fixed global barrier `phi = C + ETA` (constants in Appendix B).
 - **No-lookahead invariant:** Features at boundary `k` use bars `<= n_k` only; the label uses bars `n_k+1..n_k+M` only; past-target features use only matured labels `<= k-1`.
 - **Warmup trimming:** Drop early boundaries where any lookback window, lag, or block statistic is structurally undefined (`k < K_WARMUP`).
@@ -131,14 +129,14 @@ The project follows a strict four-phase offline workflow:
 **Dependencies:** Sections 5–7 (time indexing, labels, features) and Appendix B (constants).  
 **Implementation Location:** `notebooks/02_feature_building.ipynb` (label creation) and `src/utils.py::construct_labels()`.
 
-Train and evaluate a CatBoost classifier to predict whether price will cross an upward barrier within a 10-minute horizon. The workflow is strictly offline: download data → build features/labels → train → evaluate.
+Train and evaluate a CatBoost classifier to predict whether price will cross an upward barrier within a 20-minute horizon. The workflow is strictly offline: download data → build features/labels → train → evaluate.
 
 **Target application:** Short-horizon probability forecasting for trading decision support.
 
 **Non-goals:** Online inference, production systems, real-time streaming, multi-asset portfolios.
 
 ### 2.1 Validation Criteria
-- The saved dataset contains `y` (binary) constructed exactly as in Section 6 with `M=10` and `phi=PHI` (Appendix B).
+- The saved dataset contains `y` (binary) constructed exactly as in Section 6 with `M=20` and `phi=PHI` (Appendix B).
 - `src/utils.py::checkpoint_labels()` passes on the boundary DataFrame.
 
 ---
@@ -509,7 +507,7 @@ After repair, `validate_klines()` must report zero gaps. The count of filled bar
 ## 5. Time Indexing
 
 ### 5.0 Overview
-**Purpose:** Define the two-cadence indexing system (1-minute bars vs 10-minute decision boundaries) and the boundary observation rule that enforces causality.  
+**Purpose:** Define the two-cadence indexing system (1-minute bars vs 20-minute decision boundaries) and the boundary observation rule that enforces causality. Section 6.9 covers the 1-minute overlapping-label cadence used by the current pipeline.  
 **Scope:** Index definitions (`n`, `k`, `n_k = k*M`) and the constraint that feature snapshots only use information available at the boundary.  
 **Dependencies:** Section 4 (timestamp normalization) and Appendix B (`M`).  
 **Implementation Location:** `notebooks/02_feature_building.ipynb` (boundary sampling) and `src/utils.py` helpers that assume the indexing convention.
@@ -519,8 +517,9 @@ After repair, `validate_klines()` must report zero gaps. The count of filled bar
 | Symbol | Definition | Default |
 |--------|------------|---------|
 | `Δ_f` | Monitoring cadence | 1 minute |
-| `M` | Decision multiplier | 10 |
-| `Δ_h` | Decision cadence: `Δ_h = M × Δ_f` | 10 minutes |
+| `M` | Decision multiplier | 20 |
+| `Δ_h` | Decision cadence (boundary mode): `Δ_h = M × Δ_f` | 20 minutes |
+| `bar_stride` | Label cadence (rows between consecutive labels) | 1 (default) or `M` (boundary mode) |
 | `n` | Monitoring bar index ∈ {0, 1, 2, ...} | — |
 | `k` | Decision boundary index ∈ {0, 1, 2, ...} | — |
 | `n_k` | Monitoring index at boundary k: `n_k = k × M` | — |
@@ -612,6 +611,71 @@ That is, `y_k = 1` if the maximum return over the horizon meets or exceeds the b
 - For any boundary with sufficient future data, `y_k = 1[m_k >= phi]` and `tau_k` is in `{1, ?, M}` when `y_k=1`, otherwise `NaN`.
 - The final boundary (and any boundary without a full future horizon) has `y=NaN` and is dropped during Stage 9 warmup/label trimming.
 - `src/utils.py::checkpoint_labels()` passes with `phi=PHI` (Appendix B).
+
+### 6.9 1-Minute Overlapping-Target Cadence (canonical from 2026-05-11)
+
+Sections 6.1–6.7 describe the original **boundary cadence**: one label every
+`M=20` bars, no overlap between adjacent prediction windows. The 2026-05-11
+refactor replaced the canonical pipeline with **1-minute cadence + overlapping
+labels** to recover the 20× sample-size loss while preserving every causality
+invariant. Both modes coexist through a single ``bar_stride`` parameter.
+
+**Cadence selector** (canonical implementation: `src/features/boundary.py:construct_labels_pl`):
+
+- `bar_stride = 1` (default) — labels at every 1-minute bar; prediction
+  windows `[n+1, n+M]` overlap by `M-1` bars.
+- `bar_stride = M` — legacy boundary cadence (non-overlapping); reproduces
+  Section 6.5 exactly.
+
+**Barrier source** (`barrier_source ∈ {"close", "high"}`):
+
+- `"close"` — `m_k = max_{j=1..M} ln(close_{n+j} / close_n)` (the spec
+  default; OHLC-free).
+- `"high"` — `m_k = max_{j=1..M} ln(high_{n+j} / close_n)`; matches
+  intra-bar barrier-hit semantics used in production-style triple-barrier
+  labelling. Adopted as the canonical source on 1-min cadence.
+
+**Label-uniqueness weights** (canonical implementation: `src/analytics/sampling.py`):
+
+Overlapping windows make adjacent labels redundant — an `M`-bar monotonic
+move contributes `M` near-identical rows. Each sample receives a weight
+
+```
+u_i = (1 / |I_i|) * sum_{l in I_i} 1 / c_l        I_i = [i+1, i+M]
+                                                  c_l = #{i : l ∈ I_i}
+```
+
+so isolated events get weight ≈ 1 and fully redundant samples get
+≈ 1/M. CatBoost is fed these as `sample_weight`.
+
+**Purged chronological splits + embargo** (`src/analytics/sampling.py`):
+
+Train rows whose label intervals overlap the validation/test intervals
+are dropped, plus an `M`-row embargo after each fold's end. See
+López de Prado, *Advances in Financial Machine Learning*, Ch. 7.
+
+**Block bootstrap for CI bands** (canonical implementation: `src/analytics/bootstrap.py`):
+
+Bootstrap confidence intervals are computed with a circular-block
+resampler (`block_size ≈ M`) so adjacent label dependence does not
+under-state variance. The unit tests in
+`tests/analytics/test_block_bootstrap_propagation.py` certify that
+block-bootstrap CIs are wider than IID CIs on autocorrelated streams.
+
+**Simulator ordering** (canonical implementation: `src/strategy/simulator.py`):
+
+The order-by-order backtest walks 1-min bars chronologically: at each
+boundary it resolves elapsed TP/SL within the just-closed M-bar window
+**before** evaluating the strategy's entry gates and sizer. Causality
+invariant: every decision uses only data observable at or before the
+boundary close; `y_k` only enters the ledger after the position closes.
+
+**Cluster-aware sizing** (`src/strategy/policy.py`):
+
+Because consecutive boundaries can open positions whose horizons
+overlap, the spec's sizer treats a run of consecutive entries as a
+single *cluster*, applies the per-cluster risk cap, and accumulates
+cluster P&L for the diagnostics in `src/strategy/diagnostics.py`.
 
 ---
 
@@ -717,7 +781,7 @@ L_f = [
 ]
 ```
 
-**Decision-scale windows (blocks = 10 minutes each):**
+**Decision-scale windows (blocks = 20 minutes each):**
 ```python
 W_h = [2, 3, 6, 12, 24, 36, 72, 144]
 ```
@@ -1404,9 +1468,9 @@ cos_dow = np.cos(2 * π * day_of_week / 7)
 
 **Total: 4 features**
 
-### 7.18 Group I: Decision-Block Features (10-minute scale)
+### 7.18 Group I: Decision-Block Features (20-minute scale)
 
-Block definition: `B_k = {n_{k-1} + 1, ..., n_k}` (M = 10 bars)
+Block definition: `B_k = {n_{k-1} + 1, ..., n_k}` (M = 20 bars)
 
 **Block aggregates:**
 ```python
@@ -1745,7 +1809,7 @@ def get_imputation_value(
 W_f_max = max(W_f)  # 1440
 L_f_max = max(L_f)  # 20
 W_h_max = max(W_h)  # 144 blocks
-M = 10
+M = 20
 
 n_warmup = max(
     W_f_max - 1,           # 1439 (for rolling windows)
@@ -1827,7 +1891,7 @@ Executed in `notebooks/03_model_training.ipynb` after splitting.
 **Purpose:** Define how chronological splits and embargo are applied, including walk-forward CV behavior used for (optional) HPO.  
 **Scope:** Splitting happens only in `03_model_training.ipynb` on the fully built dataset; no random shuffling is permitted.  
 **Dependencies:** Sections 5–6 (horizon timing), Section 12.4 (feature column contract), Appendix B (TRAIN_FRAC, VAL_FRAC, EMBARGO_K, N_CV_FOLDS).  
-**Implementation Location:** `src/utils.py::chronological_split_with_embargo()`, `src/utils.py::walk_forward_cv()`, `notebooks/03_model_training.ipynb`.
+**Implementation Location:** `src/utils.py::chronological_split_with_embargo()`, `notebooks/03_train_model.ipynb`. (`walk_forward_cv` was removed 2026-07-10 with the retired HPO path; Section 9.5 is historical.)
 
 **IMPORTANT:** The train/val/test split is performed in `03_model_training.ipynb`, NOT in `02_feature_building.ipynb`.
 
@@ -2045,7 +2109,7 @@ If you disable sample weights, you may experiment with CatBoost class weighting 
 **Purpose:** Define the metrics and plots required to evaluate probability quality, discrimination, and calibration on held-out data.  
 **Scope:** Metrics computed on validation and test splits only; regime stratification uses a fixed, feature-derived signal (not model-derived).  
 **Dependencies:** Section 9 (splits) and Section 12 (required output files).  
-**Implementation Location:** `src/utils.py::compute_all_metrics()`, `src/utils.py::expected_calibration_error()`, `src/utils.py::calibration_by_regime()`, `src/utils.py::threshold_analysis()`, `notebooks/03_model_training.ipynb`.
+**Implementation Location:** `src/utils.py::compute_all_metrics()`, `src/utils.py::expected_calibration_error()`, `src/analytics/` (metrics, curves, edge — the block-bootstrap successors of the retired `calibration_by_regime`/`threshold_analysis` helpers), `notebooks/03_train_model.ipynb`.
 
 ### 11.1 Probability Quality (Proper Scoring Rules)
 
@@ -2403,7 +2467,7 @@ def stability_selection(df, feature_cols, n_folds=4, importance_threshold=0.001)
 - **Section 6 (labels):** `construct_labels()`.
 - **Section 7 (features):** `compute_base_series()` plus the family of `compute_*` feature builders (spot Groups A?Q; derivatives Groups R?V in Appendix E).
 - **Section 8 (missingness):** `get_imputation_value()`, `create_undef_flags_and_impute()`.
-- **Section 9 (splits):** `chronological_split_with_embargo()`, `walk_forward_cv()`.
+- **Section 9 (splits):** `chronological_split_with_embargo()` (+ purged splits in `src/analytics/sampling.py`).
 - **Section 10 (model config):** CatBoost/Optuna orchestration lives in `notebooks/03_model_training.ipynb`; fixed defaults and ranges live in Appendix B (`CB_FIXED_PARAMS`, `CB_HP_RANGES`).
 - **Section W (weights):** `compute_training_weights()`, `compute_barrier_distance_weight()`, `compute_time_discount_weight()`, `checkpoint_weights()`.
 
@@ -2476,7 +2540,7 @@ END_YEAR, END_MONTH = 2025, 11
 # =============================================================================
 
 # Decision multiplier: decision every M 1-minute bars
-M = 10
+M = 20
 
 # =============================================================================
 # Label construction (log-return units)
