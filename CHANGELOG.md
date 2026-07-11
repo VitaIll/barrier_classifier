@@ -1,3 +1,43 @@
+## 2026-07-11 — Data source as an external service; residual sweep; real-data verification
+
+The market-data feed is now a fully separate service from the trading
+engine, verified behavior-identical on real BTC data.
+
+- **`src/data/` — the external feed service.** `FeedStore` (durable
+  SQLite/WAL, one writer + cross-process readers, idempotent
+  `INSERT OR IGNORE` append), `FeedWriter` (drives any producer into the
+  store, backfills the gap on restart so nothing is lost). The Binance
+  DATA adapter (`BinanceClient`, `BinanceKlineSource`, `klines_to_frame`)
+  MOVED here from `src/engine/` — the engine package now holds zero
+  market-data acquisition code. The execution broker
+  (`BinanceBroker` + filters) stays in the engine (placing orders is the
+  engine's job) and imports the shared REST client from `src.data`.
+- **`src.engine.sources.FeedSource`** — the engine's consumer of the
+  feed store: bootstraps from persisted history, tails newly-appended
+  bars, `idle_timeout` ends a silent-feed session cleanly. The engine and
+  feed are separate processes sharing ONLY the store file — the engine
+  can restart/upgrade while bars keep landing.
+- **CLI**: `python -m src.engine feed` runs the data service (Binance →
+  store; no credentials, public data); `python -m src.engine live` now
+  CONSUMES `--feed` (the engine no longer connects to Binance for data,
+  only the broker connects, for orders).
+- **Residual sweep**: removed 9 genuinely-dead functions from
+  `utils.py` (348 lines: superseded checkpoint/save helpers, verified
+  unreferenced by src, tests, AND notebooks via reference scan — the
+  data-acquisition + notebook-facing functions were kept); deleted the
+  three orphaned pre-engine simulator aliases; fixed a stale doc-comment.
+- **Real-data verification** (both PASS on the local BTC artifacts):
+  `scripts/validate_engine_replay.py` — the full refactored stack still
+  reproduces the research cache exactly (74,613/74,613 predictions
+  bit-exact, 287 trades identical, +4.4549%); new
+  `scripts/validate_feed_chain.py` — the external feed topology
+  (`FeedStore → FeedSource`, bars arriving live from a producer thread)
+  produces byte-identical predictions to the in-process `ReplaySource`
+  (8/8 exact) — data-source isolation is behavior-preserving.
+- 7 new feed-service tests (store idempotency/tail/since, writer
+  backfill-resume without gap, Binance-poller→store→FeedSource chain on
+  realistic payloads, idle-timeout) + adapter-test import updates.
+
 ## 2026-07-11 — Live trading: Binance adapter, execution containment, production ops
 
 The engine's two ports get their exchange implementations, and the

@@ -22,7 +22,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Iterator, Optional, Protocol, runtime_checkable
+from typing import Iterator, Optional, Protocol, runtime_checkable  # noqa: F401
 
 import numpy as np
 import pandas as pd
@@ -222,6 +222,61 @@ class ReplaySource:
             elapsed = time.monotonic() - t0
             if elapsed < interval:
                 time.sleep(interval - elapsed)
+
+
+class FeedSource:
+    """Consume bars from an external feed store — the engine's live input.
+
+    The engine and the data feed are SEPARATE processes with no shared
+    state but the store (docs/PRODUCTION.md): a :class:`~src.data.feed.FeedWriter`
+    process appends closed bars; this source tails them. The engine can
+    restart while the feed keeps running — resume tails from the last bar
+    it consumed, losing nothing.
+
+    ``bootstrap(n)`` reads the trailing ``n`` rows the writer already
+    persisted; ``stream()`` polls the store for newly-appended bars every
+    ``poll_seconds``. Any producer behind the store works — the engine
+    cannot tell Binance from a replay.
+    """
+
+    def __init__(
+        self,
+        feed_store,
+        *,
+        poll_seconds: float = 2.0,
+        idle_timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self._store = feed_store
+        self._poll_seconds = float(poll_seconds)
+        self._idle_timeout = idle_timeout_seconds
+        self._last_ts: Optional[pd.Timestamp] = None
+        self._closed = threading.Event()
+
+    def bootstrap(self, n_rows: int) -> pd.DataFrame:
+        frame = self._store.read_tail(n_rows)
+        if not frame.empty:
+            self._last_ts = frame.index[-1]
+        return frame
+
+    def close(self) -> None:
+        self._closed.set()
+
+    def stream(self) -> Iterator[MarketUpdate]:
+        idle = 0.0
+        while not self._closed.is_set():
+            batch = self._store.read_since(self._last_ts)
+            if batch.empty:
+                idle += self._poll_seconds
+                if self._idle_timeout is not None and idle >= self._idle_timeout:
+                    return  # feed went silent past the tolerance — end session
+                self._closed.wait(self._poll_seconds)
+                continue
+            idle = 0.0
+            for update in _frame_to_updates(batch, with_deriv=False):
+                if self._closed.is_set():
+                    return
+                self._last_ts = update.bar.ts
+                yield update
 
 
 class CallbackSource:

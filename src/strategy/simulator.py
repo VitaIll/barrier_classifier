@@ -211,12 +211,6 @@ def get_intra_bars(
     return PathIndex(raw_bars).span(ts_after, ts_through)
 
 
-# Backwards-compatible aliases (pre-engine private names).
-_get_intra_bars = get_intra_bars
-_resolve_intra_path_exits = resolve_intra_path_exits
-_resolve_expiries = resolve_expiries
-
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------

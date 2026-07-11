@@ -14,16 +14,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import src.engine.binance as bz
+import src.data.binance as bz
 from src.engine.alerts import NullAlerter, WebhookAlerter
-from src.engine.binance import (
-    BinanceBroker,
-    BinanceClient,
-    BinanceKlineSource,
-    ReconcileReport,
-    SymbolFilters,
-    klines_to_frame,
-)
+from src.data.binance import BinanceClient, BinanceKlineSource, klines_to_frame
+from src.engine.binance import BinanceBroker, ReconcileReport, SymbolFilters
 from src.engine.errors import ConfigError, ExchangeError, ExecutionError
 from src.strategy.inventory import Position, close_position
 

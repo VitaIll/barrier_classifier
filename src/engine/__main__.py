@@ -24,7 +24,7 @@ from src.engine.engine import Engine, EngineConfig
 from src.engine.errors import EngineError
 from src.engine.model import ModelRegistry
 from src.engine.retrain import RetrainPolicy
-from src.engine.sources import ReplaySource
+from src.engine.sources import FeedSource, ReplaySource
 from src.engine.store import SQLiteStore
 
 logger = logging.getLogger("src.engine.cli")
@@ -122,20 +122,53 @@ def _cmd_replay(args: argparse.Namespace, feature_mode: str) -> int:
     return 0
 
 
-def _cmd_live(args: argparse.Namespace) -> int:
-    """Live trading against Binance spot (testnet by default; dry-run by
-    default). The three safety gates must be crossed EXPLICITLY:
-    ``--mainnet`` leaves the testnet, ``--execute`` disables dry-run, and
-    credentials come from BINANCE_API_KEY / BINANCE_API_SECRET."""
-    from src.engine.binance import BinanceBroker, BinanceClient, BinanceKlineSource
+def _cmd_feed(args: argparse.Namespace) -> int:
+    """Run the DATA FEED service: pull closed bars from Binance into a
+    durable feed store. Runs as its own process; the engine consumes the
+    store. No credentials needed (public market data)."""
+    from src.data.binance import BinanceClient, BinanceKlineSource
+    from src.data.feed import FeedStore, FeedWriter, install_graceful_stop
 
-    cfg = _build_config(args, feature_mode="rolling")
-    cfg.alert_webhook_url = args.alert_webhook or cfg.alert_webhook_url
-    cfg.validate()
     client = BinanceClient(testnet=not args.mainnet)
     source = BinanceKlineSource(
         client, symbol=args.symbol, poll_seconds=args.poll_seconds
     )
+    store = FeedStore(args.feed)
+    store.set_meta("symbol", args.symbol)
+    store.set_meta("network", "mainnet" if args.mainnet else "testnet")
+    writer = FeedWriter(source, store, backfill_rows=args.backfill_rows)
+    install_graceful_stop(writer)
+    logger.warning(
+        "feed service: %s %s -> %s",
+        "MAINNET" if args.mainnet else "TESTNET", args.symbol, args.feed,
+    )
+    try:
+        n = writer.run(max_bars=args.max_bars)
+    finally:
+        store.close()
+    print(f"feed writer appended {n} streamed bar(s); store now holds {FeedStore(args.feed, read_only=True).count()} bars")
+    return 0
+
+
+def _cmd_live(args: argparse.Namespace) -> int:
+    """Live trading: CONSUME an external feed store, EXECUTE on Binance.
+
+    The engine reads bars from the feed store (fed by a separate
+    ``feed`` process) — it holds no market-data connection. The broker
+    independently connects to Binance to place orders. Safety gates on
+    execution are unchanged: ``--mainnet`` + ``--execute`` + env creds."""
+    from src.data.feed import FeedStore
+    from src.engine.binance import BinanceBroker, BinanceClient
+
+    cfg = _build_config(args, feature_mode="rolling")
+    cfg.alert_webhook_url = args.alert_webhook or cfg.alert_webhook_url
+    cfg.validate()
+    feed_store = FeedStore(args.feed, read_only=True)
+    source = FeedSource(
+        feed_store, poll_seconds=args.poll_seconds,
+        idle_timeout_seconds=args.idle_timeout,
+    )
+    client = BinanceClient(testnet=not args.mainnet)
     broker = BinanceBroker(
         client=client, symbol=args.symbol,
         trade_capital=args.trade_capital, dry_run=not args.execute,
@@ -144,16 +177,21 @@ def _cmd_live(args: argparse.Namespace) -> int:
         f"{'MAINNET' if args.mainnet else 'TESTNET'}/"
         f"{'EXECUTE' if args.execute else 'DRY-RUN'}"
     )
-    logger.warning("live session starting: %s %s capital=%.2f",
-                   mode, args.symbol, args.trade_capital)
+    logger.warning(
+        "live session: %s %s capital=%.2f  (data <- %s)",
+        mode, args.symbol, args.trade_capital, args.feed,
+    )
     _install_graceful_stop()
-    with Engine(cfg, source=source, broker=broker) as engine:
-        try:
-            report = engine.run(max_bars=args.max_bars)
-        except KeyboardInterrupt:
-            source.close()
-            logger.warning("interrupted — store drained; restart with --resume to continue")
-            return 130
+    try:
+        with Engine(cfg, source=source, broker=broker) as engine:
+            try:
+                report = engine.run(max_bars=args.max_bars)
+            except KeyboardInterrupt:
+                source.close()
+                logger.warning("interrupted — store drained; restart with --resume")
+                return 130
+    finally:
+        feed_store.close()
     print()
     print(report.summary())
     return 0
@@ -194,16 +232,32 @@ def main(argv: list[str] | None = None) -> int:
     p_run = sub.add_parser("run", help="simulated stream through the rolling live path")
     _add_common(p_run)
 
+    p_feed = sub.add_parser(
+        "feed", help="DATA FEED service: Binance bars -> durable feed store"
+    )
+    p_feed.add_argument("--feed", type=Path, default=Path("runtime/feed.db"),
+                        help="feed store path (the engine consumes this)")
+    p_feed.add_argument("--symbol", default="BTCUSDT")
+    p_feed.add_argument("--poll-seconds", type=float, default=2.0)
+    p_feed.add_argument("--backfill-rows", type=int, default=50_000)
+    p_feed.add_argument("--mainnet", action="store_true")
+    p_feed.add_argument("--max-bars", type=int, default=None)
+    p_feed.add_argument("-v", "--verbose", action="store_true")
+
     p_live = sub.add_parser(
-        "live", help="live Binance stream (testnet+dry-run by default)"
+        "live", help="live trading: consume a feed store, execute on Binance"
     )
     _add_common(p_live)
+    p_live.add_argument("--feed", type=Path, default=Path("runtime/feed.db"),
+                        help="feed store to consume (run `feed` to populate it)")
     p_live.add_argument("--symbol", default="BTCUSDT")
     p_live.add_argument("--trade-capital", type=float, default=10_000.0,
                         help="quote units mapped to the strategy's size fractions")
     p_live.add_argument("--poll-seconds", type=float, default=2.0)
+    p_live.add_argument("--idle-timeout", type=float, default=None,
+                        help="end the session if the feed is silent this long (s)")
     p_live.add_argument("--mainnet", action="store_true",
-                        help="target api.binance.com instead of the testnet")
+                        help="broker targets api.binance.com instead of testnet")
     p_live.add_argument("--execute", action="store_true",
                         help="disable dry-run: actually send orders")
     p_live.add_argument("--alert-webhook", default=None,
@@ -225,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_replay(args, feature_mode="batch")
         if args.command == "run":
             return _cmd_replay(args, feature_mode="rolling")
+        if args.command == "feed":
+            return _cmd_feed(args)
         if args.command == "live":
             return _cmd_live(args)
         if args.command == "status":

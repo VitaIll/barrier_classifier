@@ -239,7 +239,7 @@ def test_realized_pnl_matches_handcomputed_for_single_trade():
     ``entry * exp(+phi)``, the position closes at ``tp_price = entry *
     exp(+phi)`` exactly — NOT at the bar's high. See
     ``policy.exit_tp_or_expiry`` (path-walk branch sets
-    ``exit_price = pos.tp_price`` in ``simulator._resolve_intra_path_exits``).
+    ``exit_price = pos.tp_price`` in ``step.resolve_intra_path_exits``).
     This matches the high-source training label: the label fires on
     intrabar-high crossing the +phi barrier and assumes a limit-order
     fill at the barrier, not market-order fill at the bar's high.

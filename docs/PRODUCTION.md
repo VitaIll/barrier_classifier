@@ -22,32 +22,55 @@ limits) → dry-run on mainnet (real market data, no orders) → execute on
 mainnet. **Never skip the testnet-execute rung** — it is the only place
 the full order path is exercised without capital at risk.
 
-## 2. Bring-up
+## 2. Topology — two processes
+
+Data acquisition and trading are **separate processes** that share only a
+durable feed store (SQLite/WAL):
+
+```
+[ feed process ]  Binance --> BinanceKlineSource --> FeedWriter --> feed.db
+                                                                      |
+[ engine process ] feed.db --> FeedSource --> Engine --> BinanceBroker --> orders
+```
+
+The engine holds no market-data connection; it consumes bars from the
+store. The feed process holds no credentials (public data) and no engine
+state. Either can restart independently — bars keep landing while the
+engine is down; resume tails the feed from where it stopped.
+
+## 3. Bring-up
 
 ```bash
 # 0. Once: research artifacts -> model registry (v0001 + ACTIVE pointer)
 python -m src.engine import-model --dataset-dir data/model_dataset
 
-# 1. Replay validation on real history (bit-parity vs the research cache)
+# 1. Verify on real history: research-cache parity + feed-topology parity
 python scripts/validate_engine_replay.py
+python scripts/validate_feed_chain.py
 
-# 2. Testnet, dry-run (default posture): observe decisions, no orders sent
-python -m src.engine live --store runtime/live.db \
+# 2. Start the DATA FEED (its own process/terminal; public data, no keys)
+python -m src.engine feed --feed runtime/feed.db
+
+# 3. Trade — testnet, dry-run (default): consume the feed, no orders sent
+python -m src.engine live --feed runtime/feed.db --store runtime/live.db \
     --alert-webhook https://hooks.slack.com/services/...
 
-# 3. Testnet, executing:
+# 4. Testnet, executing:
 BINANCE_API_KEY=... BINANCE_API_SECRET=... \
-python -m src.engine live --execute --trade-capital 10000 --store runtime/live.db
+python -m src.engine live --feed runtime/feed.db --execute \
+    --trade-capital 10000 --store runtime/live.db
 
-# 4. Mainnet (after the ladder): add --mainnet; start SMALL trade-capital.
+# 5. Mainnet (after the ladder): add --mainnet to BOTH feed and live;
+#    start SMALL trade-capital.
 ```
 
-Startup mechanics: the source REST-backfills the 40,320-bar buffer
-(~28 days, ~30 paginated kline requests), then polls for closed candles
-every `--poll-seconds` (default 2s). First prediction fires when the
-warmup guard is satisfied. Per-bar compute is ~18s features + ~3ms
-predict against a 60s bar interval — ~40s headroom; a bar arriving while
-the previous one is processing is caught up by the source's gap backfill.
+Startup mechanics: the FEED process REST-backfills history into the store
+(~30 paginated kline requests to fill the buffer window) then polls for
+closed candles every `--poll-seconds`. The ENGINE bootstraps its buffer
+from the store and tails new bars. First prediction fires when the warmup
+guard is satisfied. Per-bar compute is ~18s features + ~3ms predict
+against a 60s bar interval — ~40s headroom; if the engine falls behind,
+`FeedSource` catches up from the store (bars are durable, never lost).
 
 `--trade-capital` maps strategy size fractions to money: the production
 spec's 0.02 lots × 50 max concurrent = 100% of trade-capital deployed at
@@ -59,7 +82,7 @@ Set the account-level kill-switch unless you deliberately want
 research-faithful unlimited drawdown: in the TOML config,
 `max_drawdown = 0.05` (log-return units) and/or `max_cumulative_loss`.
 
-## 3. What runs in parallel
+## 4. What runs in parallel
 
 - **Trading loop** (main thread): bar → features → predict → decide →
   execute → persist. Crash-safe: every bar's state is flushed to the
@@ -76,7 +99,7 @@ research-faithful unlimited drawdown: in the TOML config,
   headroom absorbs contention. A failed or rejected retrain NEVER touches
   the serving model — you get an alert and the incumbent keeps trading.
 
-## 4. Monitoring
+## 5. Monitoring
 
 - **Alerts** (`--alert-webhook`, Slack-compatible JSON): `halt`
   (kill-switch or feature-error streak), `execution_failure`
@@ -94,7 +117,7 @@ research-faithful unlimited drawdown: in the TOML config,
   retrain `gate_rejected` streaks (regime drift — consider widening the
   training window or investigating features).
 
-## 5. Failure modes and recovery
+## 6. Failure modes and recovery
 
 **Process crash / host reboot.** Restart with `--resume` and the same
 `--store`. The engine restores open positions, realized P&L, and
@@ -130,14 +153,14 @@ regressions, the compatibility check rejects serving drift, and
 activation is an atomic pointer swap. To roll back manually: stop,
 repoint `models/ACTIVE` to the previous version, restart with `--resume`.
 
-## 6. Upgrades
+## 7. Upgrades
 
 Stop the process (SIGINT — graceful: store drained), deploy code, run the
 full test suite (`pytest --all`), restart with `--resume`. The hot-swap
 compatibility check also protects across restarts: a model incompatible
 with the running configuration refuses to serve.
 
-## 7. Residual-risk register (read before arming)
+## 8. Residual-risk register (read before arming)
 
 Explicitly NOT eliminated by software, in decreasing order of teeth:
 
@@ -162,7 +185,7 @@ Explicitly NOT eliminated by software, in decreasing order of teeth:
 6. **Clock skew.** Signed requests tolerate `recvWindow` (5s); keep NTP
    on the host.
 
-## 8. Full-suite gate
+## 9. Full-suite gate
 
 Everything above sits on 1,100+ tests: live≡offline ledger parity by
 construction, serve≡train feature parity, resume≡uninterrupted equality,

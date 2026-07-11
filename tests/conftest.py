@@ -76,6 +76,8 @@ _THEME_BY_PATH: dict[str, str] = {
     "weights/test_blocks.py": "weights",
     # market (bar-series domain)
     "market/test_bars.py": "market",
+    # data (external feed service)
+    "data/test_feed.py": "data",
     # features_pipeline
     "features/test_boundary.py": "features_pipeline",
     "features/test_quality.py": "features_pipeline",
