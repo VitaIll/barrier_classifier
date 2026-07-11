@@ -107,6 +107,7 @@ _THEME_BY_PATH: dict[str, str] = {
     "engine/test_store.py": "engine",
     "engine/test_registry.py": "engine",
     "engine/test_parity_simulator.py": "engine",
+    "engine/test_hardening.py": "engine",
     "engine/test_feature_inference.py": "engine_slow",
     "engine/test_engine_e2e.py": "engine_slow",
 }
