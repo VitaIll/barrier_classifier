@@ -563,6 +563,19 @@ def make_exit_let_winners_run_monotonic(
         p_max_per_position.pop(position.k_entry, None)
         return "tp_market"
 
+    def _on_position_closed(closed) -> None:
+        """Release per-position state for ANY close path.
+
+        The policy's own pops above only cover exits it returns itself
+        ("expiry", "tp_market"). Bulk-close and SL paths close positions
+        WITHOUT consulting the exit policy, which used to leak their
+        ``p_max`` entries forever. The BoundaryStep calls this hook for
+        every ClosedPosition; ``k_entry`` is unique per run, so releasing
+        an already-popped key is a no-op.
+        """
+        p_max_per_position.pop(closed.k_entry, None)
+
+    exit_let_winners_run_monotonic.on_position_closed = _on_position_closed
     return exit_let_winners_run_monotonic
 
 

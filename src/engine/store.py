@@ -447,9 +447,16 @@ class SQLiteStore:
         start: Optional[pd.Timestamp] = None,
         end: Optional[pd.Timestamp] = None,
         *,
+        with_synthetic: bool = False,
         conn: Optional[sqlite3.Connection] = None,
     ) -> pd.DataFrame:
-        """Spot bars as a tz-aware pipeline-ready frame (retraining input)."""
+        """Spot bars as a tz-aware pipeline-ready frame (retraining input).
+
+        ``with_synthetic=True`` keeps the ``synthetic`` flag column (1 for
+        gap-repair bars fabricated by the grid guard). Consumers that train
+        on this frame need it — a fabricated flat bar must not become a
+        training row indistinguishable from real data.
+        """
         q = "SELECT * FROM bars"
         clauses, params = [], []
         if start is not None:
@@ -466,6 +473,8 @@ class SQLiteStore:
             return pd.DataFrame()
         frame.index = _from_ms(frame.pop("ts_ms"))
         frame.index.name = "ts"
+        if with_synthetic:
+            return frame
         return frame.drop(columns=["synthetic"])
 
     def trades_frame(self) -> pd.DataFrame:

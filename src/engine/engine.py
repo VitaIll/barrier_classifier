@@ -283,7 +283,9 @@ class Engine:
         def _frame_provider(window_rows: Optional[int]) -> pd.DataFrame:
             conn = self.store.read_connection()
             try:
-                frame = self.store.bars_frame(conn=conn)
+                # Keep the synthetic flag: the retrain job excludes labeled
+                # rows whose entry bar was fabricated by gap repair.
+                frame = self.store.bars_frame(conn=conn, with_synthetic=True)
             finally:
                 if conn is not self.store._conn:  # noqa: SLF001 — :memory: shares
                     conn.close()
@@ -351,7 +353,7 @@ class Engine:
         """
         realized = self.store.last_realized_cum()
         if realized is not None:
-            self.trader.realized_cum = float(realized)
+            self.trader.restore_realized(float(realized))
         self._next_trade_id = self.store.max_trade_id() + 1
         peak = self.store.max_total_equity()
         if peak is not None:

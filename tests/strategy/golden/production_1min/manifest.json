@@ -1,0 +1,13 @@
+{
+  "scenario": "production_1min",
+  "spec": "golden_production_1min",
+  "n_boundaries": 6000,
+  "n_closed": 55,
+  "n_clusters": 9,
+  "realized_cum_final": 0.002033784700418156,
+  "exit_reason_counts": {
+    "tp_market": 55
+  },
+  "numpy": "1.26.4",
+  "pandas": "2.2.3"
+}

@@ -1,0 +1,14 @@
+{
+  "scenario": "monotonic_bulk",
+  "spec": "golden_monotonic_bulk",
+  "n_boundaries": 800,
+  "n_closed": 86,
+  "n_clusters": 86,
+  "realized_cum_final": -0.002556691846700762,
+  "exit_reason_counts": {
+    "bulk_cluster_loss": 53,
+    "tp_market": 33
+  },
+  "numpy": "1.26.4",
+  "pandas": "2.2.3"
+}

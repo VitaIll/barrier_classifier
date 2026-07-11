@@ -12,14 +12,38 @@ at close time via ``ClosedPosition.net_log_return(cost)``.
 
 from __future__ import annotations
 
+import enum
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-import math
 import pandas as pd
 
 
-ExitReason = str  # "tp" | "sl" | "expiry" | "bulk_regime" | "bulk_unc" | "bulk_cluster_loss" | "bulk_drift"
+class ExitReason(enum.StrEnum):
+    """Closed vocabulary of position-exit reasons.
+
+    ``StrEnum`` members ARE strings (``ExitReason.TP == "tp"``), so ledgers,
+    parquet exports, groupbys, and JSON stay exactly as before — but an
+    unknown reason now fails loudly at :func:`close_position` instead of
+    silently flowing into reporting as a typo.
+
+    ``TP_OR_SL`` marks the ambiguous both-barriers-in-one-bar case; like
+    ``TP_MARKET`` it fills at bar close via the resolver's fallback branch.
+    Cluster *end* labels (``expiry_flat``, ``end_of_data``) are record
+    annotations on the cluster log, not position exits, and are not part
+    of this vocabulary.
+    """
+
+    TP = "tp"
+    SL = "sl"
+    TP_OR_SL = "tp_or_sl"
+    TP_MARKET = "tp_market"
+    EXPIRY = "expiry"
+    BULK_REGIME = "bulk_regime"
+    BULK_UNC = "bulk_unc"
+    BULK_CLUSTER_LOSS = "bulk_cluster_loss"
+    BULK_DRIFT = "bulk_drift"
 
 
 @dataclass(frozen=True)
@@ -105,11 +129,17 @@ def close_position(
     knowledge_unc_at_entry: float = float("nan"),
     regime_quantile_at_entry: float = float("nan"),
 ) -> ClosedPosition:
-    """Lift a ``Position`` to a ``ClosedPosition`` with realized P&L computed."""
+    """Lift a ``Position`` to a ``ClosedPosition`` with realized P&L computed.
+
+    ``exit_reason`` is normalized through :class:`ExitReason` — an unknown
+    reason string raises ``ValueError`` here, at the single choke point
+    every close path flows through.
+    """
     if not math.isfinite(exit_price) or exit_price <= 0:
         raise ValueError(f"exit_price must be finite and > 0; got {exit_price}")
     if k_exit < position.k_entry:
         raise ValueError(f"k_exit {k_exit} must be >= k_entry {position.k_entry}")
+    exit_reason = ExitReason(exit_reason)
     gross = float(position.side) * math.log(exit_price / position.entry_price)
     return ClosedPosition(
         k_entry=position.k_entry,
@@ -154,7 +184,14 @@ class Portfolio:
         knowledge_unc_at_entry: float = float("nan"),
         regime_quantile_at_entry: float = float("nan"),
     ) -> ClosedPosition:
-        if position not in self.open_positions:
+        # Identity-based membership: frozen-dataclass equality is all-field
+        # value equality, so `in`/`.remove` would silently match the FIRST
+        # positions with identical fields. The portfolio tracks objects, not
+        # values — find this exact instance in one scan.
+        idx = next(
+            (i for i, p in enumerate(self.open_positions) if p is position), None
+        )
+        if idx is None:
             raise ValueError("position not in open_positions")
         closed = close_position(
             position,
@@ -166,7 +203,7 @@ class Portfolio:
             knowledge_unc_at_entry=knowledge_unc_at_entry,
             regime_quantile_at_entry=regime_quantile_at_entry,
         )
-        self.open_positions.remove(position)
+        del self.open_positions[idx]
         self.closed_positions.append(closed)
         return closed
 

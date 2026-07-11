@@ -103,6 +103,8 @@ _THEME_BY_PATH: dict[str, str] = {
     "strategy/test_policy.py": "strategy",
     "strategy/test_reporting.py": "strategy",
     "strategy/test_simulator.py": "strategy",
+    "strategy/test_golden_ledgers.py": "strategy",
+    "strategy/test_definitions.py": "strategy",
     # engine (live engine)
     "engine/test_domain_buffer_guards.py": "engine",
     "engine/test_sources.py": "engine",
@@ -110,6 +112,7 @@ _THEME_BY_PATH: dict[str, str] = {
     "engine/test_registry.py": "engine",
     "engine/test_parity_simulator.py": "engine",
     "engine/test_hardening.py": "engine",
+    "engine/test_synthetic_exclusion.py": "engine",
     "engine/test_feature_inference.py": "engine_slow",
     "engine/test_engine_e2e.py": "engine_slow",
 }

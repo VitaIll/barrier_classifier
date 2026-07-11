@@ -27,6 +27,7 @@ would.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import traceback
@@ -35,6 +36,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+import polars as pl
 from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 
@@ -52,7 +54,29 @@ from src.features.pipeline import (
     run_pipeline,
 )
 
+logger = logging.getLogger("src.engine.retrain")
+
 _TRAIN_P_QUANTILE_LEVELS = (0.05, 0.10, 0.50, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95)
+
+
+def exclude_synthetic_rows(
+    ds: pl.DataFrame,
+    synthetic_ts: Optional[pd.DatetimeIndex],
+) -> tuple[pl.DataFrame, int]:
+    """Drop labeled rows whose entry bar timestamp is gap-repair synthetic.
+
+    ``ds`` is a pipeline output frame (tz-naive ``ts`` column);
+    ``synthetic_ts`` the (possibly tz-aware) fabricated-bar timestamps.
+    Feature values computed OVER synthetic bars are untouched — the grid
+    stays contiguous — only the training rows anchored ON them go.
+    """
+    if synthetic_ts is None or len(synthetic_ts) == 0 or ds.is_empty():
+        return ds, 0
+    syn = synthetic_ts.tz_localize(None) if synthetic_ts.tz is not None else synthetic_ts
+    mask = pl.col("ts").is_in(pl.Series("syn", syn.to_numpy()))
+    n_before = ds.height
+    out = ds.filter(~mask)
+    return out, n_before - out.height
 
 # The exact production training params (nb03): CB_FIXED_PARAMS backbone +
 # legacy best hyperparameters. ``iterations`` stays overridable — demo
@@ -93,6 +117,11 @@ class RetrainPolicy:
     every_bars: int = 7 * 1440              # event-time period between runs
     window_rows: Optional[int] = None        # None = everything the store has
     min_window_rows: int = 30 * 1440         # skip (recorded) if less history
+    # Exclude labeled rows whose ENTRY bar is a gap-repair synthetic bar.
+    # Features are still computed over the full contiguous grid (synthetic
+    # bars keep the grid whole), but a fabricated flat bar must not become
+    # a training example. False restores the pre-2026-07-11 behavior.
+    exclude_synthetic_bars: bool = True
     iterations: int = 2000
     top_q: float = 0.99
     embargo_rows: Optional[int] = None       # None = research default (60*M)
@@ -153,6 +182,17 @@ def run_retrain_job(
     if raw_frame.empty:
         return RetrainOutcome(status="skipped", notes="empty training window")
 
+    # The frame may carry the store's ``synthetic`` flag column. It must
+    # never reach the feature pipeline (it would surface as an undeclared
+    # feature and trip the contract check) — pop it here, remember which
+    # timestamps were fabricated.
+    synthetic_ts: Optional[pd.DatetimeIndex] = None
+    if "synthetic" in raw_frame.columns:
+        syn_mask = raw_frame["synthetic"].to_numpy() != 0
+        raw_frame = raw_frame.drop(columns=["synthetic"])
+        if policy.exclude_synthetic_bars and bool(syn_mask.any()):
+            synthetic_ts = raw_frame.index[syn_mask]
+
     anchor = contract.anchor
     first = raw_frame.index[0].tz_convert("UTC")
     off = int(round((first - anchor).total_seconds() / 60.0))
@@ -179,6 +219,19 @@ def run_retrain_job(
     )
     if ds.is_empty():
         return RetrainOutcome(status="skipped", notes="pipeline produced no labeled rows")
+    ds, n_synthetic_dropped = exclude_synthetic_rows(ds, synthetic_ts)
+    if n_synthetic_dropped:
+        logger.info(
+            "retrain: excluded %d labeled row(s) whose entry bar is a "
+            "gap-repair synthetic bar (%.3f%% of the window)",
+            n_synthetic_dropped,
+            100.0 * n_synthetic_dropped / (ds.height + n_synthetic_dropped),
+        )
+    if ds.is_empty():
+        return RetrainOutcome(
+            status="skipped",
+            notes="all labeled rows sit on synthetic gap-repair bars",
+        )
 
     # --- 2. Asymmetric barrier-distance weights (nb02 §4) -----------------
     m_k = ds["m_k"].to_numpy()

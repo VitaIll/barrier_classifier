@@ -1,20 +1,19 @@
 """Bar-by-bar honest backtest driver.
 
-Walks boundaries chronologically. At each boundary k:
+``simulate()`` is now a thin BATCH DRIVER over
+:class:`src.strategy.step.BoundaryStep` — the single implementation of the
+per-boundary sequence shared with the live trader (see step.py for the
+sequence and its causality contract). This module owns only what is
+batch-specific:
 
-1. Walk the M intra-horizon 1-min bars in ``(n_{k-1}, n_k]`` and resolve any
-   open position whose horizon ended in that window (TP / SL).
-2. Mark remaining inventory at ``close[n_k]`` and update online stats
-   (fast vol, regime quantile, MI quantile).
-3. Compose the decision-time ``State`` AFTER elapsed exits have resolved
-   — so the spec's gates and sizer see the post-resolution
-   ``n_open_positions`` and ``cluster_pnl`` rather than a stale snapshot.
-4. Evaluate the spec's ``bulk_close``; if it fires, flatten what survived
-   step 1 at ``close[n_k]``.
-5. Resolve expiry-by-time for any positions still open.
-6. Update cluster bookkeeping.
-7. Evaluate the spec's entry gates; if they pass, size the new lot, cap to
-   risk limits, and open a position at ``close[n_k]``.
+- column extraction from the decision cache (numpy, once — not per-row),
+- intra-path span lookup via :class:`~src.strategy.step.PathIndex`
+  (O(log n) per boundary instead of a full-frame mask),
+- the offline label-feedback convention: boundary ``k``'s label feeds the
+  monitoring stats (drift, regime base-rate) at row ``k`` — the live
+  driver feeds at label maturity instead (documented divergence; the
+  production spec consumes neither),
+- equity/cluster frame assembly into :class:`SimResult`.
 
 Causality: every decision uses only data observable at or before the
 boundary's close. No primitive reads ``y_k`` or any future price during
@@ -22,25 +21,40 @@ entry decision; ``y_k`` only affects the simulator after the position has
 closed (it's recorded into the closed-trade ledger for analytics).
 
 The simulator is a pure function: ``simulate(cache, raw_bars, spec) -> SimResult``.
+Behavior is pinned by tests/strategy/test_simulator.py (ordering, no-peek,
+hand-computed P&L) and tests/strategy/test_golden_ledgers.py (recorded
+ledger corpus).
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from src.strategy.inventory import ClosedPosition, Portfolio, Position
-from src.strategy.online import (
-    DriftADWIN,
-    FastVolEWMA,
-    RollingQuantileRank,
-    RollingRegimeBaseRate,
+from src.strategy.online import DriftADWIN, RollingRegimeBaseRate
+from src.strategy.policy import IntraBar, State, StrategySpec  # noqa: F401  (State re-exported)
+from src.strategy.step import (
+    BoundaryInputs,
+    BoundaryStep,
+    PathIndex,
+    TradingState,
+    resolve_expiries,
+    resolve_intra_path_exits,
 )
-from src.strategy.policy import IntraBar, RiskConfig, State, StrategySpec
+
+__all__ = [
+    "SimConfig",
+    "SimResult",
+    "simulate",
+    "get_intra_bars",
+    "resolve_intra_path_exits",
+    "resolve_expiries",
+    "filter_specs_by_diagnostics",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -59,9 +73,10 @@ class SimResult:
         One row per closed trade (output of ``Portfolio.closed_to_frame``).
     equity : pd.DataFrame
         Per-boundary realized + unrealized equity curve. Columns:
-        ``ts, k, realized_log_ret, unrealized_log_ret, equity, n_open,
-        gross_size, n_trades_closed, regime_quantile, p, mean_p_ve,
-        knowledge_unc, knowledge_unc_quantile``.
+        ``ts, k, realized_cum, unrealized, equity, n_open, gross_size,
+        n_trades_closed_step, n_trades_closed_cum, regime_quantile, p,
+        mean_p_ve, knowledge_unc, knowledge_unc_quantile, fast_sigma,
+        score, opened_this_step, bulk_close_reason``.
     cluster_log : pd.DataFrame
         One row per cluster (sequence of boundary entries + their exits),
         with cumulative P&L, n_entries, duration_boundaries, end_reason.
@@ -119,7 +134,7 @@ def _bar_index_at_boundary(boundary_index_k: int, M: int, k_offset: int = 0) -> 
 
 
 # ---------------------------------------------------------------------------
-# Path-bar lookup
+# Path-bar lookup (legacy per-call API; the hot loop uses PathIndex)
 # ---------------------------------------------------------------------------
 
 
@@ -130,115 +145,13 @@ def get_intra_bars(
     ts_through: pd.Timestamp,
 ) -> list[IntraBar]:
     """Return the list of 1-min IntraBars with ``ts > ts_after`` and ``ts <= ts_through``,
-    in chronological order. ``raw_bars`` must be ts-indexed (UTC or naive)."""
-    if raw_bars.index.tz is not None:
-        # Strip tz for comparison consistency with cache (which has tz-naive ts)
-        idx = raw_bars.index.tz_localize(None)
-    else:
-        idx = raw_bars.index
-    after = pd.Timestamp(ts_after)
-    if after.tzinfo is not None:
-        after = after.tz_convert(None) if after.tz is not None else after.tz_localize(None)
-    thru = pd.Timestamp(ts_through)
-    if thru.tzinfo is not None:
-        thru = thru.tz_convert(None) if thru.tz is not None else thru.tz_localize(None)
-    mask = (idx > after) & (idx <= thru)
-    sub = raw_bars.loc[mask]
-    out: list[IntraBar] = []
-    for ts, row in sub.iterrows():
-        out.append(
-            IntraBar(
-                n=-1,  # bar index not needed at this layer
-                ts=pd.Timestamp(ts),
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-            )
-        )
-    return out
+    in chronological order. ``raw_bars`` must be ts-indexed (UTC or naive).
 
-
-# ---------------------------------------------------------------------------
-# Position resolution over a path
-# ---------------------------------------------------------------------------
-
-
-def resolve_intra_path_exits(
-    portfolio: Portfolio,
-    spec: StrategySpec,
-    *,
-    intra_bars: list[IntraBar],
-    k_now: int,
-    state_for_records: State,
-) -> list[ClosedPosition]:
-    """Phase 1 of exit resolution: walk path bars, close on TP/SL only.
-
-    Calls ``spec.exit_policy(pos, bar, k_now)`` for each intra-bar in
-    order; the first firing closes that position at the appropriate
-    barrier price. Positions that survive the path-walk stay open and
-    are dealt with by ``_resolve_expiries`` after bulk-close evaluation.
+    One-shot convenience API. ``simulate()`` builds a
+    :class:`~src.strategy.step.PathIndex` once and queries spans instead —
+    same semantics, O(log n) per boundary.
     """
-    closed: list[ClosedPosition] = []
-    for pos in list(portfolio.open_positions):
-        for bar in intra_bars:
-            r = spec.exit_policy(pos, bar, k_now)
-            if r is None:
-                continue
-            if r == "tp":
-                exit_price = pos.tp_price
-            elif r == "sl":
-                exit_price = pos.sl_price if pos.sl_price is not None else bar.close
-            else:
-                # Defensive: any other reason during path-walk uses bar close.
-                exit_price = bar.close
-            c = portfolio.close_one(
-                pos,
-                k_exit=k_now,
-                ts_exit=bar.ts,
-                exit_price=exit_price,
-                exit_reason=r,
-                p_at_entry=state_for_records.p,
-                knowledge_unc_at_entry=state_for_records.knowledge_unc,
-                regime_quantile_at_entry=state_for_records.regime_quantile,
-            )
-            closed.append(c)
-            break
-    return closed
-
-
-def resolve_expiries(
-    portfolio: Portfolio,
-    spec: StrategySpec,
-    *,
-    boundary_close_price: float,
-    k_now: int,
-    ts_now: pd.Timestamp,
-    state_for_records: State,
-) -> list[ClosedPosition]:
-    """Phase 2 of exit resolution: end-of-path expiry check.
-
-    Calls ``spec.exit_policy(pos, intra_bar=None, k_now)`` once per
-    open position. Closes any that return a non-None reason (typically
-    ``"expiry"``) at ``boundary_close_price``.
-    """
-    closed: list[ClosedPosition] = []
-    for pos in list(portfolio.open_positions):
-        r = spec.exit_policy(pos, None, k_now)
-        if r is None:
-            continue
-        c = portfolio.close_one(
-            pos,
-            k_exit=k_now,
-            ts_exit=ts_now,
-            exit_price=boundary_close_price,
-            exit_reason=r,
-            p_at_entry=state_for_records.p,
-            knowledge_unc_at_entry=state_for_records.knowledge_unc,
-            regime_quantile_at_entry=state_for_records.regime_quantile,
-        )
-        closed.append(c)
-    return closed
+    return PathIndex(raw_bars).span(ts_after, ts_through)
 
 
 # Backwards-compatible aliases (pre-engine private names).
@@ -250,6 +163,14 @@ _resolve_expiries = resolve_expiries
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
+
+def _column(
+    cache: pd.DataFrame, name: str, n: int, *, default: float = float("nan")
+) -> np.ndarray:
+    if name in cache.columns:
+        return cache[name].to_numpy(dtype=float)
+    return np.full(n, default)
 
 
 def simulate(
@@ -283,57 +204,42 @@ def simulate(
 
     cache = cache.sort_values("ts").reset_index(drop=True)
     has_ve = "mean_p_ve" in cache.columns and "knowledge_unc" in cache.columns
+    n = len(cache)
 
-    # --- streaming online stats ------------------------------------------------
-    regime_rank = RollingQuantileRank(
-        window=cfg.quantile_window, min_warmup=cfg.quantile_min_warmup
+    # --- columnar extraction (once, not per-row) ---------------------------
+    ts_index = pd.DatetimeIndex(cache["ts"])
+    k_arr = cache["k"].to_numpy()
+    p_arr = _column(cache, "p", n)
+    regime_arr = _column(cache, "regime", n)
+    phi_arr = _column(cache, "phi", n)
+    close_arr = _column(cache, "close", n)
+    high_arr = _column(cache, "high", n)
+    low_arr = _column(cache, "low", n)
+    y_arr = _column(cache, "y", n)
+    mean_p_ve_arr = _column(cache, "mean_p_ve", n) if has_ve else np.full(n, np.nan)
+    unc_arr = _column(cache, "knowledge_unc", n) if has_ve else np.full(n, np.nan)
+
+    # --- state + step + monitoring -----------------------------------------
+    st = TradingState.fresh(cfg)
+    base_rate = RollingRegimeBaseRate(
+        window=cfg.base_rate_window, n_bins=cfg.base_rate_n_bins
     )
-    score_rank = RollingQuantileRank(
-        window=cfg.quantile_window, min_warmup=cfg.quantile_min_warmup
-    )
-    unc_rank = RollingQuantileRank(
-        window=cfg.quantile_window, min_warmup=cfg.quantile_min_warmup
-    )
-    fast_vol = FastVolEWMA(
-        halflife_bars=cfg.fast_vol_halflife, min_warmup=cfg.fast_vol_min_warmup
-    )
-    base_rate = RollingRegimeBaseRate(window=cfg.base_rate_window, n_bins=cfg.base_rate_n_bins)
     drift = DriftADWIN()  # exposed via state via diagnostics; not consumed by v1 specs
-
-    portfolio = Portfolio()
     cost_per_trade = (
         cfg.cost_per_trade_override
         if cfg.cost_per_trade_override is not None
         else spec.risk.cost_per_trade
     )
-
-    # Cluster bookkeeping
-    cluster_id = 0
-    cluster_streak = 0
-    cluster_pnl = 0.0
-    cluster_open_id: Optional[int] = None
-    cluster_log_rows: list[dict] = []
-    cluster_entry_count = 0
-    cluster_start_ts: Optional[pd.Timestamp] = None
-    cluster_end_reason = ""
+    step = BoundaryStep(spec, cost_per_trade=cost_per_trade)
+    path = PathIndex(raw_bars)
 
     equity_rows: list[dict] = []
-    realized_cumulative = 0.0
+    empty_ve = np.empty(0)
 
-    prev_ts: Optional[pd.Timestamp] = None
-    prev_close: Optional[float] = None
-
-    n = len(cache)
     for i in range(n):
-        row = cache.iloc[i]
-        k = int(row["k"])
-        ts = pd.Timestamp(row["ts"])
-        p = float(row["p"])
-        regime_value = float(row["regime"])
-        phi = float(row["phi"])
-        bar_close = float(row["close"]) if "close" in cache.columns else float("nan")
-        bar_high = float(row["high"]) if "high" in cache.columns else float("nan")
-        bar_low = float(row["low"]) if "low" in cache.columns else float("nan")
+        k = int(k_arr[i])
+        ts = ts_index[i]
+        bar_close = float(close_arr[i])
         if math.isnan(bar_close):
             # Caller must augment the cache with boundary OHLC upfront via
             # ``augment_cache_with_boundary_ohlc`` — silent fallback to a
@@ -343,316 +249,79 @@ def simulate(
                 f"the cache with ``augment_cache_with_boundary_ohlc`` first"
             )
 
-        mean_p_ve = float(row["mean_p_ve"]) if has_ve else float("nan")
-        knowledge_unc = float(row["knowledge_unc"]) if has_ve else float("nan")
-        y = float(row["y"]) if "y" in cache.columns and not math.isnan(row.get("y", float("nan"))) else float("nan")
-
-        # ---- 1. Update online stats with current observations ---------------
-        # Causality: we update stats with values observable at close[n_k]
-        # BEFORE building the State that downstream gates read.
-        if prev_close is not None and prev_close > 0 and bar_close > 0:
-            log_ret = math.log(bar_close / prev_close)
-            fast_vol.update(log_ret)
-        regime_q = regime_rank.rank_and_update(regime_value)
-        unc_q = unc_rank.rank_and_update(knowledge_unc) if has_ve else float("nan")
-
-        # ---- 2. Resolve elapsed TP/SL exits BEFORE composing State ---------
-        # The docstring contract says exits over the (prev_ts, ts] path are
-        # resolved first, so that the State the strategy sees reflects
-        # post-resolution inventory and cluster PnL — not stale pre-exit
-        # values. This is still strictly causal: every exit uses only the
-        # intra-bar OHLC that finished before ts, and the State sees a
-        # snapshot of the world at ts that includes those resolutions.
-        if prev_ts is not None and portfolio.n_open() > 0:
-            intra_bars = get_intra_bars(raw_bars, ts_after=prev_ts, ts_through=ts)
-        else:
-            intra_bars = []
-        closed_this_step: list[ClosedPosition] = []
-        if intra_bars and portfolio.n_open() > 0:
-            # State-for-records uses a minimal sketch — we only need the
-            # diagnostic fields recorded on the closed-trade ledger.
-            sketch = State(
-                k=k, ts=ts, p=p, p_calibrated=p,
-                bar_close=bar_close, bar_high=bar_high, bar_low=bar_low,
-                regime_value=regime_value, regime_quantile=regime_q,
-                fast_sigma=fast_vol.value(),
-                n_open_positions=portfolio.n_open(),
-                cluster_pnl=0.0,
-                cluster_streak=cluster_streak,
-                mean_p_ve=mean_p_ve,
-                knowledge_unc=knowledge_unc,
-                knowledge_unc_quantile=unc_q,
-            )
-            closed_this_step.extend(
-                resolve_intra_path_exits(
-                    portfolio,
-                    spec,
-                    intra_bars=intra_bars,
-                    k_now=k,
-                    state_for_records=sketch,
-                )
-            )
-
-        # ---- 3. Pre-bulk State for bulk_close trigger ----------------------
-        # Bulk-close inspects post-elapsed-exit inventory but does NOT need to
-        # see the score (it's keyed on regime / unc / cluster P&L). Compose a
-        # minimal pre-bulk state for the bulk_close primitive only.
-        cluster_pnl_pre_bulk = (
-            sum(
-                pos.size * pos.mtm_log_return(bar_close)
-                for pos in portfolio.open_positions
-            )
-            if portfolio.n_open() > 0
-            else 0.0
+        intra_bars = (
+            path.span(st.prev_ts, ts)
+            if st.prev_ts is not None and st.portfolio.n_open() > 0
+            else []
         )
-        state_pre_bulk = State(
-            k=k,
-            ts=ts,
-            p=p,
-            p_calibrated=p,
-            bar_close=bar_close,
-            bar_high=bar_high,
-            bar_low=bar_low,
-            regime_value=regime_value,
-            regime_quantile=regime_q,
-            fast_sigma=fast_vol.value(),
-            n_open_positions=portfolio.n_open(),
-            cluster_pnl=cluster_pnl_pre_bulk,
-            cluster_streak=cluster_streak,
-            inventory_gross_size=portfolio.gross_size(),
-            mean_p_ve=mean_p_ve,
-            knowledge_unc=knowledge_unc,
-            knowledge_unc_quantile=unc_q,
-            p_ve_samples=(
-                np.asarray(p_ve_samples[i], dtype=float)
-                if p_ve_samples is not None
-                else np.empty(0)
+        outcome = step.run(
+            st,
+            BoundaryInputs(
+                k=k,
+                ts=ts,
+                p=float(p_arr[i]),
+                regime_value=float(regime_arr[i]),
+                phi=float(phi_arr[i]),
+                bar_close=bar_close,
+                bar_high=float(high_arr[i]),
+                bar_low=float(low_arr[i]),
+                intra_bars=intra_bars,
+                mean_p_ve=float(mean_p_ve_arr[i]),
+                knowledge_unc=float(unc_arr[i]),
+                p_ve_samples=(
+                    np.asarray(p_ve_samples[i], dtype=float)
+                    if p_ve_samples is not None
+                    else empty_ve
+                ),
             ),
         )
 
-        # ---- 4. Bulk-close trigger (pre-expiry; affects survivors) ---------
-        bulk_reason = spec.bulk_close(state_pre_bulk) if portfolio.n_open() > 0 else None
-        if bulk_reason is not None:
-            bulk_closed = portfolio.close_all(
-                k_exit=k, ts_exit=ts, exit_price=bar_close, exit_reason=bulk_reason
-            )
-            closed_this_step.extend(bulk_closed)
-
-        # ---- 5. Expiry-by-time for any positions still open ----------------
-        if portfolio.n_open() > 0:
-            closed_this_step.extend(
-                resolve_expiries(
-                    portfolio,
-                    spec,
-                    boundary_close_price=bar_close,
-                    k_now=k,
-                    ts_now=ts,
-                    state_for_records=state_pre_bulk,
-                )
-            )
-
-        # Accumulate realized P&L from any closes this step
-        if closed_this_step:
-            for c in closed_this_step:
-                realized_cumulative += c.weighted_net_log_return(cost_per_trade)
-
-        # ---- 6. Cluster bookkeeping -----------------------------------------
-        if portfolio.n_open() == 0:
-            # Cluster ended this step (or we're flat)
-            if cluster_open_id is not None:
-                cluster_log_rows.append(
-                    {
-                        "cluster_id": cluster_open_id,
-                        "ts_start": cluster_start_ts,
-                        "ts_end": ts,
-                        "n_entries": cluster_entry_count,
-                        "duration_boundaries": cluster_streak,
-                        "end_reason": (
-                            bulk_reason or
-                            (closed_this_step[-1].exit_reason if closed_this_step else "expiry_flat")
-                        ),
-                        "cluster_pnl": cluster_pnl,
-                    }
-                )
-                cluster_open_id = None
-                cluster_pnl = 0.0
-                cluster_entry_count = 0
-                cluster_streak = 0
-                cluster_start_ts = None
-        else:
-            # Streak continues while at least one position remains open
-            # after bulk_close + expiry at the current boundary. Reset
-            # to 1 when a fresh cluster opens (handled in the entry
-            # branch below — see ``cluster_streak = 1`` there).
-            cluster_streak += 1
-
-        # ---- 7. Compose entry-decision State (post-bulk, post-expiry) -------
-        # The gate/sizer must see the FINAL post-resolution inventory: after
-        # elapsed-path exits, bulk_close, and expiry have all fired. Rebuild
-        # State here rather than reuse state_pre_bulk so n_open_positions,
-        # cluster_pnl, inventory_gross_size, and cluster_streak all reflect
-        # the world entering the decision call.
-        cluster_pnl_at_decision = (
-            sum(
-                pos.size * pos.mtm_log_return(bar_close)
-                for pos in portfolio.open_positions
-            )
-            if portfolio.n_open() > 0
-            else 0.0
-        )
-        state_no_score = State(
-            k=k,
-            ts=ts,
-            p=p,
-            p_calibrated=p,
-            bar_close=bar_close,
-            bar_high=bar_high,
-            bar_low=bar_low,
-            regime_value=regime_value,
-            regime_quantile=regime_q,
-            fast_sigma=fast_vol.value(),
-            n_open_positions=portfolio.n_open(),
-            cluster_pnl=cluster_pnl_at_decision,
-            cluster_streak=cluster_streak,
-            inventory_gross_size=portfolio.gross_size(),
-            mean_p_ve=mean_p_ve,
-            knowledge_unc=knowledge_unc,
-            knowledge_unc_quantile=unc_q,
-            p_ve_samples=(
-                np.asarray(p_ve_samples[i], dtype=float)
-                if p_ve_samples is not None
-                else np.empty(0)
-            ),
-        )
-        s_score = float(spec.score_fn(state_no_score))
-        state = State(**{**vars(state_no_score), "score": s_score})
-        # Update score quantile (post-rank, in case future specs key off it)
-        score_rank.update(s_score)
-
-        # ---- 8. Entry decision ----------------------------------------------
-        opened = False
-        if (
-            spec.evaluate_entry(state)
-            and portfolio.n_open() < spec.risk.max_open_positions
-            and portfolio.gross_size() < spec.risk.max_gross_size
-            and bar_close > 0
-        ):
-            size = float(spec.sizer(state))
-            size = min(size, spec.risk.max_size_per_lot)
-            size = min(size, spec.risk.max_gross_size - portfolio.gross_size())
-            if size > 0:
-                # A non-finite phi would produce a NaN tp_price whose TP
-                # condition (high >= NaN) never fires — a silently corrupt
-                # position. Refuse loudly; the cache row is broken.
-                if not (math.isfinite(phi) and phi > 0):
-                    raise ValueError(
-                        f"entry at k={k} (ts={ts}) with non-finite or "
-                        f"non-positive phi={phi!r} — cache 'phi' column is "
-                        "corrupt; refusing to open a position with an "
-                        "undefined take-profit"
-                    )
-                tp_price = bar_close * math.exp(phi)  # long TP at +phi
-                # Per-position MTM floor → SL price (if configured in RiskConfig)
-                if spec.risk.position_mtm_floor_log_return is not None:
-                    sl_price = bar_close * math.exp(
-                        float(spec.risk.position_mtm_floor_log_return)
-                    )
-                else:
-                    sl_price = None
-                position = Position(
-                    k_entry=k,
-                    ts_entry=ts,
-                    side=1,
-                    size=size,
-                    entry_price=bar_close,
-                    tp_price=tp_price,
-                    sl_price=sl_price,
-                    # Horizon comes from RiskConfig; default 1 = label-aligned;
-                    # higher = patient wait-for-TP. Bulk-close triggers still
-                    # apply across the longer horizon.
-                    expiry_k=k + int(spec.risk.max_horizon_boundaries),
-                )
-                portfolio.open_one(position)
-                opened = True
-                if cluster_open_id is None:
-                    cluster_open_id = cluster_id
-                    cluster_id += 1
-                    cluster_start_ts = ts
-                    cluster_streak = 1
-                cluster_entry_count += 1
-
-        # Update cluster_pnl tally (counts realized closes during the cluster)
-        if cluster_open_id is not None and closed_this_step:
-            for c in closed_this_step:
-                cluster_pnl += c.weighted_net_log_return(cost_per_trade)
-
-        # ---- 9. Online label feedback (post-decision; drift + base-rate) ----
+        # ---- Offline label feedback (post-decision; drift + base-rate) ----
         # ``y`` is the LABEL of boundary k, which the spec did NOT see at
-        # decision time. We feed it AFTER the entry decision so that for
-        # ``score_residualized`` specs, the regime-conditional base rate
-        # used by the score at boundary k does NOT depend on y[k]. The
-        # label is only folded into the rolling accumulators consumed at
-        # boundary k+1 onwards — consistent with the "label available
-        # retrospectively, not at decision time" causality contract.
+        # decision time. Fed AFTER the entry decision so residualized-score
+        # specs never see y[k] in the base rate they consume at boundary k.
+        y = float(y_arr[i])
         if not math.isnan(y):
-            if not math.isnan(p):
-                drift.update(y - p)
-            if not math.isnan(regime_q):
-                base_rate.update(regime_q, y)
+            if not math.isnan(outcome.state.p):
+                drift.update(y - outcome.state.p)
+            if not math.isnan(outcome.regime_q):
+                base_rate.update(outcome.regime_q, y)
 
-        # ---- 10. Equity row -------------------------------------------------
+        # ---- Equity row -----------------------------------------------------
+        unrealized = (
+            st.portfolio.mtm_log_return(bar_close) if bar_close > 0 else 0.0
+        )
         equity_rows.append(
             {
                 "ts": ts,
                 "k": k,
-                "realized_cum": realized_cumulative,
-                "unrealized": (
-                    portfolio.mtm_log_return(bar_close) if bar_close > 0 else 0.0
-                ),
-                "equity": realized_cumulative + (
-                    portfolio.mtm_log_return(bar_close) if bar_close > 0 else 0.0
-                ),
-                "n_open": portfolio.n_open(),
-                "gross_size": portfolio.gross_size(),
-                "n_trades_closed_step": len(closed_this_step),
-                "n_trades_closed_cum": len(portfolio.closed_positions),
-                "regime_quantile": regime_q,
-                "p": p,
-                "mean_p_ve": mean_p_ve,
-                "knowledge_unc": knowledge_unc,
-                "knowledge_unc_quantile": unc_q,
-                "fast_sigma": fast_vol.value(),
-                "score": s_score,
-                "opened_this_step": opened,
-                "bulk_close_reason": bulk_reason,
+                "realized_cum": st.realized_cum,
+                "unrealized": unrealized,
+                "equity": st.realized_cum + unrealized,
+                "n_open": st.portfolio.n_open(),
+                "gross_size": st.portfolio.gross_size(),
+                "n_trades_closed_step": len(outcome.closed),
+                "n_trades_closed_cum": len(st.portfolio.closed_positions),
+                "regime_quantile": outcome.regime_q,
+                "p": float(p_arr[i]),
+                "mean_p_ve": float(mean_p_ve_arr[i]),
+                "knowledge_unc": float(unc_arr[i]),
+                "knowledge_unc_quantile": outcome.unc_q,
+                "fast_sigma": outcome.fast_sigma,
+                "score": outcome.score,
+                "opened_this_step": outcome.opened is not None,
+                "bulk_close_reason": outcome.bulk_reason,
             }
         )
-
-        prev_ts = ts
-        prev_close = bar_close
 
     # --- finalize: flush any open cluster --------------------------------------
-    if cluster_open_id is not None:
-        cluster_log_rows.append(
-            {
-                "cluster_id": cluster_open_id,
-                "ts_start": cluster_start_ts,
-                "ts_end": prev_ts,
-                "n_entries": cluster_entry_count,
-                "duration_boundaries": cluster_streak,
-                "end_reason": "end_of_data",
-                "cluster_pnl": cluster_pnl,
-            }
-        )
+    st.cluster.flush_end_of_data(st.prev_ts)
 
-    closed_df = portfolio.closed_to_frame()
-    equity_df = pd.DataFrame(equity_rows)
-    cluster_df = pd.DataFrame(cluster_log_rows)
     return SimResult(
         spec_name=spec.name,
-        closed=closed_df,
-        equity=equity_df,
-        cluster_log=cluster_df,
+        closed=st.portfolio.closed_to_frame(),
+        equity=pd.DataFrame(equity_rows),
+        cluster_log=pd.DataFrame(st.cluster.rows),
         diagnostics_used={r: True for r in spec.requires},
         config=vars(cfg).copy(),
     )

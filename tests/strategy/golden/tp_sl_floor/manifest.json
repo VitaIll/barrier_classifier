@@ -1,0 +1,14 @@
+{
+  "scenario": "tp_sl_floor",
+  "spec": "golden_tp_sl_floor",
+  "n_boundaries": 800,
+  "n_closed": 102,
+  "n_clusters": 60,
+  "realized_cum_final": -0.018149999999999205,
+  "exit_reason_counts": {
+    "tp": 52,
+    "sl": 50
+  },
+  "numpy": "1.26.4",
+  "pandas": "2.2.3"
+}
