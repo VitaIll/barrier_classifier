@@ -157,11 +157,24 @@ class BinanceBroker:
             client_id=client_id,
             params={"quoteOrderQty": f"{quote_amount.normalize():f}"},
         )
+        status = str(result.get("status", ""))
         executed_qty = Decimal(str(result.get("executedQty", "0")))
         quote_spent = Decimal(str(result.get("cummulativeQuoteQty", "0")))
-        if executed_qty <= 0:
+        if status in ("REJECTED", "EXPIRED", "CANCELED") or executed_qty <= 0:
             raise ExecutionError(
-                f"entry order {client_id} reported zero executed quantity: {result}"
+                f"entry order {client_id} not filled (status={status!r}, "
+                f"executedQty={executed_qty}): {result}"
+            )
+        if status == "PARTIALLY_FILLED":
+            # A market entry that only partially filled means the desk holds
+            # less than the strategy assumes. Record the ACTUAL quantity (so
+            # the close sells exactly what was bought) and warn — the ledger
+            # position size stays the strategy's, slippage/shortfall surfaces
+            # in the reconcile.
+            logger.warning(
+                "entry %s partially filled: %s of intended (status=%s) — "
+                "recording actual quantity for the close",
+                client_id, executed_qty, status,
             )
         self._qty_by_position[key] = executed_qty
         fill_price = float(quote_spent / executed_qty)
@@ -205,8 +218,24 @@ class BinanceBroker:
             side="SELL", client_id=client_id,
             params={"quantity": f"{qty.normalize():f}"},
         )
+        status = str(result.get("status", ""))
         executed_qty = Decimal(str(result.get("executedQty", "0")))
         quote_got = Decimal(str(result.get("cummulativeQuoteQty", "0")))
+        # A close that did not fully liquidate leaves base on the exchange
+        # the ledger thinks is flat — a divergence the engine must act on
+        # (halt + reconcile), never a silent partial.
+        if status in ("REJECTED", "EXPIRED", "CANCELED") or executed_qty <= 0:
+            raise ExecutionError(
+                f"close order {client_id} not filled (status={status!r}, "
+                f"executedQty={executed_qty}): {result}"
+            )
+        shortfall = qty - executed_qty
+        if shortfall > (self.filters.step_size if self.filters else Decimal("0")):
+            raise ExecutionError(
+                f"close order {client_id} under-filled: sold {executed_qty} of "
+                f"{qty} (status={status!r}) — {shortfall} base remains on the "
+                "exchange; ledger/exchange divergence"
+            )
         fill_price = (
             float(quote_got / executed_qty) if executed_qty > 0 else closed.exit_price
         )

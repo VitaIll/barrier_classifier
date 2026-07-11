@@ -777,8 +777,8 @@ def _compute_block_features_1min(
     H = high_s.rolling(M, min_periods=M).max().to_numpy()
     L = low_s.rolling(M, min_periods=M).min().to_numpy()
     V = volume_s.rolling(M, min_periods=M).sum().to_numpy()
-    Q = qvol_s.rolling(M, min_periods=M).sum().to_numpy()
-    Ntr = ntr_s.rolling(M, min_periods=M).sum().to_numpy()
+    qvol_s.rolling(M, min_periods=M).sum().to_numpy()
+    ntr_s.rolling(M, min_periods=M).sum().to_numpy()
     VTB = tbb_s.rolling(M, min_periods=M).sum().to_numpy()
 
     # ret_inst[n] = log(close[n] / close[n-M])

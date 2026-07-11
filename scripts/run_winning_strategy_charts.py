@@ -35,7 +35,6 @@ import seaborn as sns
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import utils  # noqa: E402
 from src.analytics.thresholds import derive_top_q_threshold  # noqa: E402
 from src.strategy.baseline import COST_PER_TRADE, compute_btc_buy_and_hold  # noqa: E402
 from src.features.config import M as M_CFG, PHI as PHI_CFG  # noqa: E402
@@ -263,7 +262,8 @@ def reconstruct_composition(eq_df, closed_df, raw_bars_df, bin_edges, n_bins):
     for _, tr in closed_df.iterrows():
         i0 = int(eq_idx_local.searchsorted(tr["ts_entry"], side="right") - 1)
         i1 = int(eq_idx_local.searchsorted(tr["ts_exit"], side="right") - 1)
-        i0 = max(0, i0); i1 = min(n - 1, i1)
+        i0 = max(0, i0)
+        i1 = min(n - 1, i1)
         if i1 < i0:
             continue
         ep = float(tr["entry_price"])
@@ -437,7 +437,8 @@ if len(closed) > 0:
         i0 = int(np.searchsorted(raw_idx_local, np.datetime64(t0), side="left"))
         i1 = int(np.searchsorted(raw_idx_local, np.datetime64(t1), side="right"))
         if i1 <= i0:
-            ax.axis("off"); continue
+            ax.axis("off")
+            continue
         win_idx = raw_idx_local[i0:i1]
         win_close = raw_close_arr[i0:i1]
         ax.plot(win_idx, win_close, color="#34495e", linewidth=0.7)

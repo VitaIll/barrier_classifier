@@ -1,0 +1,32 @@
+# Static-analysis gate. Institution-grade posture: block on real defects,
+# not subjective style. The selected rules catch undefined names, unused
+# imports/variables, redefinitions, comparison/boolean bugs, mutable
+# defaults, and syntax errors — the classes that hide actual bugs.
+
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = [
+    "F",      # pyflakes: undefined names, unused imports/vars, redefinitions
+    "E7",     # pycodestyle statement errors (== None, bare except placement)
+    "E9",     # syntax errors
+    "B",      # flake8-bugbear: mutable defaults, misuse of builtins, etc.
+    "PLE",    # pylint errors (genuine bugs only)
+]
+ignore = [
+    # Single-char math names (l = long window, I, O) are pervasive and
+    # intentional in the quant math; renaming them harms readability.
+    "E741",
+    # bugbear: zip() without strict= is fine for our known-aligned frames.
+    "B905",
+    # bugbear: raise-without-from inside except is acceptable where the
+    # cause is deliberately suppressed with a clear message.
+    "B904",
+]
+
+[lint.per-file-ignores]
+# Scripts and notebooks establish sys.path before importing src — the
+# E402 (import-not-at-top) is the correct pattern there, not a defect.
+"scripts/*" = ["E402"]
+"src/utils.py" = ["E402"]  # legacy god-module; retires in the notebook migration

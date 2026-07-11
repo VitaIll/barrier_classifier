@@ -127,6 +127,12 @@ CREATE TABLE IF NOT EXISTS model_versions (
     metrics_json TEXT,
     thresholds_json TEXT
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_ts_ms INTEGER NOT NULL,
+    git_sha TEXT,
+    config_json TEXT
+);
 CREATE TABLE IF NOT EXISTS retrain_runs (
     run_id INTEGER PRIMARY KEY AUTOINCREMENT,
     trigger_ts_ms INTEGER NOT NULL,
@@ -477,6 +483,22 @@ class SQLiteStore:
             return frame
         return frame.drop(columns=["synthetic"])
 
+    def record_session(
+        self, started_ts: pd.Timestamp, *, git_sha: str, config_json: str
+    ) -> int:
+        """Audit provenance: WHICH code and configuration ran this session.
+
+        One row per engine start (including resumes) — the answer to
+        "what exactly was trading at 03:12 on the 14th" is a join away.
+        """
+        cur = self._conn.execute(
+            "INSERT INTO sessions (started_ts_ms, git_sha, config_json) "
+            "VALUES (?, ?, ?)",
+            (_ms(started_ts), git_sha, config_json),
+        )
+        self._conn.commit()
+        return int(cur.lastrowid)
+
     def trades_frame(self) -> pd.DataFrame:
         self.flush()
         frame = pd.read_sql_query("SELECT * FROM trades ORDER BY ts_exit_ms", self._conn)
@@ -497,7 +519,7 @@ class SQLiteStore:
         out = {}
         for table in ("bars", "predictions", "decisions", "trades", "equity",
                       "labels", "guard_events", "model_versions", "retrain_runs",
-                      "open_positions"):
+                      "open_positions", "sessions"):
             out[table] = int(
                 self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             )

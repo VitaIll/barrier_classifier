@@ -44,7 +44,7 @@ import pandas as pd
 from scipy import stats
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, iid_indices
+from .bootstrap import DEFAULT_CI, BootstrapResult
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def causal_feature_audit(feature_list: Sequence[str]) -> CausalAuditResult:
     causal: List[str] = []
     unmatched: List[str] = []
     for f in feats:
-        lower = f.lower()
+        f.lower()
         is_suspect = (
             SUSPECT_SUFFIX_LITERAL in f
             or SUSPECT_TOKEN_PATTERN.search(f) is not None

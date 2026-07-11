@@ -390,7 +390,7 @@ def plot_hit_rate_heatmap_2d(
         ax.text(0.5, 0.5, "no cells", ha="center", va="center", transform=ax.transAxes)
         return ax
     pivot = df.pivot(index="p_bin", columns="unc_bin", values="hit_rate")
-    n_pivot = df.pivot(index="p_bin", columns="unc_bin", values="n")
+    df.pivot(index="p_bin", columns="unc_bin", values="n")
     sns.heatmap(
         pivot,
         annot=annotate,

@@ -51,6 +51,7 @@ from src.engine.features import (
 from src.engine.guards import BarSchemaGuard, GridGuard, WarmupGuard
 from src.engine.model import ModelHandle, ModelRegistry
 from src.engine.retrain import Retrainer, RetrainPolicy
+from src.engine.risk import EntryControls, EntryGovernor
 from src.engine.sources import DataSource, ReplaySource
 from src.engine.store import SQLiteStore
 from src.engine.strategy import LiveProbFeed, LiveTrader, make_live_production_spec
@@ -94,6 +95,12 @@ class EngineConfig:
     # Retraining
     retrain: RetrainPolicy = field(default_factory=lambda: RetrainPolicy(enabled=False))
     retrain_threaded: bool = True
+    # Pre-trade entry controls (institutional gate) — ON by default;
+    # disabling any limit is the deliberate act. Exits are never gated.
+    entry_controls: EntryControls = field(default_factory=EntryControls)
+    # Periodic ledger-vs-exchange reconciliation cadence (bars). Runs only
+    # when the broker exposes reconcile(); alerts on mismatch. None = off.
+    reconcile_every_bars: Optional[int] = 1_440
     # Operational alerting: POST JSON to this webhook on halt / execution
     # failure / reconcile mismatch / retrain outcomes. None = log-only.
     alert_webhook_url: Optional[str] = None
@@ -258,6 +265,8 @@ class Engine:
             if config.alert_webhook_url
             else NullAlerter()
         )
+        self.governor = EntryGovernor(config.entry_controls)
+        self._prev_bar_close: Optional[float] = None
         self.broker: Broker = broker or PaperBroker(
             next_order_id=self.store.max_order_id() + 1
         )
@@ -452,6 +461,7 @@ class Engine:
     # ------------------------------------------------------------------ #
 
     def run(self, *, max_bars: Optional[int] = None) -> SessionReport:
+        self._record_session_provenance()
         self._bootstrap()
         try:
             for update in self.source.stream():
@@ -471,6 +481,26 @@ class Engine:
             return self._finish()
         finally:
             self.store.flush()
+
+    def _record_session_provenance(self) -> None:
+        """Audit: stamp WHICH code (git sha) + configuration ran this
+        session, so any trade in the ledger is traceable to a build and a
+        config. Best-effort — a provenance failure must not stop trading."""
+        import dataclasses
+        import json as _json
+
+        from src.utils import get_git_sha
+
+        try:
+            cfg = dataclasses.asdict(self.config)
+            cfg = {k: str(v) for k, v in cfg.items()}  # paths/dataclasses -> str
+            self.store.record_session(
+                pd.Timestamp.now(tz="UTC"),
+                git_sha=get_git_sha(),
+                config_json=_json.dumps(cfg, sort_keys=True),
+            )
+        except Exception as exc:  # provenance is audit, not control flow
+            logger.warning("session provenance not recorded: %s", exc)
 
     def _bootstrap(self) -> None:
         need = self.buffer.capacity
@@ -599,6 +629,26 @@ class Engine:
             self._emit(EventType.PREDICTION_MADE, pred)
 
         allow_entry = not degraded and not self._halted
+        if allow_entry:
+            pre_equity = self.trader.realized_cum + (
+                self.trader.portfolio.mtm_log_return(float(bar.close))
+                if float(bar.close) > 0 and self.trader.portfolio.n_open() > 0
+                else 0.0
+            )
+            veto = self.governor.check_entry(
+                ts=bar.ts,
+                prev_close=self._prev_bar_close,
+                bar_close=float(bar.close),
+                total_equity=pre_equity,
+                entry_size=self.trader.spec.risk.max_size_per_lot,
+            )
+            if veto is not None:
+                allow_entry = False
+                self._sink(GuardEvent(
+                    ts=bar.ts, guard="entry_controls", severity="warning",
+                    message=f"entry vetoed: {veto}",
+                ))
+                logger.warning("entry vetoed at %s: %s", bar.ts, veto)
         result = self.trader.on_boundary(
             k=k, ts=bar.ts, p=p, bar=bar, regime_value=regime_value,
             phi=self.contract.phi, allow_entry=allow_entry,
@@ -667,6 +717,16 @@ class Engine:
 
         # Retraining (event-time), hot-swap on completion.
         self.retrainer.on_bar(bar.ts)
+        if result.opened is not None:
+            self.governor.record_entry(bar.ts)
+        self._prev_bar_close = float(bar.close)
+        if (
+            self.config.reconcile_every_bars is not None
+            and self._n_bars > 0
+            and self._n_bars % self.config.reconcile_every_bars == 0
+            and hasattr(self.broker, "reconcile")
+        ):
+            self._periodic_reconcile(bar.ts)
         self._poll_retrain(bar.ts)
 
         # Retention pruning (event-time, daily cadence).
@@ -758,6 +818,29 @@ class Engine:
         if self.batch_service is not None and new.feature_list != self.contract.feature_list:
             return "feature list changed; batch mode serves a precomputed matrix"
         return ""
+
+    def _periodic_reconcile(self, ts: pd.Timestamp) -> None:
+        """Scheduled ledger-vs-exchange check (institutions reconcile on a
+        cadence, not only at restart). Mismatch alerts; the operator
+        decides — automated flattening of an unexplained delta is how
+        small divergences become large ones."""
+        try:
+            report = self.broker.reconcile(
+                list(self.trader.portfolio.open_positions)
+            )
+        except Exception as exc:  # reconcile must never take the loop down
+            logger.warning("periodic reconcile failed: %s", exc)
+            return
+        if not report.ok:
+            msg = (
+                f"periodic reconcile mismatch: ledger {report.expected_base_qty:.8f}"
+                f" vs exchange {report.exchange_base_qty:.8f} "
+                f"(tol {report.tolerance:.8f})"
+            )
+            self._sink(GuardEvent(
+                ts=ts, guard="reconcile", severity="error", message=msg,
+            ))
+            self.alerter.send(level="error", event="reconcile", message=msg)
 
     def _execution_failure(self, ts: pd.Timestamp, intent: str, detail: str) -> None:
         """An order could not be executed: the ledger and the exchange have

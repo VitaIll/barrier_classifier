@@ -1,3 +1,44 @@
+## 2026-07-11 — Institutional hardening: pre-trade risk controls, order verification, audit, CI lint
+
+Closing the gap to an institutional production posture. What a
+technology/model-risk review would flag is now code-addressed; what only
+an organization can provide is documented (PRODUCTION.md §10), not
+pretended away.
+
+- **`src/engine/risk.py` — pre-trade entry controls, ON by default.**
+  `EntryGovernor` gates every entry before the boundary step opens (a
+  veto is a clean skip): daily entry budget (signal-storm guard), bar
+  dislocation collar (no market orders into a dislocated book), daily
+  loss stop (resumes next UTC day), per-order notional cap. Event-time
+  (UTC-day reset is deterministic under replay). `EntryControls.disabled()`
+  is the research-parity opt-out the replay/e2e harnesses use;
+  `--no-risk-controls` on the CLI. Vetoes logged as guard events.
+- **Order-status verification** (`BinanceBroker`): entries reject
+  EXPIRED/REJECTED/zero-fill and record the ACTUAL executed quantity on
+  partial fills (the close then sells exactly what was bought); a close
+  that under-fills (base left on the exchange) raises `ExecutionError` —
+  a divergence the engine halts on, never a silent partial.
+- **Session provenance** (`sessions` table + `store.record_session`):
+  every engine start stamps git sha + full config JSON, so any trade in
+  the ledger is traceable to a build and a configuration.
+- **Periodic reconciliation** (`reconcile_every_bars`, default daily):
+  ledger-vs-exchange balance check on a cadence, not only at resume;
+  mismatch alerts, operator decides (no automated flattening of an
+  unexplained delta).
+- **CI static-analysis gate**: `ruff.toml` selecting the real-defect rule
+  classes (undefined names, unused imports/vars, redefinitions, bugbear,
+  pylint-errors) — gates the build; found and fixed a genuine duplicate
+  `ExecutionError` class definition + removed dead locals/imports.
+  `.github/workflows/ci.yml` runs ruff before pytest.
+- **docs/PRODUCTION.md**: §8 pre-trade controls table, §10 the
+  organizational-requirements register (independent model validation,
+  second-line risk, dual-control change management, books-and-records
+  reconciliation, BCP, compliance) — the honest statement that the
+  software is production-grade and ready to run INSIDE a firm's control
+  framework, not a substitute for it.
+- New `tests/engine/test_risk_controls.py` + order-status tests
+  (EXPIRED/partial/under-fill) in the adapter suite.
+
 ## 2026-07-11 — Data source as an external service; residual sweep; real-data verification
 
 The market-data feed is now a fully separate service from the trading

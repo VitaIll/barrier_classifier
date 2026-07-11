@@ -32,13 +32,12 @@ strategies; override with the realized-return column for accurate EV.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, block_indices, iid_indices, choose_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, choose_indices
 from .curves import _interp_pr, _interp_roc
 from .degradation import wilson_interval
 
@@ -106,7 +105,7 @@ def _threshold_metrics(
     p_sorted = p[order]
     y_sorted = y[order]
     cum_tp = np.cumsum(y_sorted)
-    cum_n = np.arange(1, n + 1)
+    np.arange(1, n + 1)
     if r_realized is not None:
         r_sorted = r_realized[order]
         cum_realized_sum = np.cumsum(r_sorted)

@@ -55,7 +55,6 @@ def augment_cache_with_r_realized(
     if raw.index.tz is not None:
         raw.index = raw.index.tz_localize(None)
     raw = raw.sort_index()
-    raw_idx = raw.index
     raw_close = raw["close"].to_numpy(dtype=float)
 
     out = cache.copy()

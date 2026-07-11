@@ -118,7 +118,6 @@ def _coerce_expected_numeric(df_pl: pl.DataFrame) -> pl.DataFrame:
     cast_diagnostics: list[tuple[str, int]] = []
     for col in df_pl.columns:
         if col in expected_numeric and df_pl.schema[col] != pl.Float64:
-            src_dtype = df_pl.schema[col]
             n_null_before = int(df_pl[col].null_count())
             casts.append(pl.col(col).cast(pl.Float64, strict=False).alias(col))
             cast_diagnostics.append((col, n_null_before))

@@ -32,7 +32,6 @@ Plot helpers are lazy on matplotlib import.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -43,9 +42,7 @@ from .bootstrap import (
     DEFAULT_B,
     DEFAULT_CI,
     BootstrapResult,
-    block_indices,
     bootstrap_metric,
-    iid_indices,
     choose_indices,
     wilson_interval,
 )

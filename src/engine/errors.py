@@ -60,10 +60,6 @@ class RetrainError(EngineError):
     """
 
 
-class ExecutionError(EngineError):
-    """Broker rejected or failed an order in a non-recoverable way."""
-
-
 class ExchangeError(EngineError):
     """The exchange API rejected a request or the transport failed
     beyond the bounded retry policy (network, 5xx, rate-limit storms)."""

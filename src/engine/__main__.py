@@ -162,6 +162,10 @@ def _cmd_live(args: argparse.Namespace) -> int:
 
     cfg = _build_config(args, feature_mode="rolling")
     cfg.alert_webhook_url = args.alert_webhook or cfg.alert_webhook_url
+    if args.no_risk_controls:
+        from src.engine.risk import EntryControls
+        cfg.entry_controls = EntryControls.disabled()
+        logger.warning("PRE-TRADE RISK CONTROLS DISABLED (--no-risk-controls)")
     cfg.validate()
     feed_store = FeedStore(args.feed, read_only=True)
     source = FeedSource(
@@ -262,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="disable dry-run: actually send orders")
     p_live.add_argument("--alert-webhook", default=None,
                         help="POST operational alerts to this URL")
+    p_live.add_argument("--no-risk-controls", action="store_true",
+                        help="disable the pre-trade entry controls "
+                             "(research-faithful; NOT for production)")
 
     p_status = sub.add_parser("status", help="registry + store overview")
     p_status.add_argument("--model-dir", type=Path, default=Path("models"))

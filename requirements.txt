@@ -15,3 +15,4 @@ requests>=2.31
 tqdm>=4.66
 jupyter>=1.0
 pytest>=8.0
+ruff>=0.6

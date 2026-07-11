@@ -41,7 +41,7 @@ from sklearn.metrics import (
 
 from src.utils import expected_calibration_error
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, block_indices, iid_indices, choose_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, choose_indices
 
 
 # Shared resampling-precedence helper (was a local copy in this module).

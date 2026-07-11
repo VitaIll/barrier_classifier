@@ -7,6 +7,24 @@ on:
     branches: ["**"]
 
 jobs:
+  lint:
+    name: ruff (static analysis)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: python -m pip install ruff==0.6.9
+
+      - name: Lint src/ (error-class rules) — gate on real defects
+        run: ruff check src scripts --output-format=github
+
   test:
     name: pytest (Python 3.11)
     runs-on: ubuntu-latest

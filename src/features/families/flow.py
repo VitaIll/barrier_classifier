@@ -37,7 +37,7 @@ import polars as pl
 
 from src.features.base import Feature
 from src.features.config import EPS
-from src.features.primitives import rolling_sum, rolling_std_pop
+from src.features.primitives import rolling_sum
 
 
 class _FlowFeature(Feature):

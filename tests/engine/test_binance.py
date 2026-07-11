@@ -379,3 +379,51 @@ class TestAlerts:
         with caplog.at_level(logging.ERROR, logger="src.engine.alerts"):
             NullAlerter().send(level="error", event="halt", message="boom")
         assert any("ALERT" in r.message for r in caplog.records)
+
+
+class TestOrderStatusVerification:
+    """A live-money broker must verify fills, not assume them."""
+
+    def _broker(self, ft):
+        return BinanceBroker(
+            client=_client(ft), symbol="BTCUSDT", trade_capital=10_000.0,
+            dry_run=False, filters=FILTERS, session_tag="v",
+        )
+
+    def test_expired_entry_raises(self):
+        ft = FakeTransport()
+        ft.route("POST", "/api/v3/order", (200, {
+            "status": "EXPIRED", "executedQty": "0", "cummulativeQuoteQty": "0",
+        }))
+        with pytest.raises(ExecutionError, match="not filled"):
+            self._broker(ft).execute_entry(_position())
+
+    def test_partial_entry_records_actual_qty(self):
+        ft = FakeTransport()
+        ft.route("POST", "/api/v3/order", (200, {
+            "status": "PARTIALLY_FILLED", "executedQty": "0.00200000",
+            "cummulativeQuoteQty": "100.10",
+        }))
+        broker = self._broker(ft)
+        pos = _position()
+        broker.execute_entry(pos)
+        key = broker._position_key(pos.k_entry, pos.ts_entry)
+        # Records what was ACTUALLY bought, not the intended amount.
+        assert broker._qty_by_position[key] == __import__("decimal").Decimal("0.00200000")
+
+    def test_close_underfill_is_divergence(self):
+        ft = FakeTransport()
+        ft.route("POST", "/api/v3/order",
+                 (200, {"status": "FILLED", "executedQty": "0.00400000",
+                        "cummulativeQuoteQty": "200.20"}),
+                 (200, {"status": "PARTIALLY_FILLED", "executedQty": "0.00100000",
+                        "cummulativeQuoteQty": "50.00"}))
+        broker = self._broker(ft)
+        pos = _position()
+        broker.execute_entry(pos)
+        closed = close_position(
+            pos, k_exit=9, ts_exit=pos.ts_entry + pd.Timedelta(minutes=2),
+            exit_price=50_250.0, exit_reason="tp_market",
+        )
+        with pytest.raises(ExecutionError, match="under-filled"):
+            broker.execute_close(closed)

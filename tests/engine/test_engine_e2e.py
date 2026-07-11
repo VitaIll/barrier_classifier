@@ -98,10 +98,13 @@ def world(tmp_path_factory):
 def _config(world, tmp_path, **overrides) -> EngineConfig:
     n_total = len(world["raw"])
     buffer_rows = n_total + (20 - n_total % 20) % 20
+    from src.engine.risk import EntryControls
     cfg = EngineConfig(
         model_dir=world["registry_dir"],
         store_path=tmp_path / "engine.db",
         feature_mode="batch",
+        entry_controls=EntryControls.disabled(),  # research-parity: no gate
+        reconcile_every_bars=None,
         buffer_rows=buffer_rows,
         min_ready_rows=N_WARMUP + 1,
         log_every_bars=10_000,

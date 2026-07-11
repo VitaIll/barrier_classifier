@@ -102,9 +102,11 @@ def main() -> int:
     store_path = ROOT / "runtime" / f"backtest_{args.split}.db"
     for suffix in ("", "-wal", "-shm"):
         Path(str(store_path) + suffix).unlink(missing_ok=True)
+    from src.engine.risk import EntryControls
     cfg = EngineConfig(
         model_dir=MODEL_DIR, store_path=store_path, feature_mode="batch",
         cost_per_trade=cost, log_every_bars=20_000,
+        entry_controls=EntryControls.disabled(), reconcile_every_bars=None,
     )
     engine = Engine(cfg, source=ReplaySource(RAW_PATH, start=start, end=end))
     report = engine.run()

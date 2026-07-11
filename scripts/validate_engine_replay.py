@@ -46,6 +46,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from src.engine import Engine, EngineConfig, ModelRegistry, ReplaySource  # noqa: E402
+from src.engine.risk import EntryControls  # noqa: E402
 from src.engine.strategy import make_live_production_spec  # noqa: E402
 from src.strategy.cache import (  # noqa: E402
     augment_cache_with_boundary_ohlc,
@@ -107,6 +108,7 @@ def main() -> int:
     cfg = EngineConfig(
         model_dir=MODEL_DIR, store_path=STORE_PATH, feature_mode="batch",
         log_every_bars=20_000,
+        entry_controls=EntryControls.disabled(), reconcile_every_bars=None,
     )
     source = ReplaySource(RAW_PATH, start=start, end=end)
     engine = Engine(cfg, source=source)
@@ -194,6 +196,7 @@ def main() -> int:
         roll_store = ROOT / "runtime" / "validate_engine_rolling.db"
         roll_store.unlink(missing_ok=True)
         cfg_roll = EngineConfig(
+            entry_controls=EntryControls.disabled(), reconcile_every_bars=None,
             model_dir=MODEL_DIR, store_path=roll_store, feature_mode="rolling",
             log_every_bars=10_000,
         )

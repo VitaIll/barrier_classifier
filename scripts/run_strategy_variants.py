@@ -30,7 +30,6 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src import utils  # noqa: E402
 from src.analytics.thresholds import (  # noqa: E402
     derive_top_q_threshold,
 )

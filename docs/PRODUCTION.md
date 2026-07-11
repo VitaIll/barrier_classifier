@@ -160,7 +160,32 @@ full test suite (`pytest --all`), restart with `--resume`. The hot-swap
 compatibility check also protects across restarts: a model incompatible
 with the running configuration refuses to serve.
 
-## 8. Residual-risk register (read before arming)
+## 8. Pre-trade risk controls (institutional gate)
+
+Every entry signal is a REQUEST; the `EntryGovernor` decides whether the
+desk may act on it, checked before the boundary step opens (a veto is a
+clean skip — nothing sent, nothing to unwind) and re-enforced in the
+broker. **ON by default** (`EngineConfig.entry_controls`); disabling is
+the deliberate act (`--no-risk-controls`, or `EntryControls.disabled()`,
+which is what the research-parity harnesses use). Exits are never gated.
+
+| Control | Default | Guards against |
+|---|---|---|
+| `max_daily_entries` | 300 / UTC day | signal storm (model regression, feed loop) machine-gunning orders |
+| `max_bar_move` | 0.05 log-ret | market orders into a dislocated book the edge wasn't estimated on |
+| `max_daily_loss` | 0.10 log-ret | a bad day compounding — entries stop, resume next UTC day |
+| `max_entry_capital_frac` | 0.10 | fat-finger / config-error oversize |
+
+Plus the **account kill-switch** (`max_drawdown` / `max_cumulative_loss`,
+§3), which halts the whole session, and **periodic reconciliation**
+(`reconcile_every_bars`, default daily) comparing ledger exposure to the
+exchange balance — mismatch alerts, the operator decides.
+
+Vetoes are counted and logged as `entry_controls` guard events; the
+account audit trail (`sessions` table) records which git sha + config ran
+each session, so any trade is traceable to a build and a configuration.
+
+## 9. Residual-risk register (read before arming)
 
 Explicitly NOT eliminated by software, in decreasing order of teeth:
 
@@ -185,7 +210,44 @@ Explicitly NOT eliminated by software, in decreasing order of teeth:
 6. **Clock skew.** Signed requests tolerate `recvWindow` (5s); keep NTP
    on the host.
 
-## 9. Full-suite gate
+## 10. Organizational requirements no codebase can satisfy
+
+An institutional deployment ("would this pass at BlackRock") needs
+controls that live in the FIRM, not the repository. This code is built to
+slot into them, but they are your responsibility and cannot be shipped as
+software:
+
+- **Independent model validation.** A model-risk function separate from
+  the desk must review and sign off the strategy, the label definition,
+  the backtest methodology, and the selection-bias caveats (ENGINE.md
+  §10) before capital is committed. The parity tests prove the code
+  computes the researched model faithfully — they say nothing about
+  whether that model *should* trade.
+- **Independent risk oversight.** The pre-trade limits here are the
+  desk's own governor; an institution also requires a second-line risk
+  function that sets and monitors limits the desk cannot unilaterally
+  disable.
+- **Change management / dual control.** Deployments should require review
+  and a second approver; secrets belong in a managed vault with rotation,
+  not env vars on a host; production access should be logged and
+  least-privilege. The `sessions` provenance table supports an audit but
+  does not enforce the process.
+- **Segregation & reconciliation to books-and-records.** The store is the
+  engine's audit trail; an institution reconciles it to the firm's
+  official position/PNL systems and custody, not just to the exchange.
+- **Business continuity.** Redundant hosts/regions, a tested failover
+  runbook, and a manual kill procedure independent of this process.
+- **Regulatory & compliance.** Best-execution monitoring, market-abuse
+  surveillance, record retention, and jurisdiction-specific reporting.
+
+Bottom line: the software is production-*grade* — parity-verified,
+risk-gated, audited, statically checked, hermetically tested — and ready
+to run inside an institutional control framework. It is not a substitute
+for that framework. Bring it up on testnet, have model risk validate the
+strategy, and wire the firm's second-line controls around it before live
+capital.
+
+## 11. Full-suite gate
 
 Everything above sits on 1,100+ tests: live≡offline ledger parity by
 construction, serve≡train feature parity, resume≡uninterrupted equality,
