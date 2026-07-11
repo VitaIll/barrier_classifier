@@ -40,6 +40,8 @@ from src.engine.domain import (
 )
 from src.engine.errors import ConfigError, FeatureContractError
 from src.engine.execution import Broker, PaperBroker, trade_from_closed
+from src.engine.alerts import AlertSink, NullAlerter, WebhookAlerter
+from src.engine.errors import ExecutionError
 from src.engine.features import (
     BatchFeatureService,
     FeatureContract,
@@ -92,6 +94,9 @@ class EngineConfig:
     # Retraining
     retrain: RetrainPolicy = field(default_factory=lambda: RetrainPolicy(enabled=False))
     retrain_threaded: bool = True
+    # Operational alerting: POST JSON to this webhook on halt / execution
+    # failure / reconcile mismatch / retrain outcomes. None = log-only.
+    alert_webhook_url: Optional[str] = None
     # Progress logging cadence (bars)
     log_every_bars: int = 1_440
 
@@ -210,6 +215,7 @@ class Engine:
         *,
         store: Optional[SQLiteStore] = None,
         broker: Optional[Broker] = None,
+        alerter: Optional[AlertSink] = None,
         registry: Optional[ModelRegistry] = None,
     ) -> None:
         config.validate()
@@ -247,6 +253,11 @@ class Engine:
                 "overwrite them. Use a new store_path, delete the file, or set "
                 "resume=True to continue the prior session."
             )
+        self.alerter: AlertSink = alerter or (
+            WebhookAlerter(config.alert_webhook_url)
+            if config.alert_webhook_url
+            else NullAlerter()
+        )
         self.broker: Broker = broker or PaperBroker(
             next_order_id=self.store.max_order_id() + 1
         )
@@ -380,6 +391,27 @@ class Engine:
             len(rows), self.trader.realized_cum, self._next_trade_id,
             self._resumed_from_ts,
         )
+        # Live brokers expose reconcile(): compare the restored ledger to
+        # the exchange's actual balance before trading resumes.
+        if hasattr(self.broker, "reconcile"):
+            report = self.broker.reconcile(list(self.trader.portfolio.open_positions))
+            if not report.ok:
+                msg = (
+                    f"position reconciliation mismatch: ledger expects "
+                    f"{report.expected_base_qty:.8f} base, exchange holds "
+                    f"{report.exchange_base_qty:.8f} (tolerance "
+                    f"{report.tolerance:.8f}) {report.details}"
+                )
+                self._sink(GuardEvent(
+                    ts=self._resumed_from_ts or pd.Timestamp.now(tz="UTC"),
+                    guard="reconcile", severity="error", message=msg,
+                ))
+                self.alerter.send(level="error", event="reconcile", message=msg)
+            else:
+                logger.info(
+                    "reconcile ok: %.8f base on both sides (tol %.8f)",
+                    report.expected_base_qty, report.tolerance,
+                )
 
     def _regime_index(self, regime_col: str) -> int:
         try:
@@ -574,7 +606,11 @@ class Engine:
 
         # Execution + ledger
         for closed in result.closed:
-            order, fill = self.broker.execute_close(closed)
+            try:
+                order, fill = self.broker.execute_close(closed)
+            except ExecutionError as exc:
+                self._execution_failure(bar.ts, "close", str(exc))
+                continue
             self.store.record_order(order, status="filled")
             self.store.record_fill(fill)
             trade = trade_from_closed(
@@ -588,12 +624,16 @@ class Engine:
             self.store.record_trade(trade)
             self._emit(EventType.TRADE_CLOSED, trade)
         if result.opened is not None:
-            order, fill = self.broker.execute_entry(result.opened)
-            self.store.record_order(order, status="filled")
-            self.store.record_fill(fill)
-            self._entry_p[result.opened.k_entry] = p
-            self._entry_version[result.opened.k_entry] = self.handle.version
-            self._emit(EventType.ORDER_FILLED, fill)
+            try:
+                order, fill = self.broker.execute_entry(result.opened)
+            except ExecutionError as exc:
+                self._execution_failure(bar.ts, "entry", str(exc))
+            else:
+                self.store.record_order(order, status="filled")
+                self.store.record_fill(fill)
+                self._entry_p[result.opened.k_entry] = p
+                self._entry_version[result.opened.k_entry] = self.handle.version
+                self._emit(EventType.ORDER_FILLED, fill)
 
         action = (
             Action.HALT if self._halted else
@@ -653,6 +693,13 @@ class Engine:
         )
         self._emit(EventType.RETRAIN_COMPLETED, outcome)
         logger.info("retrain completed: %s %s", outcome.status, outcome.new_version or "")
+        self.alerter.send(
+            level="info" if outcome.status == "published" else "warning",
+            event="retrain",
+            message=f"retrain {outcome.status}"
+            + (f" -> {outcome.new_version}" if outcome.new_version else ""),
+            n_rows=outcome.n_rows, notes=outcome.notes[:500],
+        )
         if outcome.status != "published" or outcome.new_version is None:
             return
         # Hot-swap at the bar boundary: verify the new version is serving-
@@ -712,6 +759,23 @@ class Engine:
             return "feature list changed; batch mode serves a precomputed matrix"
         return ""
 
+    def _execution_failure(self, ts: pd.Timestamp, intent: str, detail: str) -> None:
+        """An order could not be executed: the ledger and the exchange have
+        diverged. Halt new entries, alert the operator, keep exits alive —
+        recovery is the runbook's reconciliation procedure."""
+        self._sink(GuardEvent(
+            ts=ts, guard="execution", severity="error",
+            message=f"{intent} execution failed: {detail}",
+        ))
+        self.alerter.send(
+            level="error", event="execution_failure",
+            message=f"{intent} order failed — ledger/exchange divergence; "
+            "see docs/PRODUCTION.md reconciliation",
+            detail=detail[:800], ts=str(ts),
+        )
+        if not self._halted:
+            self._halt(ts, f"{intent} execution failure: {detail[:200]}")
+
     def _halt(self, ts: pd.Timestamp, reason: str) -> None:
         """Trip the kill-switch: no new entries for the rest of the session
         (open positions still resolve via the researched exit policy)."""
@@ -721,6 +785,10 @@ class Engine:
         logger.error(
             "HALT at %s: %s — no new entries for the rest of the session",
             ts, reason,
+        )
+        self.alerter.send(
+            level="error", event="halt", message=reason, ts=str(ts),
+            open_positions=self.trader.portfolio.n_open(),
         )
 
     def _check_risk_limits(self, ts: pd.Timestamp, total_eq: float) -> None:

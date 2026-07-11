@@ -62,3 +62,17 @@ class RetrainError(EngineError):
 
 class ExecutionError(EngineError):
     """Broker rejected or failed an order in a non-recoverable way."""
+
+
+class ExchangeError(EngineError):
+    """The exchange API rejected a request or the transport failed
+    beyond the bounded retry policy (network, 5xx, rate-limit storms)."""
+
+
+class ExecutionError(EngineError):
+    """An order intent could not be executed on the exchange.
+
+    Raised only after bounded retries. The engine treats this as a
+    ledger/exchange divergence: it halts new entries and alerts — the
+    runbook's reconciliation procedure is the recovery path.
+    """

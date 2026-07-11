@@ -1,3 +1,52 @@
+## 2026-07-11 — Live trading: Binance adapter, execution containment, production ops
+
+The engine's two ports get their exchange implementations, and the
+operational surface for running them safely. Safety ladder is explicit
+and default-on: testnet + dry-run unless `--mainnet` and `--execute` are
+BOTH passed, credentials via env vars only.
+
+- **`src/engine/binance.py`**:
+  - `BinanceClient` — signed/unsigned REST with bounded retries
+    (5xx/429 with Retry-After honored, exponential backoff), typed
+    `ExchangeError` on rejection, injectable transport (every path
+    hermetically tested; no test touches the network).
+  - `BinanceKlineSource` (`DataSource`) — REST-paginated buffer backfill
+    (28 days ≈ 30 requests) + closed-candle polling with automatic
+    in-order gap catch-up; refuses silent catch-up beyond
+    `max_backfill_bars`. Timestamp convention identical to research
+    (bar-complete UTC = open_time + 60s).
+  - `BinanceBroker` (`Broker`) — MARKET orders matching the researched
+    strategy semantics exactly: entries buy by quote amount
+    (`size × trade_capital`), closes sell the recorded base quantity
+    snapped to the LOT_SIZE grid; NOTIONAL/minQty validated against the
+    live exchangeInfo filters; idempotent `bc-<session>-<n>` client
+    order ids (a duplicate-id rejection fetches the landed order —
+    double-sends cannot double-fill); actual fill prices reported so
+    slippage is measured, not assumed. `reconcile()` compares ledger
+    exposure to the exchange balance.
+- **Execution containment** (`engine.py`): a failed order after bounded
+  retries (`ExecutionError`) records a guard event, alerts, and halts
+  new entries (exits keep resolving) — ledger/exchange divergence is an
+  operator decision, per the runbook. Resume now runs broker
+  reconciliation before trading continues.
+- **`src/engine/alerts.py`** — `AlertSink` protocol, `WebhookAlerter`
+  (Slack-compatible payload, best-effort with retry, never raises into
+  the loop), `NullAlerter` default. Wired at the halt choke-point
+  (covers kill-switch + feature-error halts), execution failures,
+  reconcile mismatches, retrain outcomes. `EngineConfig.alert_webhook_url`.
+- **CLI**: `python -m src.engine live` with the three-gate posture
+  (`--mainnet`, `--execute`, env credentials), `--trade-capital`,
+  `--alert-webhook`.
+- **docs/PRODUCTION.md** — the runbook: bring-up ladder (testnet-execute
+  is mandatory), parallel-retraining operations, monitoring, failure
+  modes with recovery procedures (crash/resume, execution failure, feed
+  stall, kill-switch, bad publish rollback), and an explicit
+  residual-risk register (strategy risk, fill quality, exchange risk,
+  latency margin) — enumerated and bounded, not hand-waved away.
+- 26 new hermetic adapter tests (signing, retries, pagination,
+  closed-candle discipline, filter arithmetic, dry-run/live order paths,
+  duplicate handling, reconciliation, alert sinks).
+
 ## 2026-07-11 — Ownership pass: behaviors attach to the objects that own them
 
 Continuation of the self-describing-Feature principle across the other
