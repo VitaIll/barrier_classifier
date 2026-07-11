@@ -37,10 +37,72 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from typing import Callable, Optional
+
 from src.core.errors import ContractError
 from src.features.config import C, EPS
 from src.features.primitives import population_corr, rolling_mean
 from src.labels.barrier import barrier_label_arrays
+
+
+# =============================================================================
+# Imputation contract for boundary-stage columns
+# =============================================================================
+#
+# The registry features declare their fill on the Feature class
+# (``Feature.impute_default``); the columns CONSTRUCTED IN THIS MODULE
+# (past-target memory, barrier-aware, block aggregates) declare theirs
+# here, next to their constructors. Prefix-matched because the names are
+# window-parameterized; first match wins; ``None`` means "must never be
+# missing" (a constant column — a null there is a pipeline bug).
+#
+# Context-dependent entries take (p_hit_prior, cap_h_blocks) — the same
+# knobs the legacy registry took.
+
+_BoundaryImpute = Optional[Callable[[float, int], Optional[float]]]
+
+BOUNDARY_IMPUTE_PREFIXES: tuple[tuple[str, _BoundaryImpute], ...] = (
+    # -- constants: never missing -------------------------------------------
+    ("cost__c", None),
+    ("barrier__phi", None),
+    # -- barrier-aware (this module) ----------------------------------------
+    ("barrier__z_tight", lambda p, c: 10.0),
+    ("barrier__emax_ratio", lambda p, c: 0.0),
+    ("barrier__p_hit_drifted", lambda p, c: 0.5),
+    ("vol__ratio", lambda p, c: 1.0),
+    # -- past-target memory (this module) -----------------------------------
+    ("hit__rate", lambda p, c: float(p)),
+    ("hit__since", lambda p, c: float(c)),
+    ("hit__prev", lambda p, c: 0.0),
+    ("target__mature_m_mean", lambda p, c: 0.0),
+    ("target__mature_m_pos_mean", lambda p, c: 0.0),
+    ("target__mature_tau_pos_mean", lambda p, c: float(c)),
+    ("target__mature_near_miss_up", lambda p, c: 0.0),
+    ("target__mature_near_miss_dn", lambda p, c: 0.0),
+    ("target__autocorr", lambda p, c: 0.0),
+    # -- block aggregates (this module) --------------------------------------
+    ("block__close_to_high", lambda p, c: 0.5),
+    ("block__maxret", lambda p, c: 0.0),
+    ("block__minret", lambda p, c: 0.0),
+    ("ret__inst", lambda p, c: 0.0),
+    ("range__inst", lambda p, c: 0.0),
+    ("logvol__inst", lambda p, c: 0.0),
+    ("ofi__inst", lambda p, c: 0.0),
+    ("ret__std__h", lambda p, c: 0.0),
+    # -- quality flags (src/features/quality.py) ------------------------------
+    ("data__bad_ohlc", lambda p, c: 0.0),
+    ("data__gap", lambda p, c: 0.0),
+)
+
+
+def boundary_imputation_entries(
+    *, p_hit_prior: float, cap_h_blocks: int
+) -> list[tuple[str, Optional[float]]]:
+    """Resolved ``(prefix, fill | None)`` pairs for boundary-stage columns."""
+    return [
+        (prefix, fn(p_hit_prior, cap_h_blocks) if fn is not None else None)
+        for prefix, fn in BOUNDARY_IMPUTE_PREFIXES
+    ]
 
 
 # =============================================================================

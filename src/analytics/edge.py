@@ -38,26 +38,13 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, block_indices, iid_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, BootstrapResult, block_indices, iid_indices, choose_indices
 from .curves import _interp_pr, _interp_roc
 from .degradation import wilson_interval
 
 
-def _choose_indices(
-    n: int,
-    B: int,
-    rng: np.random.Generator,
-    *,
-    stratify_y: Optional[np.ndarray],
-    stratify: bool,
-    block_size: Optional[int],
-) -> np.ndarray:
-    """Block bootstrap if ``block_size > 1``, else stratified/iid."""
-    if block_size is not None and int(block_size) > 1:
-        return block_indices(n, B, rng, block_size=int(block_size))
-    return iid_indices(
-        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
-    )
+# Shared resampling-precedence helper (was a local copy in this module).
+_choose_indices = choose_indices
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +182,11 @@ def bootstrap_threshold_sweep(
     """
     if outcome_model is None:
         outcome_model = OutcomeModel()
+    from .schema import require_cache_columns
+
+    require_cache_columns(
+        cache, ("split", "ts", "y", "p"), context="bootstrap_threshold_sweep"
+    )
     cs = cache[cache["split"] == split].reset_index(drop=True)
     if len(cs) == 0:
         return pd.DataFrame()

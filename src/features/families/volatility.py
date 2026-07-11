@@ -145,6 +145,7 @@ class _VolDecompFeature(Feature):
 
 
 class VolBpvRatio(_VolDecompFeature):
+    impute_default: ClassVar[float] = 1.0  # bipower/realized; 1 = no jumps
     """Bipower-variation ratio: realized variance over scaled bipower variation.
 
     rv = rolling_mean(r², w)
@@ -196,6 +197,7 @@ class VolSemivarUp(_VolDecompFeature):
 
 
 class VolSemivarRatio(_VolDecompFeature):
+    impute_default: ClassVar[float] = 1.0  # down/up semivariance parity
     """Down/up semivariance ratio: semidown / (semiup + EPS).
 
     Computed inline rather than referencing the up/down feature columns

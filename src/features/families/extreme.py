@@ -53,6 +53,7 @@ class _ExtremeFeature(Feature):
 
 
 class ExtremeDistLowZ(_ExtremeFeature):
+    impute_default: ClassVar[float] = 5.0  # 'far from the extreme' sentinel
     """Volatility-normalized log-distance from current close to trailing low.
 
         D^low_{W,n} = (p_n - min_{i in [n-W+1, n]} log(L_i)) / (sigma_W,n * sqrt(M) + EPS)
@@ -76,6 +77,7 @@ class ExtremeDistLowZ(_ExtremeFeature):
 
 
 class ExtremeDistHighZ(_ExtremeFeature):
+    impute_default: ClassVar[float] = 5.0  # 'far from the extreme' sentinel
     """Volatility-normalized log-distance from trailing high to current close.
 
         D^high_{W,n} = (max_{i in [n-W+1, n]} log(H_i) - p_n) / (sigma_W,n * sqrt(M) + EPS)
@@ -132,6 +134,7 @@ def _rolling_rank_of_current_np(p: np.ndarray, w: int) -> np.ndarray:
 
 
 class ExtremePriceRank(_ExtremeFeature):
+    impute_default: ClassVar[float] = 0.5  # median of bounded support
     """Empirical CDF of current log close inside the trailing window.
 
         R_{W,n} = (1/W) * sum_{i in [n-W+1, n]} 1{p_i <= p_n}

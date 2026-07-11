@@ -136,6 +136,7 @@ class BasisStd(Feature):
 
 
 class FlowTakerBuyRatio(Feature):
+    impute_default: ClassVar[float] = 0.5  # taker-buy fraction; 0.5 = balanced flow
     family: ClassVar[str] = "deriv_flow"
     tier: ClassVar[int | str] = 1
     inputs = ("tb_ratio_fut",)
@@ -175,6 +176,7 @@ class FlowNetVolCsum(Feature):
 
 
 class FlowFutVsSpotVol(Feature):
+    impute_default: ClassVar[float] = 1.0  # volume ratio; 1 = parity
     """fut quote-vol over spot quote-vol (null when spot ≤ 0)."""
 
     family: ClassVar[str] = "deriv_flow"
@@ -252,6 +254,7 @@ class FlowTradesZscore30(Feature):
 
 
 class OiTotalUsd(Feature):
+    impute_default: ClassVar[float] = 15e9  # utils.MEDIAN_OI_USD — median BTC futures OI
     family: ClassVar[str] = "deriv_oi"
     tier: ClassVar[int | str] = 1
     inputs = ("oi_usd",)
@@ -501,6 +504,7 @@ class _FundingPhaseBase(Feature):
 
 
 class FundingPhase(_FundingPhaseBase):
+    impute_default: ClassVar[float] = 0.5  # phase in (0,1]; 0.5 = mid-cycle
     """Unit phase to next funding settlement, in (0, 1]."""
 
     def column_name(self, w: int | None = None) -> str:
@@ -552,6 +556,7 @@ class FundingTrend(Feature):
 
 
 class OptPcrOi(Feature):
+    impute_default: ClassVar[float] = 1.0  # put/call ratio; 1 = balanced
     family: ClassVar[str] = "deriv_options"
     tier: ClassVar[int | str] = 1
     inputs = ("pcr_oi",)
@@ -565,6 +570,7 @@ class OptPcrOi(Feature):
 
 
 class OptPcrVol(Feature):
+    impute_default: ClassVar[float] = 1.0  # put/call ratio; 1 = balanced
     family: ClassVar[str] = "deriv_options"
     tier: ClassVar[int | str] = 1
     inputs = ("pcr_vol",)
@@ -578,6 +584,7 @@ class OptPcrVol(Feature):
 
 
 class OptPcrOiChg(Feature):
+    impute_default: ClassVar[float] = 1.0  # NOTE: preserves a legacy-registry ORDER BUG — the intended fill was 0.0, but `^opt_pcr__oi` matched first and returned 1.0; v0001 was trained with 1.0, so parity wins until a deliberate retrain
     family: ClassVar[str] = "deriv_options"
     tier: ClassVar[int | str] = 1
     inputs = ("pcr_oi",)
@@ -623,6 +630,7 @@ class OptVol24hUsd(Feature):
 
 
 class VolIdxBvol30d(Feature):
+    impute_default: ClassVar[float] = 60.0  # long-run BVOL level
     family: ClassVar[str] = "deriv_volidx"
     tier: ClassVar[int | str] = 1
     inputs = ("bvol",)
@@ -650,6 +658,7 @@ class VolIdxBvolChg(Feature):
 
 
 class VolRealized30d(Feature):
+    impute_default: ClassVar[float] = 60.0  # long-run realized-vol level
     """Annualised realised vol from r over 30 days = 43200 minutes.
 
     Declares ``windows=(43200,)`` so the engine's warmup tracker includes
@@ -689,6 +698,7 @@ class VolRiskPremiumDiff(Feature):
 
 
 class VolRiskPremiumRatio(Feature):
+    impute_default: ClassVar[float] = 1.0  # implied/realized; 1 = no premium
     """See ``VolRiskPremiumDiff`` for the shared-rv rationale."""
 
     family: ClassVar[str] = "deriv_volidx"

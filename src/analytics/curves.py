@@ -41,31 +41,11 @@ from sklearn.metrics import (
 
 from src.utils import expected_calibration_error
 
-from .bootstrap import DEFAULT_B, DEFAULT_CI, block_indices, iid_indices
+from .bootstrap import DEFAULT_B, DEFAULT_CI, block_indices, iid_indices, choose_indices
 
 
-def _choose_indices(
-    n: int,
-    B: int,
-    rng: np.random.Generator,
-    *,
-    stratify_y: Optional[np.ndarray],
-    stratify: bool,
-    block_size: Optional[int],
-) -> np.ndarray:
-    """Pick block or iid (optionally stratified) resampling indices.
-
-    Centralized helper so every curve / metric bootstrap in this module
-    uses the same precedence rule: ``block_size > 1`` -> moving-block
-    bootstrap (stratification is incompatible with blocks and is
-    ignored), else stratified-iid (if ``stratify=True`` and labels are
-    available), else plain iid.
-    """
-    if block_size is not None and int(block_size) > 1:
-        return block_indices(n, B, rng, block_size=int(block_size))
-    return iid_indices(
-        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
-    )
+# Shared resampling-precedence helper (was a local copy in this module).
+_choose_indices = choose_indices
 
 
 @dataclass

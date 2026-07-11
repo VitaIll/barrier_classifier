@@ -18,6 +18,7 @@ from src.features.primitives import perm_entropy_m3
 
 
 class EntropyPermNorm(Feature):
+    impute_default: ClassVar[float] = 0.5  # normalized entropy; 0.5 = uninformative
     family: ClassVar[str] = "entropy"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)

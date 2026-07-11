@@ -107,13 +107,15 @@ def test_impute_coerces_float_nan_to_null_then_fills():
     assert int(out["ret__rsi__f__w14"].is_nan().sum()) == 0
 
 
-def test_impute_raises_on_residual_nan_after_fill(monkeypatch):
-    """If the imputation registry returns a non-finite value (NaN/inf),
-    the impute step must raise rather than silently fill the column
-    with NaN and ship a poisoned dataset to training.
+def test_impute_raises_on_residual_nan_after_fill():
+    """If a declared imputation value is non-finite (NaN/inf), the impute
+    step must raise rather than silently fill the column with NaN and ship
+    a poisoned dataset to training.
 
-    Patches ``utils.get_imputation_value`` to return ``float('nan')`` so
-    we exercise the safety check at the registry boundary."""
+    Passes an ``impute_map`` carrying a NaN fill so the safety check at
+    the declaration boundary is exercised (2026-07-11: the legacy regex
+    registry this test used to monkeypatch was replaced by class-declared
+    fills threaded through ``impute_map``)."""
     from src.features import quality as quality_mod
 
     df = pl.DataFrame(
@@ -124,15 +126,12 @@ def test_impute_raises_on_residual_nan_after_fill(monkeypatch):
         }
     )
 
-    def _nan_registry(col, *, p_hit_prior, cap_h_blocks):  # noqa: ARG001
-        return float("nan")
-
-    monkeypatch.setattr(
-        quality_mod._legacy, "get_imputation_value", _nan_registry
-    )
     with pytest.raises(ValueError, match="non-finite"):
         quality_mod.create_undef_flags_and_impute_pl(
-            df, ["ret__rsi__f__w14"], p_hit_prior=0.5
+            df,
+            ["ret__rsi__f__w14"],
+            p_hit_prior=0.5,
+            impute_map={"ret__rsi__f__w14": float("nan")},
         )
 
 

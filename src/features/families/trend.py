@@ -91,6 +91,7 @@ class TrendEmaSpread60_240(_TrendEmaSpread):
 
 
 class TrendRsi(Feature):
+    impute_default: ClassVar[float] = 50.0  # RSI midpoint
     """Wilder's RSI on log returns.
 
     Compute path:

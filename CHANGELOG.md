@@ -1,3 +1,45 @@
+## 2026-07-11 — Re-architecture Phase 3.3 + Phase 4: imputation on classes, evaluation consolidation
+
+**Imputation lives with the features now.** The 140-line order-sensitive
+regex table (`utils.get_imputation_value`) is no longer consulted by the
+pipeline: registry features declare `impute_default` on their class (21
+non-zero declarations added), boundary-stage columns declare theirs in
+`boundary.BOUNDARY_IMPUTE_PREFIXES` next to their constructors, and
+`FeatureEngine.imputation_map()` threads the registry half through the
+pipeline. An UNDECLARED column is now a hard `ContractError` — the silent
+`.* -> 0.0` catch-all is gone. `tests/features/test_imputation_bridge.py`
+(28 tests) pinned the new resolution equal to the legacy registry for
+EVERY produced column before the switch — and surfaced one latent legacy
+bug preserved deliberately: `opt_pcr__oi_chg` was intended to fill 0.0 but
+the `^opt_pcr__oi` pattern matched first and returned 1.0; v0001 trained
+with 1.0, so parity wins until a deliberate retrain (documented on the
+class).
+
+**Phase 4 — evaluation consolidation:**
+- `bootstrap.choose_indices` is public and THE resampling-precedence rule;
+  the three private copies in `curves`/`edge`/`degradation` are aliases.
+  `bootstrap_apply` is the canonical NaN-tolerant resample loop
+  (`bootstrap_metric` now runs on it — identical draws, outputs pinned by
+  the 288-test analytics suite). `wilson_interval` moved to `bootstrap`
+  (generic statistic, not a drift concept); `degradation` re-exports.
+- `analytics/schema.py`: the decision-cache column contract declared once;
+  `edge.bootstrap_threshold_sweep` and `degradation.conditional_precision`
+  validate up front with errors that name the missing columns and the
+  augmenter that adds them (was a bare `KeyError` deep inside pandas).
+- `SimResult.summary()` — headline metrics (Sharpe/Calmar/max-DD/
+  utilization, cadence-aware annualization) as one call on the result
+  object; the run's effective cost is now recorded on `SimResult.config`.
+
+**Live-serving profile + interim optimization (Phase 3.5 groundwork):**
+profiling the 40,320-row rolling call: 22.4s total = 18.4s polars
+expression evaluation (intrinsic to full recompute) + ~3.5s imputation
+orchestration waste (`df.schema` rebuilt per column × 3,059, per-column
+null-count queries). The impute stage now snapshots the schema once and
+scans null/NaN/inf counts in single engine passes: **22.4s -> 18.0s per
+rolling call**, behavior identical. The remaining 18s is the
+full-recompute floor — O(depth)-per-bar streaming state is the designed
+Phase-3b fix.
+
 ## 2026-07-11 — Re-architecture Phase 3.2: sample-weight blocks (`src/weights/`)
 
 `BarrierDistanceWeight`, `TimeDiscountWeight`, `TrainingWeights` — faithful

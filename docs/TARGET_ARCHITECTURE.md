@@ -191,6 +191,22 @@ and are kept (possibly moved); 🔧 exist but are reworked; ⭐ are new.
 
 ## 6. Migration plan
 
+**Status (2026-07-11):** Phases 1 and 2 landed in full. Phase 3 landed
+config injection (3.1), weight blocks (3.2), imputation-on-classes (3.3),
+and the serving profile + impute-stage optimization (3.5 groundwork);
+pandas-free boundary stages (3.4) are deliberately deferred — `ret__std`
+and the block sums are pinned bitwise to pandas rolling semantics by the
+oracle suites, so replacing them is a conscious-behavior-change decision,
+not a refactor. Phase 4 landed the bootstrap consolidation, the cache
+schema contract, and `SimResult.summary()`; the full report-object/viz
+split remains. Phase 5 (Run/ArtifactStore, `src/data/`, thin notebooks,
+utils retirement) remains — notebook regeneration requires real-data
+execution and belongs to a session with the data volumes mounted. The
+remaining live-serving work (O(depth)/bar streaming state) is scoped as
+Phase 3b: the profiled floor is ~18s/bar of pure polars expression
+evaluation on the 40,320-row buffer; nothing short of incremental state
+removes it.
+
 Each phase lands green: the full test suite passes, parity gates hold, and the
 phase adds its own tests. No big-bang cutover; old entry points become thin
 adapters over new kernels until their consumers migrate, then die.

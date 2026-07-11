@@ -89,6 +89,24 @@ class Feature(ABC):
     expected_dtype: ClassVar[pl.DataType] = pl.Float64
     max_nan_rate_after_warmup: ClassVar[float] = 0.0
 
+    # --- Imputation contract ----------------------------------------------------
+    # The fill applied to missing values (warmup rows, undefined inputs)
+    # AFTER the ``undef__`` flag is recorded. Declared HERE, next to the
+    # feature that owns the column — previously a 140-line order-sensitive
+    # regex table in utils keyed on column names, with a silent 0.0
+    # catch-all. 0.0 is the correct neutral for the majority (residuals,
+    # z-scores, changes, rates-of-change); bounded/ratio features override
+    # (e.g. RSI -> 50, ratios -> 1, fractions -> 0.5).
+    impute_default: ClassVar[float] = 0.0
+
+    def impute_value(self, w: int | None = None) -> float:
+        """Fill value for this feature's column at window ``w``.
+
+        Override for window-dependent policies; the default returns the
+        class-level ``impute_default``.
+        """
+        return float(self.impute_default)
+
     # --- Warmup / null tail -------------------------------------------------
     null_tail_bars: ClassVar[int] = 0
 

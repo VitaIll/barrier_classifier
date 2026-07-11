@@ -93,6 +93,32 @@ class SimResult:
     diagnostics_used: dict
     config: dict
 
+    def summary(self, *, cost_per_trade: float | None = None) -> dict:
+        """Headline metrics for this run — one call instead of the ~50
+        lines of Sharpe/Calmar/max-DD arithmetic notebooks used to
+        hand-roll.
+
+        ``cost_per_trade`` defaults to the value echoed into
+        ``self.config`` (the run's effective cost); pass explicitly to
+        re-price. Cadence-aware annualization comes from the run config.
+        """
+        from src.strategy.reporting import headline_row
+
+        if cost_per_trade is None:
+            cost_per_trade = self.config.get("effective_cost_per_trade")
+        if cost_per_trade is None:
+            raise ValueError(
+                "cost_per_trade not recorded on this run's config — pass "
+                "summary(cost_per_trade=...) explicitly"
+            )
+        return headline_row(
+            self.spec_name,
+            self.closed,
+            self.equity,
+            cost_per_trade=float(cost_per_trade),
+            cadence_minutes=float(self.config.get("cadence_minutes", 20.0)),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Inputs
@@ -323,7 +349,9 @@ def simulate(
         equity=pd.DataFrame(equity_rows),
         cluster_log=pd.DataFrame(st.cluster.rows),
         diagnostics_used={r: True for r in spec.requires},
-        config=vars(cfg).copy(),
+        # Echo the run config plus the RESOLVED cost (override or the
+        # spec's), so SimResult.summary() needs no external context.
+        config={**vars(cfg), "effective_cost_per_trade": cost_per_trade},
     )
 
 

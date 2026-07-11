@@ -213,7 +213,7 @@ def run_pipeline(
         config=config if config is not None else DEFAULT_CONFIG,
     )
 
-    df_pl, df_raw_pl = _build_bar_level(
+    df_pl, df_raw_pl, impute_map = _build_bar_level(
         df_raw_pd,
         with_derivatives=with_derivatives,
         label_cadence=label_cadence,
@@ -237,7 +237,9 @@ def run_pipeline(
         .filter(pl.col("y").is_not_null())
     )
 
-    return _impute_stage(df_boundaries, p_hit_prior=p_hit_prior, plan=plan)
+    return _impute_stage(
+        df_boundaries, p_hit_prior=p_hit_prior, plan=plan, impute_map=impute_map
+    )
 
 
 def run_inference_pipeline(
@@ -284,7 +286,7 @@ def run_inference_pipeline(
         cap_h_blocks=cap_h_blocks,
         config=config if config is not None else DEFAULT_CONFIG,
     )
-    df_pl, df_raw_pl = _build_bar_level(
+    df_pl, df_raw_pl, impute_map = _build_bar_level(
         df_raw_pd,
         with_derivatives=with_derivatives,
         label_cadence=label_cadence,
@@ -307,7 +309,9 @@ def run_inference_pipeline(
         autocorr_lags=autocorr_lags,
         add_triple_barrier_aux=False,
     )
-    return _impute_stage(df_boundaries, p_hit_prior=p_hit_prior, plan=plan)
+    return _impute_stage(
+        df_boundaries, p_hit_prior=p_hit_prior, plan=plan, impute_map=impute_map
+    )
 
 
 @dataclass(frozen=True)
@@ -397,8 +401,8 @@ def _build_bar_level(
     with_derivatives: bool,
     label_cadence: str,
     config: FeatureConfig,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Stages 1-4: base series, bar-level engine features, quality flags."""
+) -> tuple[pl.DataFrame, pl.DataFrame, dict[str, float]]:
+    """Stages 1-4: base series, engine features, quality flags (+ impute map)."""
     # --- Stages 1-2: base series (legacy) ----------------------------------
     df_pd = _legacy.compute_base_series(df_raw_pd)
     if with_derivatives:
@@ -412,6 +416,7 @@ def _build_bar_level(
     if with_derivatives:
         families.extend(_DERIVATIVES_FAMILIES)
     engine = FeatureEngine(tiers=(1, 2), families=tuple(families), config=config)
+    impute_map = engine.imputation_map()
     df_pl = engine.transform(df_pl, trim=False).data
 
     # At 1-min cadence the boundary-sparse excursion drawup/drawdown columns
@@ -432,7 +437,7 @@ def _build_bar_level(
 
     # --- Stage 4: data quality flags --------------------------------------
     df_pl = compute_data_quality_flags_pl(df_pl)
-    return df_pl, df_raw_pl
+    return df_pl, df_raw_pl, impute_map
 
 
 def _run_boundary_stages(
@@ -503,6 +508,7 @@ def _impute_stage(
     *,
     p_hit_prior: float,
     plan: _PipelinePlan,
+    impute_map: dict[str, float],
 ) -> pl.DataFrame:
     """Stage 11: undef flags + deterministic imputation."""
     # Feature columns = everything on the boundary frame that is NOT a
@@ -517,5 +523,6 @@ def _impute_stage(
         feature_cols,
         p_hit_prior=p_hit_prior,
         cap_h_blocks=plan.cap_h_blocks,
+        impute_map=impute_map,
     )
     return df_final

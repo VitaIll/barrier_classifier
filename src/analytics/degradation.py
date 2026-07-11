@@ -46,24 +46,13 @@ from .bootstrap import (
     block_indices,
     bootstrap_metric,
     iid_indices,
+    choose_indices,
+    wilson_interval,
 )
 
+_choose_indices = choose_indices  # shared helper (was a local copy)
 
-def _choose_indices(
-    n: int,
-    B: int,
-    rng: np.random.Generator,
-    *,
-    stratify_y: Optional[np.ndarray],
-    stratify: bool,
-    block_size: Optional[int],
-) -> np.ndarray:
-    """Block bootstrap if ``block_size > 1``, else stratified/iid."""
-    if block_size is not None and int(block_size) > 1:
-        return block_indices(n, B, rng, block_size=int(block_size))
-    return iid_indices(
-        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
-    )
+
 
 PSI_EPS = 1e-6  # smoothing for empty bins (so log(a/b) is finite)
 
@@ -121,30 +110,8 @@ def ks_distance(p_reference: np.ndarray, p_current: np.ndarray) -> Tuple[float, 
     return float(res.statistic), float(res.pvalue)
 
 
-def wilson_interval(k: int, n: int, *, alpha: float = 0.05) -> Tuple[float, float]:
-    """Wilson score interval for a binomial proportion.
-
-    Robust at small n where the normal approximation breaks down. Returns
-    ``(0.0, 1.0)`` for ``n=0``.
-    """
-    if n == 0:
-        return (0.0, 1.0)
-    from scipy.stats import norm
-
-    z = norm.ppf(1.0 - alpha / 2.0)
-    p_hat = k / n
-    denom = 1.0 + z * z / n
-    center = (p_hat + z * z / (2.0 * n)) / denom
-    half_width = z * np.sqrt(p_hat * (1.0 - p_hat) / n + z * z / (4.0 * n * n)) / denom
-    lo = center - half_width
-    hi = center + half_width
-    # Math says lo=0 exactly at k=0 and hi=1 exactly at k=n; floating-point
-    # leaves micro-positive/-negative dust. Hardcode the boundary cases.
-    if k == 0:
-        lo = 0.0
-    if k == n:
-        hi = 1.0
-    return float(max(0.0, lo)), float(min(1.0, hi))
+# ``wilson_interval`` moved to ``bootstrap`` (generic statistic, not a
+# drift concept); re-exported above for the existing importers.
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +514,11 @@ def conditional_precision(
     ``[*by, n_predictions, n_hits, precision, ci_low, ci_high]``.
     Cells with ``n_predictions == 0`` are excluded.
     """
+    from .schema import require_cache_columns
+
+    require_cache_columns(
+        cache, ("split", "y", "p"), context="conditional_precision"
+    )
     df = cache[cache["split"] == split].copy()
     if len(df) == 0:
         return pd.DataFrame(

@@ -75,6 +75,15 @@ class FeatureEngine:
     def plan(self) -> list[tuple[Feature, int | None, str]]:
         return [(spec, w, name) for spec in self.specs for w, name in spec.expanded()]
 
+    def imputation_map(self) -> dict[str, float]:
+        """``{column_name: fill_value}`` for every column this engine emits.
+
+        The registry half of the imputation contract; boundary-stage
+        columns contribute theirs via
+        :func:`src.features.boundary.boundary_imputation_entries`.
+        """
+        return {name: spec.impute_value(w) for spec, w, name in self.plan()}
+
     def transform(
         self,
         bars: pl.DataFrame,

@@ -103,6 +103,7 @@ class _CandleBreakoutFeature(Feature):
 
 
 class CandleLogpPos(_CandleBreakoutFeature):
+    impute_default: ClassVar[float] = 0.5  # range position; 0.5 = mid
     """Position of current log price within the rolling [min, max] band.
 
     Null where the band collapses (max == min).

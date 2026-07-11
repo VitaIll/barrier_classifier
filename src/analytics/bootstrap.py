@@ -150,6 +150,81 @@ def iid_indices(
     return np.concatenate([pos_idx, neg_idx], axis=1)
 
 
+def choose_indices(
+    n: int,
+    B: int,
+    rng: np.random.Generator,
+    *,
+    stratify_y: Optional[np.ndarray],
+    stratify: bool,
+    block_size: Optional[int],
+) -> np.ndarray:
+    """Pick block or iid (optionally stratified) resampling indices.
+
+    THE precedence rule, shared by every bootstrap surface in this package
+    (this helper used to exist as four private copies): ``block_size > 1``
+    -> moving-block bootstrap (stratification is incompatible with blocks
+    and is ignored), else stratified-iid (if ``stratify=True`` and labels
+    are available), else plain iid.
+    """
+    if block_size is not None and int(block_size) > 1:
+        return block_indices(n, B, rng, block_size=int(block_size))
+    return iid_indices(
+        n, B, rng, stratify=stratify_y if stratify and stratify_y is not None else None
+    )
+
+
+def bootstrap_apply(
+    fn: Callable[[np.ndarray], float],
+    idx: np.ndarray,
+    *,
+    B: Optional[int] = None,
+) -> np.ndarray:
+    """Evaluate ``fn(row_indices)`` per replicate; NaN-tolerant.
+
+    The canonical resample loop: a replicate whose metric raises
+    ``ValueError`` (single-class slice under block bootstrap) records NaN
+    and drops out of ``nanquantile`` aggregation — the package-wide NaN
+    contract. Returns the ``(B,)`` sample vector; callers aggregate.
+    """
+    n_reps = int(B) if B is not None else int(idx.shape[0])
+    samples = np.full(n_reps, np.nan, dtype=float)
+    for b in range(n_reps):
+        try:
+            samples[b] = float(fn(idx[b]))
+        except ValueError:
+            samples[b] = np.nan
+    return samples
+
+
+def wilson_interval(k: int, n: int, *, alpha: float = 0.05) -> tuple[float, float]:
+    """Wilson score interval for a binomial proportion.
+
+    Robust at small n where the normal approximation breaks down. Returns
+    ``(0.0, 1.0)`` for ``n=0``. (Moved here from ``degradation`` — it is a
+    generic statistic consumed across the package, not a drift concept;
+    ``degradation.wilson_interval`` remains as a re-export.)
+    """
+    if n == 0:
+        return (0.0, 1.0)
+    from scipy.stats import norm
+
+    z = norm.ppf(1.0 - alpha / 2.0)
+    p_hat = k / n
+    denom = 1.0 + z * z / n
+    center = (p_hat + z * z / (2.0 * n)) / denom
+    half_width = z * np.sqrt(p_hat * (1.0 - p_hat) / n + z * z / (4.0 * n * n)) / denom
+    lo = center - half_width
+    hi = center + half_width
+    # Math says lo=0 exactly at k=0 and hi=1 exactly at k=n; floating-point
+    # leaves micro-positive/-negative dust. Hardcode the boundary cases.
+    if k == 0:
+        lo = 0.0
+    if k == n:
+        hi = 1.0
+    return float(max(0.0, lo)), float(min(1.0, hi))
+
+
 def bootstrap_metric(
     fn: Callable[[np.ndarray, np.ndarray], float],
     y: np.ndarray,
@@ -184,20 +259,17 @@ def bootstrap_metric(
     if y_arr.ndim != 1:
         raise ValueError(f"y and p must be 1D, got {y_arr.ndim}D")
     rng = np.random.default_rng(seed)
-    if block_size is not None and int(block_size) > 1:
-        idx = block_indices(len(y_arr), B, rng, block_size=int(block_size))
-    else:
-        idx = iid_indices(len(y_arr), B, rng, stratify=y_arr if stratify else None)
-    samples = np.full(B, np.nan, dtype=float)
-    for b in range(B):
-        i = idx[b]
-        try:
-            samples[b] = float(fn(y_arr[i], p_arr[i]))
-        except ValueError:
-            # Block resamples can produce single-class slices that crash
-            # roc_auc_score / precision_recall_curve. Record NaN, drop from
-            # CI aggregation, expose count via B_effective.
-            samples[b] = np.nan
+    idx = choose_indices(
+        len(y_arr), B, rng,
+        stratify_y=y_arr if stratify else None,
+        stratify=stratify,
+        block_size=block_size,
+    )
+    # NaN-tolerant loop: block resamples can produce single-class slices
+    # that crash roc_auc_score / precision_recall_curve; those replicates
+    # record NaN, drop from CI aggregation, and are counted out of
+    # B_effective.
+    samples = bootstrap_apply(lambda i: fn(y_arr[i], p_arr[i]), idx, B=B)
     point = float(fn(y_arr, p_arr))
     alpha = (1.0 - ci) / 2.0
     ci_low = float(np.nanquantile(samples, alpha))

@@ -41,6 +41,7 @@ class _ActivityInstFeature(Feature):
 
 
 class ActivityTbRatioInst(_ActivityInstFeature):
+    impute_default: ClassVar[float] = 0.5  # taker-buy fraction
     inputs = ("b",)
     output_prefix = "tb_ratio"
 

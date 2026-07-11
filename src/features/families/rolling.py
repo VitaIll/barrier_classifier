@@ -87,6 +87,7 @@ class RollingAbsretMean(_RollingFeature):
 
 
 class RollingRetPosfrac(_RollingFeature):
+    impute_default: ClassVar[float] = 0.5  # fraction of positive returns
     """Fraction of positive returns over the window.
 
     Parity note: legacy ``(r > 0).astype(float)`` treats NaN as False (→ 0.0)
