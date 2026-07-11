@@ -208,6 +208,12 @@ class _PivotFeature(Feature):
             return int(ww) + int(qq) - 1
         return 0
 
+    def depends_on(self, w=None) -> tuple[str, ...]:
+        if isinstance(w, tuple):
+            ww, _qq = w
+            return self.inputs + (f"vol__rs__f__w{int(ww)}",)
+        return self.inputs
+
 
 class PivotLastLowDistZ(_PivotFeature):
     """Volatility-normalized distance from current close to most recent

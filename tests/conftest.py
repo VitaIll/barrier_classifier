@@ -81,6 +81,7 @@ _THEME_BY_PATH: dict[str, str] = {
     "features/test_cadence_helpers.py": "features_pipeline",
     "features/test_feature_config.py": "features_pipeline",
     "features/test_imputation_bridge.py": "features_pipeline",
+    "features/test_self_description.py": "features_pipeline",
     # analytics_bootstrap
     "analytics/test_bootstrap.py": "analytics_bootstrap",
     "analytics/test_block_bootstrap_propagation.py": "analytics_bootstrap",

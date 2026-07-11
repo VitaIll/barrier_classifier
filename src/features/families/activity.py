@@ -15,7 +15,7 @@ from typing import ClassVar
 
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, Domain, Feature
 from src.features.config import EPS
 from src.features.primitives import rolling_sum, z_score_rolling
 
@@ -41,7 +41,7 @@ class _ActivityInstFeature(Feature):
 
 
 class ActivityTbRatioInst(_ActivityInstFeature):
-    impute_default: ClassVar[float] = 0.5  # taker-buy fraction
+    domain: ClassVar[Domain] = FRACTION  # taker-buy share
     inputs = ("b",)
     output_prefix = "tb_ratio"
 

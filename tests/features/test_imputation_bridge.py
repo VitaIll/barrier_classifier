@@ -172,3 +172,21 @@ class TestEndToEndFrameBridge:
             f"{len(mismatches)} produced column(s) diverge, "
             f"e.g. {mismatches[:10]}"
         )
+
+        # Positive membership must equal the legacy subtraction EXACTLY —
+        # content AND order (frame column order is the frozen serving
+        # contract). ``feature_cols`` above is the subtraction form.
+        from src.features.boundary import is_boundary_feature_column
+        from src.features.engine import FeatureEngine
+
+        emitted = set(FeatureEngine(tiers=(1, 2)).imputation_map())
+        positive = [
+            c for c in out.columns
+            if (c in emitted or is_boundary_feature_column(c))
+            and not c.startswith("undef__")
+        ]
+        subtraction = [
+            c for c in out.columns
+            if c not in non_feature and not c.startswith("undef__")
+        ]
+        assert positive == subtraction

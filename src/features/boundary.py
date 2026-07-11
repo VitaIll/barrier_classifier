@@ -105,6 +105,17 @@ def boundary_imputation_entries(
     ]
 
 
+def is_boundary_feature_column(name: str) -> bool:
+    """Is ``name`` a feature column CONSTRUCTED by the boundary stages?
+
+    The positive-membership half for non-registry features: a column is a
+    feature because something declared it (a registered Feature class, or
+    a prefix here) — never because it failed to appear on an exclusion
+    list.
+    """
+    return any(name.startswith(prefix) for prefix, _ in BOUNDARY_IMPUTE_PREFIXES)
+
+
 # =============================================================================
 # Labels
 # =============================================================================

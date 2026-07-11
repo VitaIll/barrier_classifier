@@ -28,7 +28,7 @@ from typing import ClassVar
 import numpy as np
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import OSCILLATOR_0_100, Domain, Feature
 from src.features.config import EPS
 from src.features.primitives import ewm_mean, wilder_smooth, z_score_rolling
 
@@ -91,7 +91,7 @@ class TrendEmaSpread60_240(_TrendEmaSpread):
 
 
 class TrendRsi(Feature):
-    impute_default: ClassVar[float] = 50.0  # RSI midpoint
+    domain: ClassVar[Domain] = OSCILLATOR_0_100  # RSI
     """Wilder's RSI on log returns.
 
     Compute path:

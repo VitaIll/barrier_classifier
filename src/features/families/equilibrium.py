@@ -572,6 +572,12 @@ class _EqBarrierVsEqHz(_EqTier2Window):
     def warmup_for(self, w: int | None) -> int:
         return (w + 1) if w else 0
 
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        return self.inputs + (
+            f"eq__mu_{self.proxy}__f__w{w}",
+            f"eq__sigma_r__f__w{w}",
+        )
+
     def compute(self, w: int | None = None) -> pl.Expr:
         p = pl.col("p")
         mu = pl.col(f"eq__mu_{self.proxy}__f__w{w}")
@@ -680,6 +686,16 @@ class EqPairInteractions(Feature):
         if isinstance(w, tuple):
             return int(w[1]) + 1
         return 0
+
+    def depends_on(self, w=None) -> tuple[str, ...]:
+        if not isinstance(w, tuple):
+            return self.inputs
+        s, l, _kind = w
+        return self.inputs + (
+            f"eq__mu_mean__f__w{s}",
+            f"eq__mu_mean__f__w{l}",
+            f"eq__sigma_r__f__w{l}",
+        )
 
     def compute(self, w=None) -> pl.Expr:
         s, l, kind = w

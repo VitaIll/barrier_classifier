@@ -21,7 +21,7 @@ from typing import ClassVar
 
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, Domain, Feature
 from src.features.primitives import clip_pos, rolling_mean, rolling_std_pop
 
 
@@ -87,7 +87,7 @@ class RollingAbsretMean(_RollingFeature):
 
 
 class RollingRetPosfrac(_RollingFeature):
-    impute_default: ClassVar[float] = 0.5  # fraction of positive returns
+    domain: ClassVar[Domain] = FRACTION  # share of positive returns
     """Fraction of positive returns over the window.
 
     Parity note: legacy ``(r > 0).astype(float)`` treats NaN as False (→ 0.0)

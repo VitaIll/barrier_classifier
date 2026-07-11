@@ -99,6 +99,8 @@ class FlowPressureCum(_FlowFeature):
 
 
 class FlowSellAbsorption(_FlowFeature):
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        return self.inputs + (f"ret__rms__f__w{w}",)
     """Sell-absorption signal in [0, 1].
 
         d_{W,n} = tanh((p_n - p_{n-W}) / (sigma_W,n * sqrt(W) + EPS))
@@ -150,6 +152,8 @@ class FlowSellAbsorption(_FlowFeature):
 
 
 class FlowBuyExhaustion(_FlowFeature):
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        return self.inputs + (f"ret__rms__f__w{w}",)
     """Buy-exhaustion signal in [0, 1] — opposite of sell absorption.
 
         BE_{W,n} = max(0, FP_{W,n}) * max(0, -d_{W,n})

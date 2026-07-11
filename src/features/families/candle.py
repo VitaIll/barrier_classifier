@@ -16,7 +16,7 @@ from typing import ClassVar
 
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, Domain, Feature
 from src.features.primitives import rolling_max, rolling_mean, rolling_min
 
 
@@ -103,7 +103,7 @@ class _CandleBreakoutFeature(Feature):
 
 
 class CandleLogpPos(_CandleBreakoutFeature):
-    impute_default: ClassVar[float] = 0.5  # range position; 0.5 = mid
+    domain: ClassVar[Domain] = FRACTION  # range position; 0.5 = mid
     """Position of current log price within the rolling [min, max] band.
 
     Null where the band collapses (max == min).

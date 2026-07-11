@@ -71,6 +71,10 @@ class FeatureEngine:
                         f"{prev.__name__} and {type(spec).__name__}"
                     )
                 seen[key] = type(spec)
+        # Declared-predecessor validation: a same-/later-tier reference is
+        # the polars forward-reference landmine — fail at construction,
+        # not as a missing-column error mid-transform.
+        self.validate_dependencies()
 
     def plan(self) -> list[tuple[Feature, int | None, str]]:
         return [(spec, w, name) for spec in self.specs for w, name in spec.expanded()]
@@ -83,6 +87,66 @@ class FeatureEngine:
         :func:`src.features.boundary.boundary_imputation_entries`.
         """
         return {name: spec.impute_value(w) for spec, w, name in self.plan()}
+
+    def emitted_columns(self) -> list[str]:
+        """Every column name this engine emits, in plan (frame) order."""
+        return [name for _, _, name in self.plan()]
+
+    def catalog(self) -> pl.DataFrame:
+        """Self-description of every emitted column — one row per column.
+
+        The aggregation of ``Feature.describe()`` over the whole plan:
+        domain, range, imputation, warmup, predecessors, tags, legal ops.
+        This is the introspection surface for feature selection, health
+        tooling, and documentation.
+        """
+        rows = []
+        for spec, w, _ in self.plan():
+            d = spec.describe(w)
+            # Polymorphic fields normalized for a columnar frame: windows
+            # may be ints or (pair) tuples; tiers ints or strings.
+            d["window"] = None if d["window"] is None else str(d["window"])
+            d["tier"] = str(d["tier"])
+            rows.append(d)
+        return pl.DataFrame(
+            rows,
+            schema_overrides={"range_lo": pl.Float64, "range_hi": pl.Float64},
+        )
+
+    def validate_dependencies(self) -> None:
+        """Reject declared predecessor references that cannot resolve.
+
+        A feature's ``depends_on`` column that is emitted by this engine
+        must come from a STRICTLY EARLIER tier — a same-tier reference is
+        the polars ``with_columns`` forward-reference landmine (silently
+        unresolvable within one call), and a later-tier reference is a
+        cycle. References to columns the engine does not emit (base
+        series, raw bars) are the caller's contract and are not checked
+        here. Raises ``ValueError`` naming every violation.
+        """
+        tier_order = {t: i for i, t in enumerate(_ordered_tiers(
+            {spec.tier for spec in self.specs}
+        ))}
+        emitted_tier: dict[str, int | str] = {}
+        for spec, _w, name in self.plan():
+            emitted_tier[name] = spec.tier
+        problems: list[str] = []
+        for spec, w, name in self.plan():
+            for dep in spec.depends_on(w):
+                dep_tier = emitted_tier.get(dep)
+                if dep_tier is None:
+                    continue  # base/raw column — outside this engine
+                if tier_order[dep_tier] >= tier_order[spec.tier]:
+                    problems.append(
+                        f"{name} (tier {spec.tier!r}) depends on {dep} "
+                        f"(tier {dep_tier!r}) — references must point to a "
+                        "strictly earlier tier"
+                    )
+        if problems:
+            raise ValueError(
+                "FeatureEngine dependency validation failed:\n  - "
+                + "\n  - ".join(problems)
+            )
 
     def transform(
         self,

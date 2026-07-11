@@ -20,7 +20,7 @@ from typing import ClassVar
 
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, RATIO, Domain, Feature
 from src.features.config import EPS
 from src.features.primitives import (
     ewm_mean,
@@ -136,7 +136,7 @@ class BasisStd(Feature):
 
 
 class FlowTakerBuyRatio(Feature):
-    impute_default: ClassVar[float] = 0.5  # taker-buy fraction; 0.5 = balanced flow
+    domain: ClassVar[Domain] = FRACTION  # taker-buy share; neutral 0.5
     family: ClassVar[str] = "deriv_flow"
     tier: ClassVar[int | str] = 1
     inputs = ("tb_ratio_fut",)
@@ -176,7 +176,7 @@ class FlowNetVolCsum(Feature):
 
 
 class FlowFutVsSpotVol(Feature):
-    impute_default: ClassVar[float] = 1.0  # volume ratio; 1 = parity
+    domain: ClassVar[Domain] = RATIO  # fut/spot volume; 1 = parity
     """fut quote-vol over spot quote-vol (null when spot ≤ 0)."""
 
     family: ClassVar[str] = "deriv_flow"
@@ -504,7 +504,7 @@ class _FundingPhaseBase(Feature):
 
 
 class FundingPhase(_FundingPhaseBase):
-    impute_default: ClassVar[float] = 0.5  # phase in (0,1]; 0.5 = mid-cycle
+    domain: ClassVar[Domain] = FRACTION  # funding phase; 0.5 = mid-cycle
     """Unit phase to next funding settlement, in (0, 1]."""
 
     def column_name(self, w: int | None = None) -> str:
@@ -556,7 +556,7 @@ class FundingTrend(Feature):
 
 
 class OptPcrOi(Feature):
-    impute_default: ClassVar[float] = 1.0  # put/call ratio; 1 = balanced
+    domain: ClassVar[Domain] = RATIO  # put/call; 1 = balanced
     family: ClassVar[str] = "deriv_options"
     tier: ClassVar[int | str] = 1
     inputs = ("pcr_oi",)
@@ -570,7 +570,7 @@ class OptPcrOi(Feature):
 
 
 class OptPcrVol(Feature):
-    impute_default: ClassVar[float] = 1.0  # put/call ratio; 1 = balanced
+    domain: ClassVar[Domain] = RATIO  # put/call; 1 = balanced
     family: ClassVar[str] = "deriv_options"
     tier: ClassVar[int | str] = 1
     inputs = ("pcr_vol",)
@@ -698,7 +698,7 @@ class VolRiskPremiumDiff(Feature):
 
 
 class VolRiskPremiumRatio(Feature):
-    impute_default: ClassVar[float] = 1.0  # implied/realized; 1 = no premium
+    domain: ClassVar[Domain] = RATIO  # implied/realized; 1 = no premium
     """See ``VolRiskPremiumDiff`` for the shared-rv rationale."""
 
     family: ClassVar[str] = "deriv_volidx"

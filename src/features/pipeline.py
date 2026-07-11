@@ -511,13 +511,31 @@ def _impute_stage(
     impute_map: dict[str, float],
 ) -> pl.DataFrame:
     """Stage 11: undef flags + deterministic imputation."""
-    # Feature columns = everything on the boundary frame that is NOT a
-    # label, weight, raw bar, base series, or derivatives base series.
-    # Without this exclusion the impute step tries to is_infinite() check
-    # an all-null Object-dtyped column (e.g. opt_oi outside EOH coverage),
-    # which polars rejects.
+    # POSITIVE feature membership: a column is a feature because something
+    # declared it — the engine emitted it (impute_map keys = the plan) or
+    # a boundary-stage prefix declares it. The role tuples below classify
+    # the known NON-features (labels, raw bars, base series); any column
+    # in NEITHER set is contract drift and fails loudly. This replaces the
+    # historical everything-except-exclusion-lists subtraction, under
+    # which a new stray column silently became a model feature.
+    from src.core.errors import ContractError
+    from src.features.boundary import is_boundary_feature_column
+
     non_feature = set(_LABEL_AUX_COLS + _RAW_COLS + _BASE_COLS + _DERIV_BASE_COLS)
-    feature_cols = [c for c in df_boundaries.columns if c not in non_feature]
+    feature_cols: list[str] = []
+    unknown: list[str] = []
+    for c in df_boundaries.columns:
+        if c in impute_map or is_boundary_feature_column(c):
+            feature_cols.append(c)
+        elif c not in non_feature:
+            unknown.append(c)
+    if unknown:
+        raise ContractError(
+            f"pipeline produced {len(unknown)} column(s) with no declared "
+            f"role: {unknown[:8]} — declare a Feature class / boundary "
+            "prefix (feature) or add to the role tuples in pipeline.py "
+            "(label/raw/base)."
+        )
     df_final, _ = create_undef_flags_and_impute_pl(
         df_boundaries,
         feature_cols,

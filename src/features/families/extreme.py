@@ -35,7 +35,7 @@ from typing import ClassVar
 import numpy as np
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, Domain, Feature
 from src.features.config import EPS
 from src.features.primitives import rolling_max, rolling_min
 
@@ -53,6 +53,8 @@ class _ExtremeFeature(Feature):
 
 
 class ExtremeDistLowZ(_ExtremeFeature):
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        return self.inputs + (f"vol__rs__f__w{w}",)
     impute_default: ClassVar[float] = 5.0  # 'far from the extreme' sentinel
     """Volatility-normalized log-distance from current close to trailing low.
 
@@ -77,6 +79,8 @@ class ExtremeDistLowZ(_ExtremeFeature):
 
 
 class ExtremeDistHighZ(_ExtremeFeature):
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        return self.inputs + (f"vol__rs__f__w{w}",)
     impute_default: ClassVar[float] = 5.0  # 'far from the extreme' sentinel
     """Volatility-normalized log-distance from trailing high to current close.
 
@@ -134,7 +138,7 @@ def _rolling_rank_of_current_np(p: np.ndarray, w: int) -> np.ndarray:
 
 
 class ExtremePriceRank(_ExtremeFeature):
-    impute_default: ClassVar[float] = 0.5  # median of bounded support
+    domain: ClassVar[Domain] = FRACTION  # price rank in [0, 1]
     """Empirical CDF of current log close inside the trailing window.
 
         R_{W,n} = (1/W) * sum_{i in [n-W+1, n]} 1{p_i <= p_n}

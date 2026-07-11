@@ -13,12 +13,12 @@ from typing import ClassVar
 
 import polars as pl
 
-from src.features.base import Feature
+from src.features.base import FRACTION, Domain, Feature
 from src.features.primitives import perm_entropy_m3
 
 
 class EntropyPermNorm(Feature):
-    impute_default: ClassVar[float] = 0.5  # normalized entropy; 0.5 = uninformative
+    domain: ClassVar[Domain] = FRACTION  # normalized entropy
     family: ClassVar[str] = "entropy"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)

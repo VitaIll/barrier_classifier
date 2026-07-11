@@ -1,3 +1,40 @@
+## 2026-07-11 — Self-describing Feature contract; pipeline as pure aggregator
+
+Everything feature-level now lives ON the Feature class; the pipeline
+aggregates declarations instead of owning per-feature knowledge.
+
+- **`Domain` value objects** (`base.py`): a feature's TYPE as one
+  declaration — `REAL`, `NONNEGATIVE`, `FRACTION`, `SIGNED_FRACTION`,
+  `RATIO`, `BINARY`, `OSCILLATOR_0_100` — deriving the imputation fill
+  (domain neutral), the expected range (domain bounds), and the legal
+  operations (`LEGAL_OPS_BY_DOMAIN`: e.g. logit for fractions, log for
+  ratios, winsorize for unbounded tails). 16 of the 21 explicit impute
+  declarations became domain declarations; true sentinels (e.g.
+  `extreme__dist_z -> 5.0`, `oi__total_usd -> median`) stay explicit.
+  The imputation bridge suite pins values unchanged.
+- **`depends_on(w)` — true predecessors.** Tier-2 features that read
+  earlier-tier columns via f-strings now DECLARE them (equilibrium
+  residual/pair interactions, pivot, extreme z-distances, flow
+  absorption/exhaustion). `FeatureEngine.validate_dependencies()` runs at
+  construction: a same-/later-tier reference — the polars
+  `with_columns` forward-reference landmine — is now a hard error with
+  the offending edge named, instead of a silent missing-column failure
+  mid-transform.
+- **`tags` / `effective_tags`**: categorical labels (family, tier,
+  domain, windowed-ness structural; class enrichment additive) for
+  selection and reporting.
+- **`describe()` + `FeatureEngine.catalog()`**: the metadata surface —
+  one row per emitted column with domain, range, imputation, warmup,
+  predecessors, tags, legal ops.
+- **Positive feature membership** (`pipeline._impute_stage`): a column is
+  a feature because the engine emitted it or a boundary prefix declares
+  it — never because it failed to appear on an exclusion list. A column
+  with NO declared role is now a `ContractError` (under the old
+  subtraction, a stray column silently became a model feature). Frame
+  order — the frozen serving contract — is preserved; the bridge suite
+  asserts positive == legacy subtraction exactly on a real pipeline
+  frame.
+
 ## 2026-07-11 — Re-architecture Phase 3.3 + Phase 4: imputation on classes, evaluation consolidation
 
 **Imputation lives with the features now.** The 140-line order-sensitive

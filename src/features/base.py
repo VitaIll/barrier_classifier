@@ -12,11 +12,76 @@ escape hatch when the strict convention does not fit (e.g. legacy parity).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Iterable, Iterator, Optional
+from dataclasses import dataclass
+from typing import Any, ClassVar, Iterable, Iterator, Optional
 
 import polars as pl
 
 from src.features.config import DEFAULT_CONFIG, FeatureConfig
+
+
+# =============================================================================
+# Value domains — the feature's TYPE as a value object
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class Domain:
+    """The value domain a feature's outputs live in.
+
+    One declaration drives three contracts at once:
+
+    - ``neutral`` is the default imputation fill (the "no information"
+      value of the domain — 0.5 for fractions, 1.0 for ratios, 0.0 for
+      residual-like reals);
+    - ``(lo, hi)`` is the default expected range for health checks;
+    - ``name`` selects the default legal-operation set (see
+      ``LEGAL_OPS_BY_DOMAIN``).
+
+    Features declare ``domain = FRACTION`` instead of hand-maintaining
+    three separate, silently-driftable attributes.
+    """
+
+    name: str
+    lo: Optional[float]
+    hi: Optional[float]
+    neutral: float
+
+    @property
+    def bounded(self) -> bool:
+        return self.lo is not None and self.hi is not None
+
+
+#: Unbounded real — residuals, z-scores, log-returns, changes. Neutral 0.
+REAL = Domain("real", None, None, 0.0)
+#: Non-negative scale quantities — vols, ranges, ages. Neutral 0.
+NONNEGATIVE = Domain("nonnegative", 0.0, None, 0.0)
+#: Rates / ranks / shares in [0, 1]. Neutral 0.5.
+FRACTION = Domain("fraction", 0.0, 1.0, 0.5)
+#: Signed bounded [-1, 1] — correlations, order-flow imbalance. Neutral 0.
+SIGNED_FRACTION = Domain("signed_fraction", -1.0, 1.0, 0.0)
+#: Positive ratios where 1 means parity — vol ratios, put/call ratios.
+RATIO = Domain("ratio", 0.0, None, 1.0)
+#: {0, 1} indicator flags. Neutral 0 (event absent).
+BINARY = Domain("binary", 0.0, 1.0, 0.0)
+#: RSI-style [0, 100] oscillators. Neutral 50.
+OSCILLATOR_0_100 = Domain("oscillator_0_100", 0.0, 100.0, 50.0)
+
+
+#: Advisory taxonomy of transformations that are MEANINGFUL for each
+#: domain — consumed by tooling (catalog, monitoring, preprocessing
+#: helpers), not enforced at compute time. E.g. winsorization makes sense
+#: for unbounded tails but is vacuous for [0,1] fractions; a logit is the
+#: right link for fractions but undefined for signed values.
+LEGAL_OPS_BY_DOMAIN: dict[str, frozenset[str]] = {
+    "real": frozenset({"difference", "zscore", "winsorize", "rank"}),
+    "nonnegative": frozenset({"difference", "zscore", "winsorize", "rank", "log1p"}),
+    "fraction": frozenset({"difference", "rank", "logit"}),
+    "signed_fraction": frozenset({"difference", "rank", "fisher_z"}),
+    "ratio": frozenset({"difference", "rank", "winsorize", "log"}),
+    "binary": frozenset({"rate"}),
+    "oscillator_0_100": frozenset({"difference", "rank"}),
+}
 
 
 _REGISTRY: list[type["Feature"]] = []
@@ -83,29 +148,100 @@ class Feature(ABC):
             return tuple(getattr(self.cfg, self.windows_field))
         return ()
 
+    # --- Value domain (the feature's TYPE) -----------------------------------
+    # One declaration drives the default imputation fill (domain.neutral),
+    # the default expected range (domain bounds), and the default legal
+    # operations. REAL (unbounded, neutral 0) matches the historical
+    # zero-fill default, so undeclared classes behave exactly as before.
+    domain: ClassVar[Domain] = REAL
+
     # --- Statistical contract (used by Validator) ---------------------------
+    #: Explicit override; ``None`` derives from ``domain`` bounds.
     expected_range: ClassVar[tuple[float | None, float | None] | None] = None
     expected_finite: ClassVar[bool] = True
     expected_dtype: ClassVar[pl.DataType] = pl.Float64
     max_nan_rate_after_warmup: ClassVar[float] = 0.0
+
+    # --- Categorical labels ----------------------------------------------------
+    #: Class-specific enrichment; ``effective_tags`` adds the structural
+    #: labels (family, tier, domain, windowed-ness) automatically.
+    tags: ClassVar[frozenset[str]] = frozenset()
 
     # --- Imputation contract ----------------------------------------------------
     # The fill applied to missing values (warmup rows, undefined inputs)
     # AFTER the ``undef__`` flag is recorded. Declared HERE, next to the
     # feature that owns the column — previously a 140-line order-sensitive
     # regex table in utils keyed on column names, with a silent 0.0
-    # catch-all. 0.0 is the correct neutral for the majority (residuals,
-    # z-scores, changes, rates-of-change); bounded/ratio features override
-    # (e.g. RSI -> 50, ratios -> 1, fractions -> 0.5).
-    impute_default: ClassVar[float] = 0.0
+    # catch-all. ``None`` (default) derives the fill from the value
+    # domain's neutral; set explicitly ONLY for sentinel fills that are
+    # deliberately NOT the domain neutral (e.g. "far from the extreme"
+    # distances filled at 5.0).
+    impute_default: ClassVar[Optional[float]] = None
 
     def impute_value(self, w: int | None = None) -> float:
         """Fill value for this feature's column at window ``w``.
 
-        Override for window-dependent policies; the default returns the
-        class-level ``impute_default``.
+        Defaults to the value domain's neutral; an explicit
+        ``impute_default`` overrides (sentinel fills). Override the method
+        for window-dependent policies.
         """
-        return float(self.impute_default)
+        if self.impute_default is not None:
+            return float(self.impute_default)
+        return float(self.domain.neutral)
+
+    # --- Derived contract surfaces -------------------------------------------
+
+    @property
+    def value_range(self) -> tuple[float | None, float | None]:
+        """Expected output range: explicit override or the domain bounds."""
+        if self.expected_range is not None:
+            return self.expected_range
+        return (self.domain.lo, self.domain.hi)
+
+    @property
+    def legal_ops(self) -> frozenset[str]:
+        """Transformations that are meaningful for this feature's domain."""
+        return LEGAL_OPS_BY_DOMAIN.get(self.domain.name, frozenset())
+
+    @property
+    def effective_tags(self) -> frozenset[str]:
+        """Structural labels + class enrichment, for selection/reporting."""
+        structural = {self.family, f"tier:{self.tier}", f"domain:{self.domain.name}"}
+        if self.windows:
+            structural.add("windowed")
+        return frozenset(structural) | self.tags
+
+    def depends_on(self, w: int | None = None) -> tuple[str, ...]:
+        """Column-level predecessors of this feature at window ``w``.
+
+        Defaults to the declared base ``inputs``. Tier-2 features that
+        read columns EMITTED BY EARLIER TIERS (today referenced via
+        f-strings inside ``compute``) should override so the dependency
+        is declared, not implicit — the engine validates the declared
+        graph at construction and rejects same-/later-tier references
+        (the polars ``with_columns`` forward-reference landmine).
+        """
+        return self.inputs
+
+    def describe(self, w: int | None = None) -> dict[str, Any]:
+        """Self-description of one emitted column — the metadata surface."""
+        return {
+            "column": self.column_name(w),
+            "family": self.family,
+            "name": self.name,
+            "tier": self.tier,
+            "window": w,
+            "domain": self.domain.name,
+            "range_lo": self.value_range[0],
+            "range_hi": self.value_range[1],
+            "impute": self.impute_value(w),
+            "warmup_rows": self.warmup_for(w),
+            "null_tail_rows": self.null_tail_bars,
+            "depends_on": list(self.depends_on(w)),
+            "tags": sorted(self.effective_tags),
+            "legal_ops": sorted(self.legal_ops),
+            "class": type(self).__name__,
+        }
 
     # --- Warmup / null tail -------------------------------------------------
     null_tail_bars: ClassVar[int] = 0
