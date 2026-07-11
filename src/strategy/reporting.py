@@ -458,3 +458,153 @@ def plot_regime_attribution(closed: pd.DataFrame, *, cost_per_trade: float, ax=N
         )
     ax.grid(axis="y", alpha=0.3)
     return ax
+
+
+# ---------------------------------------------------------------------------
+# Trade forensics — kernels behind SimResult's owner-attached methods.
+# Ported from notebook 05's inline helpers (2026-07-11): the result object
+# owns its trade analysis; callers inject the market context (raw bars).
+# ---------------------------------------------------------------------------
+
+
+def trade_composition(
+    equity: pd.DataFrame,
+    closed: pd.DataFrame,
+    raw_bars: pd.DataFrame,
+    *,
+    bin_edges: np.ndarray,
+) -> dict:
+    """Open-book composition per equity step, bucketed by current MTM.
+
+    For each equity row, every open trade is marked to the last known
+    close and assigned to an MTM bucket (``bin_edges``, log-return units,
+    ``len(bin_edges) - 1`` buckets). Returns a dict of aligned arrays:
+
+    - ``counts``     (n_steps, n_bins) — open lots per MTM bucket
+    - ``sum_mtm``    (n_steps,)        — summed unweighted open MTM
+    - ``n_open``     (n_steps,)        — open-lot count
+    - ``worst_mtm``  (n_steps,)        — deepest open-lot MTM (NaN if flat)
+    """
+    edges = np.asarray(bin_edges, dtype=float)
+    n_bins = len(edges) - 1
+    if n_bins < 1:
+        raise ValueError("bin_edges must define at least one bucket")
+    eq_idx = pd.DatetimeIndex(pd.to_datetime(equity["ts"].values))
+    n = len(eq_idx)
+    counts = np.zeros((n, n_bins), dtype=int)
+    sum_mtm = np.zeros(n, dtype=float)
+    n_open = np.zeros(n, dtype=int)
+    worst_mtm = np.full(n, np.nan, dtype=float)
+    if len(closed) == 0 or n == 0:
+        return {
+            "counts": counts, "sum_mtm": sum_mtm,
+            "n_open": n_open, "worst_mtm": worst_mtm,
+        }
+    close_arr = (
+        raw_bars["close"].reindex(eq_idx, method="ffill").to_numpy(dtype=float)
+    )
+    entry_ts = closed["ts_entry"].to_numpy()
+    exit_ts = closed["ts_exit"].to_numpy()
+    entry_px = closed["entry_price"].to_numpy(dtype=float)
+    i0s = np.maximum(eq_idx.searchsorted(entry_ts, side="right") - 1, 0)
+    i1s = np.minimum(eq_idx.searchsorted(exit_ts, side="right") - 1, n - 1)
+    for i0, i1, ep in zip(i0s, i1s, entry_px):
+        if i1 < i0 or ep <= 0:
+            continue
+        mtm = np.log(close_arr[i0 : i1 + 1] / ep)
+        bin_ix = np.clip(np.digitize(mtm, edges) - 1, 0, n_bins - 1)
+        rows = np.arange(i0, i1 + 1)
+        np.add.at(counts, (rows, bin_ix), 1)
+        sum_mtm[rows] += mtm
+        n_open[rows] += 1
+        worst_mtm[rows] = np.where(
+            np.isnan(worst_mtm[rows]), mtm, np.fmin(worst_mtm[rows], mtm)
+        )
+    return {
+        "counts": counts, "sum_mtm": sum_mtm,
+        "n_open": n_open, "worst_mtm": worst_mtm,
+    }
+
+
+def entry_local_min_rank(
+    closed: pd.DataFrame,
+    raw_bars: pd.DataFrame,
+    *,
+    window_minutes: int = 60,
+) -> np.ndarray:
+    """How close each entry sat to a local price minimum, in [0, 1].
+
+    Rank = fraction of closes within ±``window_minutes`` of the entry that
+    are BELOW the entry price. 0 means the entry was the local minimum;
+    1 means it was the local maximum. NaN when the window is degenerate.
+    """
+    ranks = np.full(len(closed), np.nan)
+    if len(closed) == 0:
+        return ranks
+    raw_idx = raw_bars.index
+    raw_close = raw_bars["close"].to_numpy(dtype=float)
+    half = pd.Timedelta(minutes=int(window_minutes))
+    for i, (ts_entry, entry_price) in enumerate(
+        zip(closed["ts_entry"], closed["entry_price"])
+    ):
+        ts_entry = pd.Timestamp(ts_entry)
+        i0 = int(raw_idx.searchsorted(ts_entry - half, side="left"))
+        i1 = int(raw_idx.searchsorted(ts_entry + half, side="right"))
+        if i1 <= i0 + 1:
+            continue
+        window = raw_close[i0:i1]
+        ranks[i] = float((window < float(entry_price)).sum()) / float(
+            len(window) - 1
+        )
+    return ranks
+
+
+def select_trade_sample(
+    closed: pd.DataFrame,
+    raw_bars: pd.DataFrame,
+    *,
+    n_per_group: int = 4,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Representative trades for zoom-in inspection.
+
+    Four groups: fastest / slowest holds, deepest intra-trade worst MTM,
+    and a seeded random draw — deduplicated by entry timestamp. Adds
+    ``hold_min``, ``worst_mtm``, and ``group`` columns; the input frame is
+    not mutated.
+    """
+    if len(closed) == 0:
+        return closed.copy()
+    df = closed.copy().reset_index(drop=True)
+    df["hold_min"] = (
+        (df["ts_exit"] - df["ts_entry"]).dt.total_seconds() / 60.0
+    )
+    raw_idx = raw_bars.index
+    raw_low = raw_bars["low"].to_numpy(dtype=float)
+    worst = np.zeros(len(df))
+    for i, (ts_entry, ts_exit, entry_price) in enumerate(
+        zip(df["ts_entry"], df["ts_exit"], df["entry_price"])
+    ):
+        lo = int(raw_idx.searchsorted(np.datetime64(ts_entry), side="right"))
+        hi = int(raw_idx.searchsorted(np.datetime64(ts_exit), side="right"))
+        if hi > lo:
+            worst[i] = float(np.log(raw_low[lo:hi].min() / float(entry_price)))
+    df["worst_mtm"] = worst
+    fastest = df.nsmallest(n_per_group, "hold_min")
+    slowest = df.nlargest(n_per_group, "hold_min")
+    deepest = df.nsmallest(n_per_group, "worst_mtm")
+    rng = np.random.default_rng(seed)
+    random_idx = rng.choice(df.index, size=min(n_per_group, len(df)), replace=False)
+    randoms = df.loc[random_idx]
+    selected = (
+        pd.concat([fastest, slowest, deepest, randoms])
+        .drop_duplicates(subset=["ts_entry"])
+        .reset_index(drop=True)
+    )
+    selected["group"] = (
+        ["fastest"] * len(fastest)
+        + ["slowest"] * len(slowest)
+        + ["worst-MTM"] * len(deepest)
+        + ["random"] * len(randoms)
+    )[: len(selected)]
+    return selected

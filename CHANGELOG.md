@@ -1,3 +1,30 @@
+## 2026-07-11 — Ownership pass: behaviors attach to the objects that own them
+
+Continuation of the self-describing-Feature principle across the other
+domain objects — a behavior lives at the lowest level that naturally owns
+it (`matrix.rank()`-style), and outside code acts through that contract.
+
+- **`BarrierSpec.label(bars)` / `.uniqueness_weights(n)`**: labeling and
+  overlap-weighting are behaviors of the label definition; the free
+  functions remain as the kernels underneath.
+- **`SimResult.composition() / .entry_local_min_rank() / .sample_trades()`**:
+  the ~75 lines of trade forensics notebook 05 hand-rolled (open-book MTM
+  composition, entry-quality local-min rank, representative trade
+  sampling) become methods on the result object, with the market context
+  (raw bars) injected by the caller. Kernels in
+  `strategy/reporting.py`; composition loop vectorized with
+  `searchsorted`/`np.add.at`. Tested on a golden-scenario run
+  (`tests/strategy/test_result_forensics.py`).
+- **`src/market/bars.py` — `RawBars`**: the 1-min bar series owns its
+  integrity: `.validate()` (kline sanity report — port of
+  `utils.validate_klines`, reporting instead of raising) and
+  `.fill_gaps()` (deterministic flat-bar grid repair from the previous
+  close, spec §4.5 — port of the notebook-01 inline cell). First-ever
+  test coverage for both (they were untested despite being
+  causality-relevant), including the leading-gap refusal and the
+  `GapFillReport.synthetic_ts` hand-off into the retrain
+  synthetic-exclusion path (review N11's research-side source of truth).
+
 ## 2026-07-11 — Self-describing Feature contract; pipeline as pure aggregator
 
 Everything feature-level now lives ON the Feature class; the pipeline

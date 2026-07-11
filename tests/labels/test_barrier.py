@@ -151,6 +151,22 @@ class TestBarrierSpec:
         b = BarrierSpec(horizon=20, upper=0.0025)
         assert a == b and hash(a) == hash(b)
 
+    def test_spec_owns_labeling(self):
+        # spec.label(bars) is the owner-attached form of label_frame.
+        spec = BarrierSpec(horizon=20, upper=0.0025)
+        bars = _bar_frame(200)
+        via_method = spec.label(bars)
+        via_function = label_frame(bars, spec)
+        assert via_method.equals(via_function)
+
+    def test_spec_owns_uniqueness_weights(self):
+        from src.analytics.sampling import compute_uniqueness_weights
+
+        spec = BarrierSpec(horizon=20, upper=0.0025, stride=1)
+        got = spec.uniqueness_weights(500, normalize=False)
+        exp = compute_uniqueness_weights(500, 20, bar_stride=1, normalize=False)
+        np.testing.assert_array_equal(got, exp)
+
 
 # ---------------------------------------------------------------------------
 # Kernel parity vs the frozen oracle

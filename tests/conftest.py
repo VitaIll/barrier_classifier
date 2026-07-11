@@ -74,6 +74,8 @@ _THEME_BY_PATH: dict[str, str] = {
     "labels/test_barrier.py": "labels",
     # weights (sample-weight blocks)
     "weights/test_blocks.py": "weights",
+    # market (bar-series domain)
+    "market/test_bars.py": "market",
     # features_pipeline
     "features/test_boundary.py": "features_pipeline",
     "features/test_quality.py": "features_pipeline",
@@ -110,6 +112,7 @@ _THEME_BY_PATH: dict[str, str] = {
     "strategy/test_simulator.py": "strategy",
     "strategy/test_golden_ledgers.py": "strategy",
     "strategy/test_definitions.py": "strategy",
+    "strategy/test_result_forensics.py": "strategy",
     # engine (live engine)
     "engine/test_domain_buffer_guards.py": "engine",
     "engine/test_sources.py": "engine",

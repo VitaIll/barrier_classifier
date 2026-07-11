@@ -119,6 +119,37 @@ class SimResult:
             cadence_minutes=float(self.config.get("cadence_minutes", 20.0)),
         )
 
+    # -- trade forensics (the result owns its analysis; callers inject the
+    #    market context). Kernels live in src.strategy.reporting. ---------
+
+    def composition(self, raw_bars: pd.DataFrame, *, bin_edges) -> dict:
+        """Open-book composition per equity step, bucketed by current MTM."""
+        from src.strategy.reporting import trade_composition
+
+        return trade_composition(
+            self.equity, self.closed, raw_bars, bin_edges=bin_edges
+        )
+
+    def entry_local_min_rank(
+        self, raw_bars: pd.DataFrame, *, window_minutes: int = 60
+    ):
+        """Entry quality: rank of each entry vs its ±window local closes."""
+        from src.strategy.reporting import entry_local_min_rank
+
+        return entry_local_min_rank(
+            self.closed, raw_bars, window_minutes=window_minutes
+        )
+
+    def sample_trades(
+        self, raw_bars: pd.DataFrame, *, n_per_group: int = 4, seed: int = 0
+    ) -> pd.DataFrame:
+        """Representative trades (fastest/slowest/deepest/random) for review."""
+        from src.strategy.reporting import select_trade_sample
+
+        return select_trade_sample(
+            self.closed, raw_bars, n_per_group=n_per_group, seed=seed
+        )
+
 
 # ---------------------------------------------------------------------------
 # Inputs

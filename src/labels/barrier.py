@@ -127,6 +127,32 @@ class BarrierSpec:
     def source_column(self) -> str:
         return "high" if self.source == "high" else "close"
 
+    # -- behaviors owned by the definition ------------------------------------
+
+    def label(self, bars: pl.DataFrame, *, n_out: Optional[int] = None) -> pl.DataFrame:
+        """Label a bar frame under THIS definition.
+
+        The spec owns labeling the way a matrix owns its rank — callers
+        ask the definition rather than threading (M, phi, source, stride)
+        through a free function. Returns the decision-row label frame
+        (see :func:`label_frame`).
+        """
+        return label_frame(bars, self, n_out=n_out)
+
+    def uniqueness_weights(self, n_rows: int, *, normalize: bool = True) -> np.ndarray:
+        """López-de-Prado uniqueness weights for THIS label definition.
+
+        Adjacent overlapping labels (stride < horizon) describe the same
+        economic event; these weights down-weight the redundancy. Derived
+        from the same horizon/stride as :meth:`label_intervals`, so the
+        weighting can never drift from the labels it corrects for.
+        """
+        from src.analytics.sampling import compute_uniqueness_weights
+
+        return compute_uniqueness_weights(
+            n_rows, self.horizon, bar_stride=self.stride, normalize=normalize
+        )
+
 
 # Label columns as a contract. ``y`` is null where the window is unknowable;
 # ``m_k``/``tau_k`` are additionally null where the forward window was
