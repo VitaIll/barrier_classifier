@@ -36,7 +36,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import EPS, WINDOWS_FLOW_PRESSURE
+from src.features.config import EPS
 from src.features.primitives import rolling_sum, rolling_std_pop
 
 
@@ -48,7 +48,7 @@ class _FlowFeature(Feature):
     # (``vol__rs``). ``pressure`` could be tier-1 but stays here for
     # family-namespace consistency.
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_FLOW_PRESSURE)
+    windows_field: ClassVar[str] = "windows_flow_pressure"
 
 
 class FlowPressure(_FlowFeature):

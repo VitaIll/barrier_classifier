@@ -21,7 +21,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import EPS, M as _M, WINDOWS_OI_REGIME
+from src.features.config import EPS
 from src.features.primitives import (
     ewm_mean,
     rolling_mean,
@@ -359,7 +359,7 @@ class _OiRegimeFeature(Feature):
     # Tier 2: depends on ``ret__rms__f__w{W}`` for price normalization.
     tier: ClassVar[int | str] = 2
     inputs = ("p", "oi_usd")
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_OI_REGIME)
+    windows_field: ClassVar[str] = "windows_oi_regime"
 
 
 def _oi_regime_components(w: int) -> tuple[pl.Expr, pl.Expr]:

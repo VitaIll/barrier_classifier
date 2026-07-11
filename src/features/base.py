@@ -12,9 +12,11 @@ escape hatch when the strict convention does not fit (e.g. legacy parity).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar, Iterable, Iterator
+from typing import ClassVar, Iterable, Iterator, Optional
 
 import polars as pl
+
+from src.features.config import DEFAULT_CONFIG, FeatureConfig
 
 
 _REGISTRY: list[type["Feature"]] = []
@@ -55,8 +57,31 @@ class Feature(ABC):
     family: ClassVar[str] = ""
     name: ClassVar[str] = ""
     inputs: ClassVar[tuple[str, ...]] = ()
-    windows: ClassVar[tuple[int, ...]] = ()
     tier: ClassVar[int | str] = 1
+
+    # --- Window binding -------------------------------------------------------
+    # Two ways to declare windows:
+    #   1. ``windows_field = "windows_eq"`` — resolved from the injected
+    #      FeatureConfig at INSTANTIATION time (the config-driven form; two
+    #      configurations can coexist in one process).
+    #   2. ``windows = (5, 60)`` as a plain class attribute — a class-local
+    #      constant that no experiment varies. The subclass attribute
+    #      shadows the base property below, so both forms coexist.
+    windows_field: ClassVar[Optional[str]] = None
+
+    def __init__(self, config: Optional[FeatureConfig] = None) -> None:
+        """Bind this spec to a configuration (default: production config).
+
+        Features hold NO data state — ``cfg`` is frozen configuration; the
+        instance stays reusable and thread-safe.
+        """
+        self.cfg: FeatureConfig = config if config is not None else DEFAULT_CONFIG
+
+    @property
+    def windows(self) -> tuple[int, ...]:
+        if self.windows_field is not None:
+            return tuple(getattr(self.cfg, self.windows_field))
+        return ()
 
     # --- Statistical contract (used by Validator) ---------------------------
     expected_range: ClassVar[tuple[float | None, float | None] | None] = None

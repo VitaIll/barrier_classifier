@@ -1,3 +1,51 @@
+## 2026-07-11 — Re-architecture Phase 3.2: sample-weight blocks (`src/weights/`)
+
+`BarrierDistanceWeight`, `TimeDiscountWeight`, `TrainingWeights` — faithful
+ports of the legacy `utils.compute_*_weight` functions with the
+module-global `WEIGHT_*` defaults replaced by explicit frozen
+configuration objects; `UniquenessWeight` bridges
+`analytics.sampling.compute_uniqueness_weights` to a `BarrierSpec` so the
+weighting horizon can never drift from the label definition. Numerics
+bit-exact against the legacy implementations (29-test parity suite, theme
+`weights`, covering every configuration axis + degenerate inputs +
+argument non-mutation). The utils originals remain the oracle until their
+Phase-5 retirement.
+
+## 2026-07-11 — Re-architecture Phase 3.1: FeatureConfig injection
+
+The feature layer's shared parameters (horizon ``M``, barrier ``phi``, all
+window families) are now an immutable, validated ``FeatureConfig`` value
+object injected at registry-build time — not module globals frozen at
+import. Two configurations coexist in one process; a custom horizon or
+window grid is a constructor call. ``DEFAULT_CONFIG`` mirrors the legacy
+``src.utils`` constants exactly (bit-parity asserted at import and by the
+feature oracle suites — all 301 green, values unchanged).
+
+- **`src/features/config.py`**: `FeatureConfig` (frozen dataclass, ~40
+  fields) with derived `phi`/`n_warmup`/`k_warmup` properties and
+  construction-time validation, including cross-field checks (eq pair
+  windows must exist in `windows_eq` — was a deep polars missing-column
+  crash, now a `ConfigError` naming the inconsistency). Legacy constant
+  re-exports remain for unthreaded modules (retire in Phase 5).
+- **`Feature` base**: instances bind a config at construction
+  (`cls(config)` from `FeatureEngine`); windows resolve via
+  `windows_field = "<config field>"` with class-attribute shadowing so
+  class-local static tuples keep working unchanged.
+- **All 18 family modules migrated** off module-global constants
+  (`_SQRT_M`-style import-time constants become per-instance
+  `self.cfg.m` reads; identical floats). The six import-time-generated
+  equilibrium pair classes are ONE config-driven `EqPairInteractions`
+  yielding (pullback, above) interleaved per pair — preserving the frozen
+  v0001 feature-list COLUMN ORDER exactly (the serving contract compares
+  ordered tuples; verified explicitly).
+- **`run_pipeline`/`run_inference_pipeline` accept `config=`** (default =
+  production config, outputs byte-identical); `_PipelinePlan` carries it;
+  every boundary-stage constant read now flows from the plan's config.
+- New `tests/features/test_feature_config.py`: validation, derived
+  properties, and coexistence proofs (two engines with different
+  windows/M side by side, no cross-talk; sqrt(M) denominators tracking
+  the injected M; pair grids from config).
+
 ## 2026-07-11 — Re-architecture Phase 2: one BoundaryStep, typed decision domain
 
 The per-boundary trading loop now exists ONCE. ``simulate()`` (batch) and

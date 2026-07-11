@@ -20,7 +20,6 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import LAGS_F
 
 
 class _LagFeature(Feature):
@@ -36,7 +35,7 @@ class _LagFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "lag"
     tier: ClassVar[int | str] = 1
-    windows: ClassVar[tuple[int, ...]] = tuple(LAGS_F)
+    windows_field: ClassVar[str] = "lags_f"
 
     output_prefix: ClassVar[str] = ""  # set by subclass
 

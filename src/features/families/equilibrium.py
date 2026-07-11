@@ -30,14 +30,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import (
-    EPS,
-    HALFLIVES_EQ,
-    M,
-    PHI,
-    WINDOWS_EQ,
-    WINDOWS_EQ_PAIRS,
-)
+from src.features.config import EPS
 from src.features.primitives import (
     ewm_mean_halflife,
     past_only_linear_trend_mu,
@@ -52,7 +45,6 @@ from src.features.primitives import (
 )
 
 
-_SQRT_M = math.sqrt(float(M))
 
 
 # =============================================================================
@@ -71,7 +63,7 @@ class _EqTier1Window(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "eq"
     tier: ClassVar[int | str] = 1
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_EQ)
+    windows_field: ClassVar[str] = "windows_eq"
 
     def warmup_for(self, w: int | None) -> int:
         return w if w else 0
@@ -85,7 +77,7 @@ class _EqTier1HalfLife(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "eq"
     tier: ClassVar[int | str] = 1
-    windows: ClassVar[tuple[int, ...]] = tuple(HALFLIVES_EQ)
+    windows_field: ClassVar[str] = "halflives_eq"
 
     def warmup_for(self, w: int | None) -> int:
         # EWMA with adjust=False seeds at row 0 (y_0 = x_0) and never
@@ -346,7 +338,7 @@ class _EqTier2Window(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "eq"
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_EQ)
+    windows_field: ClassVar[str] = "windows_eq"
 
     def warmup_for(self, w: int | None) -> int:
         return w if w else 0
@@ -358,7 +350,7 @@ class _EqTier2HalfLife(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "eq"
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = tuple(HALFLIVES_EQ)
+    windows_field: ClassVar[str] = "halflives_eq"
 
     def warmup_for(self, w: int | None) -> int:
         # Same as the tier-1 EWMA base: only the .shift(1) contributes a
@@ -391,7 +383,7 @@ class EqMeanResidHz(_EqTier2Window):
         p = pl.col("p")
         mu = pl.col(f"eq__mu_mean__f__w{w}")
         sigma = pl.col(f"eq__sigma_r__f__w{w}")
-        return (p - mu) / (sigma * _SQRT_M + EPS)
+        return (p - mu) / (sigma * math.sqrt(float(self.cfg.m)) + EPS)
 
 
 # -------- Feature 2: median residual / MAD ---------------------------------
@@ -439,7 +431,7 @@ class EqVwapResidHz(_EqTier2Window):
         p = pl.col("p")
         mu = pl.col(f"eq__mu_vwap__f__w{w}")
         sigma = pl.col(f"eq__sigma_r__f__w{w}")
-        return (p - mu) / (sigma * _SQRT_M + EPS)
+        return (p - mu) / (sigma * math.sqrt(float(self.cfg.m)) + EPS)
 
 
 # -------- Feature 4: range-midpoint residual / horizon vol -----------------
@@ -464,7 +456,7 @@ class EqRangeMidResidHz(_EqTier2Window):
         p = pl.col("p")
         mu = pl.col(f"eq__mu_range__f__w{w}")
         sigma = pl.col(f"eq__sigma_r__f__w{w}")
-        return (p - mu) / (sigma * _SQRT_M + EPS)
+        return (p - mu) / (sigma * math.sqrt(float(self.cfg.m)) + EPS)
 
 
 # -------- Feature 5: linear-trend residual / fit residual scale ------------
@@ -514,7 +506,7 @@ class EqEwmInnovHz(_EqTier2HalfLife):
         p = pl.col("p")
         mu = pl.col(f"eq__mu_ewm__f__h{w}")
         sigma = pl.col(f"eq__sigma_r_ewm__f__h{w}")
-        return (p - mu) / (sigma * _SQRT_M + EPS)
+        return (p - mu) / (sigma * math.sqrt(float(self.cfg.m)) + EPS)
 
 
 # -------- Feature 7: upside-to-equilibrium / phi ----------------------------
@@ -544,7 +536,7 @@ class _EqUpsideToEqOverPhi(_EqTier2Window):
     def compute(self, w: int | None = None) -> pl.Expr:
         p = pl.col("p")
         mu = pl.col(f"eq__mu_{self.proxy}__f__w{w}")
-        return (mu - p) / (PHI + EPS)
+        return (mu - p) / (self.cfg.phi + EPS)
 
 
 class EqUpsideToEqOverPhiViaTrend(_EqUpsideToEqOverPhi):
@@ -584,7 +576,9 @@ class _EqBarrierVsEqHz(_EqTier2Window):
         p = pl.col("p")
         mu = pl.col(f"eq__mu_{self.proxy}__f__w{w}")
         sigma = pl.col(f"eq__sigma_r__f__w{w}")
-        return (mu - (p + PHI)) / (sigma * _SQRT_M + EPS)
+        return (mu - (p + self.cfg.phi)) / (
+            sigma * math.sqrt(float(self.cfg.m)) + EPS
+        )
 
 
 class EqBarrierVsEqHzViaTrend(_EqBarrierVsEqHz):
@@ -633,114 +627,74 @@ class EqProxyDispersionHz(_EqTier2Window):
         n_valid = proxies.list.len()
         disp_std = proxies.list.std(ddof=0)
         guarded = pl.when(n_valid >= 2).then(disp_std).otherwise(None)
-        return guarded / (sigma * _SQRT_M + EPS)
+        return guarded / (sigma * math.sqrt(float(self.cfg.m)) + EPS)
 
 
 # -------- Feature 10: rising-equilibrium pullback --------------------------
 
 
-class _EqPullbackRisingEq(Feature):
-    """``max(0, (mu_S - p)/(sigma_L·√M+EPS)) · max(0, (mu_S - mu_L)/(sigma_L·√M+EPS))``.
+class EqPairInteractions(Feature):
+    """Pullback-in-uptrend and overextension-in-downtrend interactions.
 
-    Positive only when (a) current price is below the *short-horizon* mean
-    equilibrium AND (b) short-horizon equilibrium is itself above the
-    long-horizon equilibrium (local fair value is rising). Aims at the
-    ``pullback inside an uptrend`` setup that flat residuals can't pick out.
+    Two feature kinds per ``(S, L)`` pair in ``cfg.windows_eq_pairs``:
 
-    Pair-windowed: one concrete class per ``(S, L) ∈ WINDOWS_EQ_PAIRS``.
+    - ``eq__pullback_rising_eq__f__w{S}__l{L}``:
+      ``max(0, (mu_S - p)/(sigma_L*sqrt(M)+EPS)) * max(0, (mu_S - mu_L)/(...))``
+      — positive only when price sits below the short-horizon equilibrium
+      AND that equilibrium is above the long-horizon one (local fair value
+      rising): the "pullback inside an uptrend" setup.
+    - ``eq__above_falling_eq__f__w{S}__l{L}``: the mirror — price above the
+      short equilibrium while it has fallen below the long one. The natural
+      false-positive region for a long classifier.
+
+    One class emits BOTH kinds, interleaved per pair (pullback then above),
+    because the production feature-list contract (models/v*/contract.json)
+    freezes column ORDER — this reproduces the registration order of the
+    historical per-pair generated classes exactly. The pair grid itself
+    now comes from the injected config, so extending
+    ``windows_eq_pairs`` adds both columns automatically.
+
+    ``expanded()`` yields ``w = (S, L, kind)`` tokens; ``sigma_r_L`` drives
+    warmup at ``L + 1`` for both kinds.
     """
 
-    __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "eq"
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = ()
     inputs = ("p",)
 
-    S: ClassVar[int] = 0
-    L: ClassVar[int] = 0
+    _KINDS: ClassVar[tuple[str, ...]] = ("pullback_rising_eq", "above_falling_eq")
 
-    def column_name(self, w: int | None = None) -> str:
-        return f"eq__pullback_rising_eq__f__w{self.S}__l{self.L}"
+    def expanded(self):
+        for s, l in self.cfg.windows_eq_pairs:
+            for kind in self._KINDS:
+                w = (int(s), int(l), kind)
+                yield w, self.column_name(w)
 
-    def warmup_for(self, w: int | None) -> int:
-        # The long-window proxy decides warmup; the short window warms up
-        # earlier so it's not the binding constraint. ``sigma_r_L`` has
-        # warmup ``L + 1`` (r[0] null + past-only shift), so that is the
-        # binding row count here.
-        return int(self.L) + 1
+    def column_name(self, w=None) -> str:
+        s, l, kind = w
+        return f"eq__{kind}__f__w{s}__l{l}"
 
-    def compute(self, w: int | None = None) -> pl.Expr:
+    def warmup_for(self, w) -> int:
+        # The long-window proxy decides warmup; ``sigma_r_L`` has warmup
+        # ``L + 1`` (r[0] null + past-only shift) — the binding row count.
+        if isinstance(w, tuple):
+            return int(w[1]) + 1
+        return 0
+
+    def compute(self, w=None) -> pl.Expr:
+        s, l, kind = w
         p = pl.col("p")
-        mu_s = pl.col(f"eq__mu_mean__f__w{self.S}")
-        mu_l = pl.col(f"eq__mu_mean__f__w{self.L}")
-        sigma_l = pl.col(f"eq__sigma_r__f__w{self.L}")
-        denom = sigma_l * _SQRT_M + EPS
+        mu_s = pl.col(f"eq__mu_mean__f__w{s}")
+        mu_l = pl.col(f"eq__mu_mean__f__w{l}")
+        sigma_l = pl.col(f"eq__sigma_r__f__w{l}")
+        denom = sigma_l * math.sqrt(float(self.cfg.m)) + EPS
         # ``clip(lower_bound=0)`` preserves null on null inputs — necessary
         # for the warmup contract. ``pl.max_horizontal(lit(0), null) = 0``
         # would silently emit 0 during warmup and mask the missingness.
-        below_short = ((mu_s - p) / denom).clip(lower_bound=0.0)
-        short_rising = ((mu_s - mu_l) / denom).clip(lower_bound=0.0)
-        return below_short * short_rising
-
-
-# -------- Feature 11: falling-equilibrium overextension --------------------
-
-
-class _EqAboveFallingEq(Feature):
-    """``max(0, (p - mu_S)/(sigma_L·√M+EPS)) · max(0, (mu_L - mu_S)/(sigma_L·√M+EPS))``.
-
-    Mirror of feature 10. Positive only when current price is *above* the
-    short equilibrium AND the short equilibrium has fallen *below* the
-    long one (local fair value drifting down). The natural false-positive
-    region for a long classifier.
-    """
-
-    __abstract__: ClassVar[bool] = True
-    family: ClassVar[str] = "eq"
-    tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = ()
-    inputs = ("p",)
-
-    S: ClassVar[int] = 0
-    L: ClassVar[int] = 0
-
-    def column_name(self, w: int | None = None) -> str:
-        return f"eq__above_falling_eq__f__w{self.S}__l{self.L}"
-
-    def warmup_for(self, w: int | None) -> int:
-        # Same as the pullback feature: sigma_r_L drives the warmup at L+1.
-        return int(self.L) + 1
-
-    def compute(self, w: int | None = None) -> pl.Expr:
-        p = pl.col("p")
-        mu_s = pl.col(f"eq__mu_mean__f__w{self.S}")
-        mu_l = pl.col(f"eq__mu_mean__f__w{self.L}")
-        sigma_l = pl.col(f"eq__sigma_r__f__w{self.L}")
-        denom = sigma_l * _SQRT_M + EPS
-        above_short = ((p - mu_s) / denom).clip(lower_bound=0.0)
-        short_falling = ((mu_l - mu_s) / denom).clip(lower_bound=0.0)
-        return above_short * short_falling
-
-
-# -------- Concrete pair subclasses for features 10 & 11 --------------------
-#
-# Generated programmatically from ``WINDOWS_EQ_PAIRS`` so adding a pair to
-# the config registers two new feature columns automatically. The ``type()``
-# call triggers ``Feature.__init_subclass__`` which auto-registers each
-# concrete class.
-
-for _s, _l in WINDOWS_EQ_PAIRS:
-    _pullback_cls = type(
-        f"EqPullbackRisingEq_{_s}_{_l}",
-        (_EqPullbackRisingEq,),
-        {"S": _s, "L": _l},
-    )
-    _above_cls = type(
-        f"EqAboveFallingEq_{_s}_{_l}",
-        (_EqAboveFallingEq,),
-        {"S": _s, "L": _l},
-    )
-    globals()[_pullback_cls.__name__] = _pullback_cls
-    globals()[_above_cls.__name__] = _above_cls
-
-del _s, _l, _pullback_cls, _above_cls
+        if kind == "pullback_rising_eq":
+            a = ((mu_s - p) / denom).clip(lower_bound=0.0)
+            b = ((mu_s - mu_l) / denom).clip(lower_bound=0.0)
+        else:
+            a = ((p - mu_s) / denom).clip(lower_bound=0.0)
+            b = ((mu_l - mu_s) / denom).clip(lower_bound=0.0)
+        return a * b

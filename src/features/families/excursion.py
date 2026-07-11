@@ -29,7 +29,6 @@ import numpy as np
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import M, WINDOWS_EXCURSION, WINDOWS_MAXRET
 from src.features.primitives import rolling_max, rolling_min
 
 
@@ -136,7 +135,7 @@ class _ExcursionFeature(Feature):
     # feature out of the cross-tier dependency graph.
     tier: ClassVar[int | str] = 1
     inputs = ("p",)
-    windows = tuple(WINDOWS_EXCURSION)
+    windows_field: ClassVar[str] = "windows_excursion"
 
 
 class ExcursionMaxDrawup(_ExcursionFeature):
@@ -145,8 +144,8 @@ class ExcursionMaxDrawup(_ExcursionFeature):
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return pl.col("p").map_batches(
-            lambda s: pl.Series(
-                _drawup_drawdown_boundary_sparse_np(s.to_numpy(), w, M)[0]
+            lambda s, m=self.cfg.m: pl.Series(
+                _drawup_drawdown_boundary_sparse_np(s.to_numpy(), w, m)[0]
             ),
             return_dtype=pl.Float64,
         )
@@ -158,8 +157,8 @@ class ExcursionMaxDrawdown(_ExcursionFeature):
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return pl.col("p").map_batches(
-            lambda s: pl.Series(
-                _drawup_drawdown_boundary_sparse_np(s.to_numpy(), w, M)[1]
+            lambda s, m=self.cfg.m: pl.Series(
+                _drawup_drawdown_boundary_sparse_np(s.to_numpy(), w, m)[1]
             ),
             return_dtype=pl.Float64,
         )
@@ -198,7 +197,7 @@ class _MaxretFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "excursion"
     tier: ClassVar[int | str] = 2
-    windows = tuple(WINDOWS_MAXRET)
+    windows_field: ClassVar[str] = "windows_maxret"
 
 
 class RetMax1m(_MaxretFeature):

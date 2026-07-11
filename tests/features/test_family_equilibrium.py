@@ -104,9 +104,17 @@ def eq_engine_specs():
 
 
 def test_eq_family_registers_expected_class_count():
-    """27 Feature classes (10 tier-1 + 17 tier-2 including 6 pair concrete)."""
+    """22 Feature classes (10 tier-1 + 12 tier-2).
+
+    The six import-time-generated pair classes became ONE config-driven
+    ``EqPairInteractions`` (2026-07-11 FeatureConfig migration) — the pair
+    grid now comes from ``cfg.windows_eq_pairs`` instead of a module
+    constant. Column count and ORDER are unchanged (see
+    ``test_eq_family_column_count`` and the contract-order note on the
+    class); only the class structure changed.
+    """
     classes = get_registry(families=("eq",))
-    assert len(classes) == 27, [c.__name__ for c in classes]
+    assert len(classes) == 22, [c.__name__ for c in classes]
 
 
 def test_eq_family_column_count(eq_engine_specs):
@@ -123,7 +131,9 @@ def test_eq_family_tier_split():
     tier_counts = {1: 0, 2: 0}
     for cls in classes:
         tier_counts[cls.tier] += 1
-    assert tier_counts == {1: 10, 2: 17}
+    # 2 -> 12: the six generated pair classes are one class since the
+    # FeatureConfig migration (same columns; see class-count test above).
+    assert tier_counts == {1: 10, 2: 12}
 
 
 # ---------------------------------------------------------------------------

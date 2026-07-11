@@ -29,7 +29,7 @@ import numpy as np
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import EPS, WINDOWS_LOGP_Z, WINDOWS_QUAD_TREND, WINDOWS_RSI
+from src.features.config import EPS
 from src.features.primitives import ewm_mean, wilder_smooth, z_score_rolling
 
 
@@ -40,7 +40,7 @@ class TrendLogpZ(Feature):
     family: ClassVar[str] = "trend"
     tier: ClassVar[int | str] = 1
     inputs = ("p",)
-    windows = tuple(WINDOWS_LOGP_Z)
+    windows_field: ClassVar[str] = "windows_logp_z"
 
     def column_name(self, w: int | None = None) -> str:
         return f"logp__z__f__w{w}"
@@ -110,7 +110,7 @@ class TrendRsi(Feature):
     family: ClassVar[str] = "trend"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)
-    windows = tuple(WINDOWS_RSI)
+    windows_field: ClassVar[str] = "windows_rsi"
 
     def column_name(self, w: int | None = None) -> str:
         return f"ret__rsi__f__w{w}"
@@ -202,7 +202,7 @@ class _TrendQuad(Feature):
     # Tier 2: depends on ``vol__rs__f__w{W}`` for normalization.
     tier: ClassVar[int | str] = 2
     inputs = ("p",)
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_QUAD_TREND)
+    windows_field: ClassVar[str] = "windows_quad_trend"
 
     # Sub-class picks 0 (slope) or 1 (curvature) — same kernel, two outputs.
     _select: ClassVar[int] = 0

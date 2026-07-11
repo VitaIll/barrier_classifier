@@ -16,12 +16,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import (
-    EPS,
-    WINDOWS_LIQ_AMIHUD,
-    WINDOWS_LIQ_RPV,
-    WINDOWS_OFI_IMPULSE,
-)
+from src.features.config import EPS
 from src.features.primitives import rolling_max, rolling_min, rolling_sum
 
 
@@ -34,7 +29,7 @@ class LiqAmihud(Feature):
     # entry, not an engine-emitted column. No tier-2 dependency exists.
     tier: ClassVar[int | str] = 1
     inputs = ("r", "volume")
-    windows = tuple(WINDOWS_LIQ_AMIHUD)
+    windows_field: ClassVar[str] = "windows_liq_amihud"
 
     def column_name(self, w: int | None = None) -> str:
         return f"liq__amihud__f__w{w}"
@@ -53,7 +48,7 @@ class LiqRangePerVol(Feature):
     # Tier 1: reads raw OHLCV only, no engine-emitted dependency.
     tier: ClassVar[int | str] = 1
     inputs = ("high", "low", "volume")
-    windows = tuple(WINDOWS_LIQ_RPV)
+    windows_field: ClassVar[str] = "windows_liq_rpv"
 
     def column_name(self, w: int | None = None) -> str:
         return f"liq__range_per_vol__f__w{w}"
@@ -74,7 +69,7 @@ class _OfiImpulseFeature(Feature):
     # engine-emitted column.
     tier: ClassVar[int | str] = 1
     inputs = ("ofi",)
-    windows = tuple(WINDOWS_OFI_IMPULSE)
+    windows_field: ClassVar[str] = "windows_ofi_impulse"
 
 
 class OfiDelta(_OfiImpulseFeature):

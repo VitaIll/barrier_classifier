@@ -23,6 +23,7 @@ from typing import Iterable
 import polars as pl
 
 from src.features.base import Feature, get_registry
+from src.features.config import DEFAULT_CONFIG, FeatureConfig
 from src.features.observability import FeatureReport
 
 
@@ -45,11 +46,14 @@ class FeatureEngine:
         *,
         tiers: Iterable[int | str] = (1,),
         families: Iterable[str] | None = None,
+        config: FeatureConfig | None = None,
     ) -> None:
         self.tiers = tuple(tiers)
         self.families = tuple(families) if families is not None else None
+        self.config = config if config is not None else DEFAULT_CONFIG
         self.specs: list[Feature] = [
-            cls() for cls in get_registry(tiers=self.tiers, families=self.families)
+            cls(self.config)
+            for cls in get_registry(tiers=self.tiers, families=self.families)
         ]
         # Dedupe check: two specs in the same tier emitting the same column
         # name would have one silently overwrite the other inside the

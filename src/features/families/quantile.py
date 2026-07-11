@@ -17,7 +17,6 @@ import numpy as np
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import M, WINDOWS_BPLUS
 
 
 def _quantile_at_boundaries_np(
@@ -74,7 +73,7 @@ class _QuantileFeature(Feature):
     family: ClassVar[str] = "quantile"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)
-    windows = tuple(WINDOWS_BPLUS)
+    windows_field: ClassVar[str] = "windows_bplus"
 
     output_name: ClassVar[str] = ""
     quantile_value: ClassVar[float] = 0.5
@@ -90,7 +89,9 @@ class QuantileQ10(_QuantileFeature):
     def compute(self, w: int | None = None) -> pl.Expr:
         q = self.quantile_value
         return pl.col("r").map_batches(
-            lambda s: pl.Series(_quantile_at_boundaries_np(s.to_numpy(), w, M, q)),
+            lambda s, m=self.cfg.m: pl.Series(
+                _quantile_at_boundaries_np(s.to_numpy(), w, m, q)
+            ),
             return_dtype=pl.Float64,
         )
 
@@ -102,7 +103,9 @@ class QuantileQ50(_QuantileFeature):
     def compute(self, w: int | None = None) -> pl.Expr:
         q = self.quantile_value
         return pl.col("r").map_batches(
-            lambda s: pl.Series(_quantile_at_boundaries_np(s.to_numpy(), w, M, q)),
+            lambda s, m=self.cfg.m: pl.Series(
+                _quantile_at_boundaries_np(s.to_numpy(), w, m, q)
+            ),
             return_dtype=pl.Float64,
         )
 
@@ -114,7 +117,9 @@ class QuantileQ90(_QuantileFeature):
     def compute(self, w: int | None = None) -> pl.Expr:
         q = self.quantile_value
         return pl.col("r").map_batches(
-            lambda s: pl.Series(_quantile_at_boundaries_np(s.to_numpy(), w, M, q)),
+            lambda s, m=self.cfg.m: pl.Series(
+                _quantile_at_boundaries_np(s.to_numpy(), w, m, q)
+            ),
             return_dtype=pl.Float64,
         )
 
@@ -124,6 +129,8 @@ class QuantileMad(_QuantileFeature):
 
     def compute(self, w: int | None = None) -> pl.Expr:
         return pl.col("r").map_batches(
-            lambda s: pl.Series(_mad_at_boundaries_np(s.to_numpy(), w, M)),
+            lambda s, m=self.cfg.m: pl.Series(
+                _mad_at_boundaries_np(s.to_numpy(), w, m)
+            ),
             return_dtype=pl.Float64,
         )

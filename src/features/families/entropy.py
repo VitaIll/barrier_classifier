@@ -14,7 +14,6 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import WINDOWS_PENTROPY
 from src.features.primitives import perm_entropy_m3
 
 
@@ -22,7 +21,7 @@ class EntropyPermNorm(Feature):
     family: ClassVar[str] = "entropy"
     tier: ClassVar[int | str] = 1
     inputs = ("r",)
-    windows = tuple(WINDOWS_PENTROPY)
+    windows_field: ClassVar[str] = "windows_pentropy"
 
     def column_name(self, w: int | None = None) -> str:
         return f"pentropy_norm__inst__f__w{w}__m3__tau1"

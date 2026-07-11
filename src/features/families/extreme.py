@@ -36,11 +36,10 @@ import numpy as np
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import EPS, M, WINDOWS_EXTREME
+from src.features.config import EPS
 from src.features.primitives import rolling_max, rolling_min
 
 
-_SQRT_M = math.sqrt(int(M))
 
 
 class _ExtremeFeature(Feature):
@@ -50,7 +49,7 @@ class _ExtremeFeature(Feature):
     # family. Tier ordering in the engine ensures vol__rs is on the frame
     # before this expression evaluates.
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_EXTREME)
+    windows_field: ClassVar[str] = "windows_extreme"
 
 
 class ExtremeDistLowZ(_ExtremeFeature):
@@ -73,7 +72,7 @@ class ExtremeDistLowZ(_ExtremeFeature):
         trailing_min = rolling_min(log_low, w)
         vol_col = pl.col(f"vol__rs__f__w{w}")
         dist = pl.col("p") - trailing_min
-        return dist / (vol_col * _SQRT_M + EPS)
+        return dist / (vol_col * math.sqrt(int(self.cfg.m)) + EPS)
 
 
 class ExtremeDistHighZ(_ExtremeFeature):
@@ -94,7 +93,7 @@ class ExtremeDistHighZ(_ExtremeFeature):
         trailing_max = rolling_max(log_high, w)
         vol_col = pl.col(f"vol__rs__f__w{w}")
         dist = trailing_max - pl.col("p")
-        return dist / (vol_col * _SQRT_M + EPS)
+        return dist / (vol_col * math.sqrt(int(self.cfg.m)) + EPS)
 
 
 def _rolling_rank_of_current_np(p: np.ndarray, w: int) -> np.ndarray:

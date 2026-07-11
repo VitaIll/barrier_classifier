@@ -72,11 +72,14 @@ _THEME_BY_PATH: dict[str, str] = {
     "features/test_round1234_correctness.py": "features_families",
     # labels (barrier-label domain: spec + vectorized kernel + block)
     "labels/test_barrier.py": "labels",
+    # weights (sample-weight blocks)
+    "weights/test_blocks.py": "weights",
     # features_pipeline
     "features/test_boundary.py": "features_pipeline",
     "features/test_quality.py": "features_pipeline",
     "features/test_pipeline.py": "features_pipeline",
     "features/test_cadence_helpers.py": "features_pipeline",
+    "features/test_feature_config.py": "features_pipeline",
     # analytics_bootstrap
     "analytics/test_bootstrap.py": "analytics_bootstrap",
     "analytics/test_block_bootstrap_propagation.py": "analytics_bootstrap",

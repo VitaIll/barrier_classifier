@@ -28,13 +28,7 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import (
-    EPS,
-    WINDOWS_VOL_DECOMP,
-    WINDOWS_VOL_JUMP,
-    WINDOWS_VOL_OHLC,
-    WINDOWS_VOL_SIGNED,
-)
+from src.features.config import EPS
 from src.features.primitives import (
     clip_pos,
     rolling_mean,
@@ -54,7 +48,7 @@ class _VolOhlcFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "vol"
     tier: ClassVar[int | str] = 1
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_VOL_OHLC)
+    windows_field: ClassVar[str] = "windows_vol_ohlc"
 
     output_name: ClassVar[str] = ""
 
@@ -142,7 +136,7 @@ class _VolDecompFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "vol"
     tier: ClassVar[int | str] = 2
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_VOL_DECOMP)
+    windows_field: ClassVar[str] = "windows_vol_decomp"
 
     output_name: ClassVar[str] = ""
 
@@ -257,7 +251,7 @@ class VolSemivarSigned(Feature):
     family: ClassVar[str] = "vol"
     tier: ClassVar[int | str] = 2
     inputs = ("r",)
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_VOL_SIGNED)
+    windows_field: ClassVar[str] = "windows_vol_signed"
 
     def column_name(self, w: int | None = None) -> str:
         return f"vol__semivar_signed__f__w{w}"
@@ -291,7 +285,7 @@ class VolJumpRatio(Feature):
     family: ClassVar[str] = "vol"
     tier: ClassVar[int | str] = 2
     inputs = ("r",)
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_VOL_JUMP)
+    windows_field: ClassVar[str] = "windows_vol_jump"
 
     def column_name(self, w: int | None = None) -> str:
         return f"vol__jump_ratio__f__w{w}"

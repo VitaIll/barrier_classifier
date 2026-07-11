@@ -48,15 +48,9 @@ import numpy as np
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import (
-    EPS,
-    M,
-    PIVOT_Q_VALUES,
-    WINDOWS_PIVOT,
-)
+from src.features.config import EPS
 
 
-_SQRT_M = math.sqrt(int(M))
 
 
 def _detect_pivots_np(
@@ -192,10 +186,16 @@ class _PivotFeature(Feature):
     tier: ClassVar[int | str] = 2
     windows: ClassVar[tuple[int, ...]] = ()
 
-    # Subclasses iterate (W, Q) pairs to populate ``expanded()``.
-    _wq_pairs: ClassVar[tuple[tuple[int, int], ...]] = tuple(
-        (w, q) for w in WINDOWS_PIVOT for q in PIVOT_Q_VALUES
-    )
+    # Subclasses iterate (W, Q) pairs to populate ``expanded()`` —
+    # resolved from the injected config so window/quantile grids are
+    # per-instance, not frozen at import.
+    @property
+    def _wq_pairs(self) -> tuple[tuple[int, int], ...]:
+        return tuple(
+            (w, q)
+            for w in self.cfg.windows_pivot
+            for q in self.cfg.pivot_q_values
+        )
 
     def expanded(self):
         for w, q in self._wq_pairs:
@@ -245,7 +245,7 @@ class PivotLastLowDistZ(_PivotFeature):
             pl.col("p").alias("p"),
         )
         raw = struct.map_batches(_kernel, return_dtype=pl.Float64)
-        return raw / (vol_col * _SQRT_M + EPS)
+        return raw / (vol_col * math.sqrt(int(self.cfg.m)) + EPS)
 
 
 def _pivot_age_np(series: np.ndarray, q: int, w: int, *, mode: str) -> np.ndarray:
@@ -321,7 +321,7 @@ class PivotLastHighDistZ(_PivotFeature):
             pl.col("p").alias("p"),
         )
         raw = struct.map_batches(_kernel, return_dtype=pl.Float64)
-        return raw / (vol_col * _SQRT_M + EPS)
+        return raw / (vol_col * math.sqrt(int(self.cfg.m)) + EPS)
 
 
 class PivotLastHighAge(_PivotFeature):

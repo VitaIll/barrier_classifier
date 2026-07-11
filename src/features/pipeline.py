@@ -39,18 +39,7 @@ from src.features.boundary import (
     compute_past_target_features_pl,
     construct_labels_pl,
 )
-from src.features.config import (
-    C,
-    ETA,
-    HITRATE_WINDOWS_H,
-    K_WARMUP,
-    M,
-    N_WARMUP,
-    PHI,
-    VOL_PAIRS,
-    WINDOWS_BARRIER,
-    WINDOWS_H,
-)
+from src.features.config import DEFAULT_CONFIG, FeatureConfig
 from src.features.quality import (
     compute_data_quality_flags_pl,
     create_undef_flags_and_impute_pl,
@@ -174,6 +163,7 @@ def run_pipeline(
     autocorr_lags: tuple[int, ...] = _AUTOCORR_LAGS_DEFAULT,
     barrier_source: str | None = None,
     add_triple_barrier_aux: bool = False,
+    config: FeatureConfig | None = None,
 ) -> pl.DataFrame:
     """Run the full feature pipeline end-to-end on a pandas bar frame.
 
@@ -220,10 +210,14 @@ def run_pipeline(
         enable_autocorrelation=enable_autocorrelation,
         autocorr_windows=autocorr_windows,
         cap_h_blocks=cap_h_blocks,
+        config=config if config is not None else DEFAULT_CONFIG,
     )
 
     df_pl, df_raw_pl = _build_bar_level(
-        df_raw_pd, with_derivatives=with_derivatives, label_cadence=label_cadence
+        df_raw_pd,
+        with_derivatives=with_derivatives,
+        label_cadence=label_cadence,
+        config=plan.config,
     )
     df_boundaries = _run_boundary_stages(
         df_pl,
@@ -258,6 +252,7 @@ def run_inference_pipeline(
     autocorr_lags: tuple[int, ...] = _AUTOCORR_LAGS_DEFAULT,
     barrier_source: str | None = None,
     boundary_tail_rows: int | None = 6_000,
+    config: FeatureConfig | None = None,
 ) -> pl.DataFrame:
     """Feature pipeline for *serving*: same stages, no label filtering.
 
@@ -287,9 +282,13 @@ def run_inference_pipeline(
         enable_autocorrelation=enable_autocorrelation,
         autocorr_windows=autocorr_windows,
         cap_h_blocks=cap_h_blocks,
+        config=config if config is not None else DEFAULT_CONFIG,
     )
     df_pl, df_raw_pl = _build_bar_level(
-        df_raw_pd, with_derivatives=with_derivatives, label_cadence=label_cadence
+        df_raw_pd,
+        with_derivatives=with_derivatives,
+        label_cadence=label_cadence,
+        config=plan.config,
     )
     if boundary_tail_rows is not None and boundary_tail_rows < len(df_pl):
         if label_cadence == "boundary":
@@ -315,6 +314,7 @@ def run_inference_pipeline(
 class _PipelinePlan:
     """Resolved cadence-dependent knobs shared by both entry points."""
 
+    config: FeatureConfig
     label_cadence: str
     bar_stride: int
     barrier_source: str
@@ -333,11 +333,13 @@ def _resolve_plan(
     enable_autocorrelation: bool | None,
     autocorr_windows: tuple[int, ...] | None,
     cap_h_blocks: int | None,
+    config: FeatureConfig,
 ) -> _PipelinePlan:
     if label_cadence not in ("boundary", "1min"):
         raise ValueError(
             f"label_cadence must be 'boundary' or '1min', got {label_cadence!r}"
         )
+    M = config.m
     bar_stride = int(M) if label_cadence == "boundary" else 1
     if barrier_source is None:
         barrier_source = "close" if label_cadence == "boundary" else "high"
@@ -359,9 +361,11 @@ def _resolve_plan(
     # trained at one cadence has a distinct feature vector from a model
     # trained at the other.
     scale = 1 if label_cadence == "boundary" else int(M)
-    hitrate_windows = tuple(int(w) * scale for w in HITRATE_WINDOWS_H)
-    block_windows = tuple(int(w) * scale for w in WINDOWS_H)
-    warmup_rows = int(K_WARMUP) if label_cadence == "boundary" else int(N_WARMUP)
+    hitrate_windows = tuple(int(w) * scale for w in config.hitrate_windows_h)
+    block_windows = tuple(int(w) * scale for w in config.windows_h)
+    warmup_rows = (
+        int(config.k_warmup) if label_cadence == "boundary" else int(config.n_warmup)
+    )
     if cap_h_blocks is None:
         # cap_h_blocks is used by the impute step for hit__since at the
         # right calendar scale; max of the scaled hitrate windows is the
@@ -374,6 +378,7 @@ def _resolve_plan(
             else _AUTOCORR_WINDOWS_DEFAULT_1MIN
         )
     return _PipelinePlan(
+        config=config,
         label_cadence=label_cadence,
         bar_stride=bar_stride,
         barrier_source=barrier_source,
@@ -391,6 +396,7 @@ def _build_bar_level(
     *,
     with_derivatives: bool,
     label_cadence: str,
+    config: FeatureConfig,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Stages 1-4: base series, bar-level engine features, quality flags."""
     # --- Stages 1-2: base series (legacy) ----------------------------------
@@ -405,7 +411,7 @@ def _build_bar_level(
     families = list(_DEFAULT_FAMILIES_NO_DERIV)
     if with_derivatives:
         families.extend(_DERIVATIVES_FAMILIES)
-    engine = FeatureEngine(tiers=(1, 2), families=tuple(families))
+    engine = FeatureEngine(tiers=(1, 2), families=tuple(families), config=config)
     df_pl = engine.transform(df_pl, trim=False).data
 
     # At 1-min cadence the boundary-sparse excursion drawup/drawdown columns
@@ -438,10 +444,11 @@ def _run_boundary_stages(
     add_triple_barrier_aux: bool,
 ) -> pl.DataFrame:
     """Stages 5-9: decision-row sampling, labels, boundary features."""
+    cfg = plan.config
     # --- Stage 5: sample decision rows -------------------------------------
     # Boundary cadence keeps every M-th row; 1-min cadence keeps every row.
     if plan.label_cadence == "boundary":
-        df_boundaries = df_pl.gather_every(M).with_columns(
+        df_boundaries = df_pl.gather_every(cfg.m).with_columns(
             pl.int_range(pl.len()).alias("k")
         )
     else:
@@ -451,9 +458,9 @@ def _run_boundary_stages(
     df_boundaries = construct_labels_pl(
         df_boundaries,
         df_raw_pl,
-        M,
-        ETA,
-        C,
+        cfg.m,
+        cfg.eta,
+        cfg.c,
         bar_stride=plan.bar_stride,
         barrier_source=plan.barrier_source,
         add_triple_barrier_aux=add_triple_barrier_aux,
@@ -463,21 +470,30 @@ def _run_boundary_stages(
         list(plan.block_windows),
         list(plan.hitrate_windows),
         bar_stride=plan.bar_stride,
-        M=int(M),
+        M=int(cfg.m),
     )
     if plan.enable_autocorrelation:
         df_boundaries = compute_past_target_autocorrelation_pl(
             df_boundaries,
             plan.autocorr_windows,
             bar_stride=plan.bar_stride,
-            M=int(M),
+            M=int(cfg.m),
             lags=tuple(autocorr_lags),
         )
     df_boundaries = compute_barrier_aware_features_pl(
-        df_boundaries, WINDOWS_BARRIER, PHI, M, VOL_PAIRS, c=float(C)
+        df_boundaries,
+        cfg.windows_barrier,
+        cfg.phi,
+        cfg.m,
+        cfg.vol_pairs,
+        c=float(cfg.c),
     )
     df_boundaries = compute_block_features_pl(
-        df_boundaries, df_raw_pl, M, list(plan.block_windows), bar_stride=plan.bar_stride
+        df_boundaries,
+        df_raw_pl,
+        cfg.m,
+        list(plan.block_windows),
+        bar_stride=plan.bar_stride,
     )
     return df_boundaries
 

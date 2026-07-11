@@ -18,7 +18,6 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import WINDOWS_CORR
 from src.features.primitives import population_corr
 
 
@@ -26,7 +25,7 @@ class _CorrFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "correlation"
     tier: ClassVar[int | str] = 1
-    windows = tuple(WINDOWS_CORR)
+    windows_field: ClassVar[str] = "windows_corr"
 
     output_name: ClassVar[str] = ""
 

@@ -22,7 +22,6 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import WINDOWS_F
 from src.features.primitives import clip_pos, rolling_mean, rolling_std_pop
 
 
@@ -36,7 +35,7 @@ class _RollingFeature(Feature):
     __abstract__: ClassVar[bool] = True
     family: ClassVar[str] = "rolling"
     tier: ClassVar[int | str] = 1
-    windows: ClassVar[tuple[int, ...]] = tuple(WINDOWS_F)
+    windows_field: ClassVar[str] = "windows_f"
 
     output_prefix: ClassVar[str] = ""  # e.g. "ret__mean"
 

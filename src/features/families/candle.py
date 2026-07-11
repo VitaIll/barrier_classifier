@@ -17,7 +17,6 @@ from typing import ClassVar
 import polars as pl
 
 from src.features.base import Feature
-from src.features.config import WINDOWS_BREAKOUT, WINDOWS_CANDLE_ROLL
 from src.features.primitives import rolling_max, rolling_mean, rolling_min
 
 
@@ -83,7 +82,7 @@ class CandleClvMean(Feature):
     family: ClassVar[str] = "candle"
     tier: ClassVar[int | str] = 1
     inputs = ("clv",)
-    windows = tuple(WINDOWS_CANDLE_ROLL)
+    windows_field: ClassVar[str] = "windows_candle_roll"
 
     def column_name(self, w: int | None = None) -> str:
         return f"clv__mean__f__w{w}"
@@ -100,7 +99,7 @@ class _CandleBreakoutFeature(Feature):
     family: ClassVar[str] = "candle"
     tier: ClassVar[int | str] = 1
     inputs = ("p",)
-    windows = tuple(WINDOWS_BREAKOUT)
+    windows_field: ClassVar[str] = "windows_breakout"
 
 
 class CandleLogpPos(_CandleBreakoutFeature):
