@@ -37,13 +37,63 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
+from src.core.errors import ContractError
 from src.features.config import C, EPS
 from src.features.primitives import population_corr, rolling_mean
+from src.labels.barrier import barrier_label_arrays
 
 
 # =============================================================================
 # Labels
 # =============================================================================
+
+
+def _assert_label_frames_aligned(
+    df_boundaries: pl.DataFrame,
+    df_raw: pl.DataFrame,
+    bar_stride: int,
+) -> None:
+    """Fail loudly when df_boundaries rows don't sit on df_raw's grid.
+
+    ``construct_labels_pl`` correlates the two frames purely positionally
+    (row ``k`` references raw bar ``k * bar_stride``). A caller that slices
+    one frame but not the other gets silently wrong labels — this guard
+    turns that into a diagnosable error. Checked only when both frames
+    carry a temporal ``ts`` column; frames without timestamps (synthetic
+    tests) skip the check.
+    """
+    if "ts" not in df_boundaries.columns or "ts" not in df_raw.columns:
+        return
+    if not (
+        df_boundaries.schema["ts"].is_temporal()
+        and df_raw.schema["ts"].is_temporal()
+    ):
+        return
+    n_raw = df_raw.height
+    k_max = min(df_boundaries.height, -(-n_raw // bar_stride))
+    if k_max <= 0:
+        return
+    idx = np.arange(k_max, dtype=np.int64) * bar_stride
+    idx = idx[idx < n_raw]
+    if idx.size == 0:
+        return
+    try:
+        b_ts = df_boundaries["ts"].head(idx.size).cast(pl.Datetime("us"))
+        r_ts = df_raw["ts"].gather(idx).cast(pl.Datetime("us"))
+        both = b_ts.is_not_null() & r_ts.is_not_null()
+        mismatched = int(((b_ts != r_ts) & both).sum())
+    except Exception:  # exotic dtypes: the guard is best-effort, not a gate
+        return
+    if mismatched:
+        first = int(((b_ts != r_ts) & both).arg_max() or 0)
+        raise ContractError(
+            f"construct_labels_pl: df_boundaries is not aligned to df_raw at "
+            f"bar_stride={bar_stride} — {mismatched} of {idx.size} decision "
+            f"rows reference a raw bar with a different timestamp (first at "
+            f"row {first}: boundary ts={b_ts[first]}, raw ts={r_ts[first]}). "
+            "Slice both frames together, or rebuild the boundary frame from "
+            "this raw frame."
+        )
 
 
 def construct_labels_pl(
@@ -102,80 +152,53 @@ def construct_labels_pl(
         )
 
     close = df_raw["close"].to_numpy().astype(float)
-    n_total = len(close)
     K = len(df_boundaries)
     phi = float(c + eta)
 
     if barrier_source == "high":
         if "high" not in df_raw.columns:
             raise ValueError("barrier_source='high' requires a 'high' column on df_raw")
-        high = df_raw["high"].to_numpy().astype(float)
-        upper_series = high
+        upper_series = df_raw["high"].to_numpy().astype(float)
     else:
         upper_series = close
 
     add_dn = bool(add_triple_barrier_aux)
+    low = None
     if add_dn:
-        low_col = df_raw["low"] if "low" in df_raw.columns else None
-        if low_col is None:
+        if "low" not in df_raw.columns:
             raise ValueError(
                 "add_triple_barrier_aux=True requires a 'low' column on df_raw"
             )
-        low = low_col.to_numpy().astype(float)
+        low = df_raw["low"].to_numpy().astype(float)
 
-    y = np.full(K, np.nan)
-    m_k = np.full(K, np.nan)
-    tau_k = np.full(K, np.nan)
-    m_dn = np.full(K, np.nan) if add_dn else None
-    tau_dn = np.full(K, np.nan) if add_dn else None
+    _assert_label_frames_aligned(df_boundaries, df_raw, int(bar_stride))
 
-    for k in range(K):
-        n_k = k * bar_stride
-        if n_k + M >= n_total:
-            continue
-        base = close[n_k]
-        future_up = upper_series[n_k + 1 : n_k + M + 1]
-        # numpy emits a RuntimeWarning for ``log(<=0)``. Silence it locally
-        # because we explicitly handle the resulting ``-inf`` / NaN below.
-        with np.errstate(divide="ignore", invalid="ignore"):
-            future_up_ret = np.log(future_up / base)
-        m_val = float(np.max(future_up_ret))
-        # Non-finite ``m_val`` (negative or NaN OHLC anywhere in the window
-        # poisons the max with NaN). Treat as "no observed hit" (label 0)
-        # and leave m_k / tau_k null so the data-quality flag still
-        # reflects the anomaly — better than letting NaN propagate into y.
-        if not np.isfinite(m_val):
-            y[k] = 0.0
-            continue
-        m_k[k] = m_val
-        hit = m_val >= phi
-        y[k] = 1.0 if hit else 0.0
-        if hit:
-            tau_k[k] = float(np.argmax(future_up_ret >= phi) + 1)
-        if add_dn:
-            future_dn = low[n_k + 1 : n_k + M + 1]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                future_dn_ret = np.log(future_dn / base)
-            m_dn_val = float(-np.min(future_dn_ret))
-            if not np.isfinite(m_dn_val):
-                continue
-            m_dn[k] = m_dn_val
-            dn_hit = future_dn_ret <= -phi
-            if dn_hit.any():
-                tau_dn[k] = float(np.argmax(dn_hit) + 1)
+    # Vectorized kernel (src/labels/barrier.py) — bit-exact with the
+    # historical per-row loop (same divide→log→max operation order, same
+    # NaN semantics), ~70x faster at 1-min cadence, chunked to bound the
+    # temporary forward-window blocks.
+    arrays = barrier_label_arrays(
+        close,
+        upper_series,
+        horizon=int(M),
+        phi=phi,
+        stride=int(bar_stride),
+        n_out=K,
+        low=low,
+    )
 
     # Convert NaN -> null so downstream is_not_null()/notna() filters work
     # uniformly. Pandas notna catches both; polars is_not_null only catches
     # null. Coerce here so the boundary df has a consistent "missing" type.
     new_cols = [
-        pl.Series("y", y).fill_nan(None),
-        pl.Series("m_k", m_k).fill_nan(None),
-        pl.Series("tau_k", tau_k).fill_nan(None),
+        pl.Series("y", arrays.y).fill_nan(None),
+        pl.Series("m_k", arrays.m_k).fill_nan(None),
+        pl.Series("tau_k", arrays.tau_k).fill_nan(None),
         pl.lit(phi).alias("phi"),
     ]
     if add_dn:
-        new_cols.append(pl.Series("m_dn", m_dn).fill_nan(None))
-        new_cols.append(pl.Series("tau_dn", tau_dn).fill_nan(None))
+        new_cols.append(pl.Series("m_dn", arrays.m_dn).fill_nan(None))
+        new_cols.append(pl.Series("tau_dn", arrays.tau_dn).fill_nan(None))
     return df_boundaries.with_columns(new_cols)
 
 

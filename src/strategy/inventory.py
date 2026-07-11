@@ -36,21 +36,30 @@ class Position:
     expiry_k: int              # boundary index at which the position times out
 
     def __post_init__(self) -> None:
+        # NOTE every price/size check pairs a finiteness test with the sign
+        # test: ``NaN <= 0`` is False, so a bare comparison silently accepts
+        # NaN — a NaN tp_price produces a position whose take-profit can
+        # never trigger (``high >= NaN`` is always False) and that sits
+        # corrupt until expiry. Fail at construction instead.
         if self.side not in (-1, 1):
             raise ValueError(f"side must be -1 or +1; got {self.side}")
-        if self.size < 0:
-            raise ValueError(f"size must be >= 0; got {self.size}")
-        if self.entry_price <= 0:
-            raise ValueError(f"entry_price must be > 0; got {self.entry_price}")
-        if self.tp_price <= 0:
-            raise ValueError(f"tp_price must be > 0; got {self.tp_price}")
+        if not math.isfinite(self.size) or self.size < 0:
+            raise ValueError(f"size must be finite and >= 0; got {self.size}")
+        if not math.isfinite(self.entry_price) or self.entry_price <= 0:
+            raise ValueError(f"entry_price must be finite and > 0; got {self.entry_price}")
+        if not math.isfinite(self.tp_price) or self.tp_price <= 0:
+            raise ValueError(f"tp_price must be finite and > 0; got {self.tp_price}")
+        if self.sl_price is not None and (
+            not math.isfinite(self.sl_price) or self.sl_price <= 0
+        ):
+            raise ValueError(f"sl_price must be finite and > 0; got {self.sl_price}")
         if self.expiry_k < self.k_entry:
             raise ValueError(f"expiry_k {self.expiry_k} must be >= k_entry {self.k_entry}")
 
     def mtm_log_return(self, current_price: float) -> float:
         """Unrealized log-return at ``current_price`` (pre-cost, sized by ``side``)."""
-        if current_price <= 0:
-            raise ValueError(f"current_price must be > 0; got {current_price}")
+        if not math.isfinite(current_price) or current_price <= 0:
+            raise ValueError(f"current_price must be finite and > 0; got {current_price}")
         return float(self.side) * math.log(current_price / self.entry_price)
 
 
@@ -97,8 +106,8 @@ def close_position(
     regime_quantile_at_entry: float = float("nan"),
 ) -> ClosedPosition:
     """Lift a ``Position`` to a ``ClosedPosition`` with realized P&L computed."""
-    if exit_price <= 0:
-        raise ValueError(f"exit_price must be > 0; got {exit_price}")
+    if not math.isfinite(exit_price) or exit_price <= 0:
+        raise ValueError(f"exit_price must be finite and > 0; got {exit_price}")
     if k_exit < position.k_entry:
         raise ValueError(f"k_exit {k_exit} must be >= k_entry {position.k_entry}")
     gross = float(position.side) * math.log(exit_price / position.entry_price)

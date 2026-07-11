@@ -334,8 +334,9 @@ def bootstrap_shap_diff(
         {
             "feature": list(feature_list),
             "shap_diff": point,
-            "shap_diff_ci_low": np.quantile(samples, alpha, axis=0),
-            "shap_diff_ci_high": np.quantile(samples, 1.0 - alpha, axis=0),
+            # NaN-tolerant, matching the package-wide bootstrap contract.
+            "shap_diff_ci_low": np.nanquantile(samples, alpha, axis=0),
+            "shap_diff_ci_high": np.nanquantile(samples, 1.0 - alpha, axis=0),
         }
     )
     df["abs_diff"] = df["shap_diff"].abs()

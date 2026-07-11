@@ -541,6 +541,16 @@ def simulate(
             size = min(size, spec.risk.max_size_per_lot)
             size = min(size, spec.risk.max_gross_size - portfolio.gross_size())
             if size > 0:
+                # A non-finite phi would produce a NaN tp_price whose TP
+                # condition (high >= NaN) never fires — a silently corrupt
+                # position. Refuse loudly; the cache row is broken.
+                if not (math.isfinite(phi) and phi > 0):
+                    raise ValueError(
+                        f"entry at k={k} (ts={ts}) with non-finite or "
+                        f"non-positive phi={phi!r} — cache 'phi' column is "
+                        "corrupt; refusing to open a position with an "
+                        "undefined take-profit"
+                    )
                 tp_price = bar_close * math.exp(phi)  # long TP at +phi
                 # Per-position MTM floor → SL price (if configured in RiskConfig)
                 if spec.risk.position_mtm_floor_log_return is not None:

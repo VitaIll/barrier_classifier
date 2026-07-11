@@ -1,3 +1,50 @@
+## 2026-07-11 — Re-architecture Phase 1: kernel + labels slice + numerical guards
+
+Full-depth review landed as `docs/REVIEW_2026-07-11.md` (evidence-ranked
+findings); the binding target design as `docs/TARGET_ARCHITECTURE.md`
+(domain model, 8 architectural laws, 5-phase migration plan). This change
+is Phase 1 of that plan.
+
+- **New package `src/core/`** — the block kernel: `errors` (typed taxonomy
+  `CoreError` → `ConfigError`/`ContractError`/`StateError`/`BlockError`
+  with block attribution), `contracts` (`ColumnSpec`/`FrameSchema` with
+  structure/data validation levels; `assert_unmutated` no-mutation checker),
+  `block` (`Block` template — validate in, attribute failures, verify
+  provides, log one INFO line; `Pipeline` with per-stage attribution),
+  `log` (namespaced `bc.*` loggers + `timed` spans), `num` (shared guards:
+  `assert_all_finite`, `safe_div`, `stable_sigmoid`, `clip_exp`,
+  `require_finite_scalar`, `shifted_variance`), `rng` (Generator-injection
+  policy). 59 tests, theme `framework`.
+- **New package `src/labels/`** — the label domain: `BarrierSpec` (frozen
+  value object owning `M`/`phi`/source/stride; derives `maturity_shift` and
+  `label_intervals` so weights/splits/serving stop re-deriving them),
+  `barrier_label_arrays` (vectorized kernel, **bit-exact** with the legacy
+  loop — same divide→log→max operation order — and memory-bounded via row
+  chunks), `label_frame` + `BarrierLabeler` block. 32 tests (theme
+  `labels`) including a frozen copy of the legacy loop as parity oracle,
+  causality properties, and chunk-boundary invariance.
+- **`construct_labels_pl` now delegates to the kernel**: 3.40s → 0.115s on
+  527k 1-min rows (~30x), identical outputs (existing
+  `features_pipeline` suite passes untouched). New frame-alignment guard:
+  boundary/raw frames whose `ts` columns disagree at `k*bar_stride` now
+  raise `ContractError` instead of silently mislabeling.
+- **Numerical guards** (review §2 findings, regression-tested in
+  `tests/test_numerical_guards.py`):
+  - `Position`/`close_position`/`mtm_log_return` reject non-finite
+    prices/sizes (`NaN <= 0` is False — a NaN take-profit used to
+    construct a position that could never exit); simulator and live trader
+    refuse entries when the cache `phi` is non-finite (N4).
+  - `bootstrap_threshold_sweep` fails with a diagnosis on single-class
+    splits instead of a NaN→int crash (N1); its Sharpe variance now uses
+    shifted cumulative sums (cancellation-stable) (N5).
+  - New tie-robust `quantile_buckets` replaces bare `pd.qcut` in
+    `bootstrap_metrics_by_regime` and `conditional_precision` — point-mass
+    regime distributions no longer crash (N2).
+  - `psi` rejects empty inputs (N3); `virtual_ensemble_predictions` uses
+    overflow-safe `expit` (N6); `bootstrap_brier_decomposition` and
+    `bootstrap_shap_diff` now follow the package-wide NaN-tolerant
+    aggregation contract (`nanquantile` + `B_effective`) (N7).
+
 ## 2026-07-10 — Live trading engine (`src/engine/`) + repo consolidation
 
 The researched 1-min P1+P3 strategy is now servable end-to-end: stream bars

@@ -70,6 +70,8 @@ _THEME_BY_PATH: dict[str, str] = {
     "features/test_family_round1.py": "features_families",
     "features/test_family_equilibrium.py": "features_families",
     "features/test_round1234_correctness.py": "features_families",
+    # labels (barrier-label domain: spec + vectorized kernel + block)
+    "labels/test_barrier.py": "labels",
     # features_pipeline
     "features/test_boundary.py": "features_pipeline",
     "features/test_quality.py": "features_pipeline",

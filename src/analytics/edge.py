@@ -123,7 +123,15 @@ def _threshold_metrics(
     if r_realized is not None:
         r_sorted = r_realized[order]
         cum_realized_sum = np.cumsum(r_sorted)
-        cum_realized_sq_sum = np.cumsum(r_sorted ** 2)
+        # Variance via SHIFTED cumulative sums: the naive E[X²]−E[X]² on
+        # raw sums cancels catastrophically when mean² >> var (small-
+        # dispersion realized returns). Variance is shift-invariant, so
+        # accumulating around a constant near the data gives the same
+        # quantity computed stably.
+        r_shift = float(np.mean(r_sorted))
+        r_centered = r_sorted - r_shift
+        cum_centered_sum = np.cumsum(r_centered)
+        cum_centered_sq_sum = np.cumsum(r_centered ** 2)
 
     out = np.full((len(thresholds), 5), np.nan)
     for ti, thr in enumerate(thresholds):
@@ -139,8 +147,9 @@ def _threshold_metrics(
 
         if r_realized is not None and om.use_realized_return:
             mean_r = cum_realized_sum[n_pred - 1] / n_pred - om.cost_per_trade
+            mean_centered = cum_centered_sum[n_pred - 1] / n_pred
             var_r = (
-                cum_realized_sq_sum[n_pred - 1] / n_pred - (cum_realized_sum[n_pred - 1] / n_pred) ** 2
+                cum_centered_sq_sum[n_pred - 1] / n_pred - mean_centered ** 2
             )
             sharpe = mean_r / np.sqrt(var_r) if var_r > 1e-18 else np.nan
             ev = mean_r
@@ -191,6 +200,16 @@ def bootstrap_threshold_sweep(
         return pd.DataFrame()
     y = cs["y"].astype(int).to_numpy()
     p = cs["p"].astype(float).to_numpy()
+    n_pos_total = int(y.sum())
+    if n_pos_total == 0 or n_pos_total == len(y):
+        # Every threshold metric is undefined on a single-class split; the
+        # sweep would otherwise crash converting an all-NaN trade count to
+        # int. Fail with the diagnosis instead.
+        raise ValueError(
+            f"bootstrap_threshold_sweep: split {split!r} is single-class "
+            f"(n={len(y)}, n_pos={n_pos_total}) — threshold metrics are "
+            "undefined; check the split construction / label pipeline"
+        )
     if thresholds is None:
         thresholds = np.linspace(0.01, float(p.max()), 100)
     thresholds = np.asarray(thresholds, dtype=float)

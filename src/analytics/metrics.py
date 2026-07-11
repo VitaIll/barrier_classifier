@@ -33,6 +33,32 @@ _METRIC_FUNCS: Dict[str, Callable[[np.ndarray, np.ndarray], float]] = {
 }
 
 
+def quantile_buckets(
+    values: "pd.Series | np.ndarray",
+    labels: Sequence[str],
+) -> pd.Series:
+    """Equal-frequency buckets that survive tied/point-mass distributions.
+
+    ``pd.qcut(x, k, labels=[...])`` raises ``Bin edges must be unique`` on
+    heavy ties — exactly the shape vol-regime columns produce. This wrapper
+    uses ``duplicates="drop"``: when edges collapse, FEWER buckets come back
+    and the top labels are dropped (buckets keep their bottom-up names).
+    NaN values map to NaN (excluded from every bucket), matching qcut.
+    """
+    s = pd.Series(np.asarray(values, dtype=float))
+    k = len(labels)
+    if k < 1:
+        raise ValueError("labels must be non-empty")
+    codes = pd.qcut(s, k, labels=False, duplicates="drop")
+    # Full collapse (constant input): qcut yields ZERO bins and every code
+    # is NaN even for real values. Those rows all share one value — put
+    # them in the bottom bucket rather than dropping the whole column.
+    degenerate = s.notna() & codes.isna()
+    if degenerate.any():
+        codes = codes.where(~degenerate, 0)
+    return codes.map(lambda c: labels[int(c)] if pd.notna(c) else np.nan)
+
+
 def bootstrap_all_metrics(
     y: np.ndarray,
     p: np.ndarray,
@@ -87,7 +113,7 @@ def bootstrap_metrics_by_regime(
     unknown = set(metric_names) - set(_METRIC_FUNCS.keys())
     if unknown:
         raise ValueError(f"Unknown metric names: {sorted(unknown)}")
-    terciles = pd.qcut(regime, 3, labels=["low", "med", "high"])
+    terciles = quantile_buckets(regime, ["low", "med", "high"])
     out: Dict[str, Dict[str, BootstrapResult]] = {}
     for label in ["low", "med", "high"]:
         mask = np.asarray(terciles == label)

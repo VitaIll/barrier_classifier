@@ -88,6 +88,11 @@ def psi(
 
     Conventions: PSI < 0.1 stable; 0.1-0.2 moderate shift; > 0.2 significant.
     """
+    if len(p_reference) == 0 or len(p_current) == 0:
+        raise ValueError(
+            f"psi requires non-empty inputs; got len(p_reference)="
+            f"{len(p_reference)}, len(p_current)={len(p_current)}"
+        )
     bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
     a = (
         np.bincount(
@@ -251,15 +256,20 @@ def bootstrap_brier_decomposition(
             samples[k][b] = d[k]
     point = brier_murphy_decomposition(y, p, n_bins=n_bins)
     alpha = (1.0 - ci) / 2.0
+    # NaN-tolerant aggregation + B_effective — the same contract every other
+    # bootstrap surface in this package follows (a NaN replicate must not
+    # silently poison the CI, and the effective replicate count must be
+    # visible to the caller).
     return {
         k: BootstrapResult(
             point=point[k],
-            median=float(np.quantile(samples[k], 0.5)),
-            ci_low=float(np.quantile(samples[k], alpha)),
-            ci_high=float(np.quantile(samples[k], 1.0 - alpha)),
+            median=float(np.nanquantile(samples[k], 0.5)),
+            ci_low=float(np.nanquantile(samples[k], alpha)),
+            ci_high=float(np.nanquantile(samples[k], 1.0 - alpha)),
             ci=ci,
             B=B,
             samples=samples[k],
+            B_effective=int(np.isfinite(samples[k]).sum()),
         )
         for k in keys
     }
@@ -544,9 +554,13 @@ def conditional_precision(
         )
     derived = set(by) - set(df.columns)
     if "regime_bucket" in derived:
-        df["regime_bucket"] = pd.qcut(
-            df["regime"], n_regime_buckets, labels=list(regime_labels)
-        )
+        # Tie-robust equal-frequency bucketing: plain qcut raises on
+        # point-mass regime distributions (duplicate bin edges).
+        from .metrics import quantile_buckets
+
+        df["regime_bucket"] = quantile_buckets(
+            df["regime"], list(regime_labels)
+        ).to_numpy()
     if "hour" in derived:
         df["hour"] = pd.to_datetime(df["ts"]).dt.hour
     if "weekday" in derived:

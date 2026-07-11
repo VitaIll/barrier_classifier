@@ -352,6 +352,14 @@ class LiveTrader:
             size = min(size, self.spec.risk.max_size_per_lot)
             size = min(size, self.spec.risk.max_gross_size - self.portfolio.gross_size())
             if size > 0:
+                # Mirror of the simulator's guard (parity contract): a
+                # non-finite phi must never become a NaN take-profit.
+                if not (math.isfinite(phi) and phi > 0):
+                    raise ValueError(
+                        f"entry at k={k} (ts={ts}) with non-finite or "
+                        f"non-positive phi={phi!r} — refusing to open a "
+                        "position with an undefined take-profit"
+                    )
                 tp_price = bar_close * math.exp(phi)
                 if self.spec.risk.position_mtm_floor_log_return is not None:
                     sl_price = bar_close * math.exp(

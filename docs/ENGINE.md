@@ -108,7 +108,7 @@ Anti-skew guards (why this is safe):
    repeated failures trip the halt kill-switch.
 4. **Recursive features** (EWMA/RSI) converge rather than truncate exactly;
    buffer burn-in bounds the error (documented in §8). The batch/rolling
-   parity test quantifies residual skew (`tests/engine/test_feature_parity.py`).
+   parity test quantifies residual skew (`tests/engine/test_feature_inference.py`).
 
 ## 5. Model service and scheduled retraining
 

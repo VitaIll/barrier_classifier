@@ -120,7 +120,11 @@ def virtual_ensemble_predictions(
     if out.ndim != 2:
         raise ValueError(f"Unexpected VE shape after squeeze {out.shape}; expected 2D")
     if prediction_type == "logit":
-        out = 1.0 / (1.0 + np.exp(-out))
+        # expit is the overflow-safe logistic: 1/(1+exp(-x)) overflows
+        # (RuntimeWarning, then 0/inf artifacts) for large negative logits.
+        from scipy.special import expit
+
+        out = expit(out)
     # Numerical safety
     return np.clip(out, 0.0, 1.0).astype(float)
 
