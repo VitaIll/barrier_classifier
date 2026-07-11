@@ -99,10 +99,13 @@ Anti-skew guards (why this is safe):
    of `M` and anchors its phase to the model's `grid_anchor_ts` (recorded in
    the `FeatureContract` at training time). Misalignment is a hard error.
 3. **Contract reconciliation**: after imputation, the live row is reconciled
-   against `feature_list` — missing `undef__*` flags are added as 0 (nothing
-   was imputed live), unexpected extra flags are dropped *and counted as guard
-   events*, any missing real feature is a hard error, and the final vector
-   must be all-finite.
+   against `feature_list` — the contract's features are selected *in order*;
+   a missing contract feature or a non-finite value after imputation is a
+   hard `FeatureContractError` (pipeline/contract version drift, never a
+   runtime repair). In the rolling path any pipeline exception is wrapped
+   into the same typed error, so one bad window degrades that bar (exits
+   still resolve, entry suppressed) instead of crashing the session;
+   repeated failures trip the halt kill-switch.
 4. **Recursive features** (EWMA/RSI) converge rather than truncate exactly;
    buffer burn-in bounds the error (documented in §8). The batch/rolling
    parity test quantifies residual skew (`tests/engine/test_feature_parity.py`).
@@ -127,7 +130,11 @@ Anti-skew guards (why this is safe):
      `block_size=M`) — fail ⇒ keep incumbent, record the run;
   6. re-derive `p_threshold` from the *new* training slice (the walk-forward
      threshold refresh nb05 called out as missing);
-  7. publish; the engine hot-swaps at the next bar boundary.
+  7. publish; the engine hot-swaps at the next bar boundary — after a
+     serving-compatibility check (same M, same raw schema, anchor congruent
+     with the buffer grid, warmup fits the session's ready window; batch
+     mode additionally requires an identical feature list). An incompatible
+     (manually published) version is guard-evented and the incumbent kept.
   Runs on a worker thread; the trading loop never blocks. Retraining reads
   its window from the store's `bars` table (spot columns) — the
   derivatives-enabled contract would need a parquet-backed window instead,
@@ -153,11 +160,15 @@ available as `exit_variant="monotonic"`.
 
 Tables: `bars`, `predictions`, `decisions`, `orders`, `fills`, `trades`,
 `equity`, `labels` (matured), `model_versions`, `retrain_runs`,
-`guard_events`, `meta`. Single writer (engine thread), WAL,
-`synchronous=NORMAL`, `executemany` batches flushed per bar and on close;
-readers (retrain thread, dashboards) use separate connections. Event-time
-retention pruning (`retention_days`) keeps the DB a bounded, fast working set;
-long-term truth stays in parquet + the model registry.
+`guard_events`, `open_positions` (live-inventory snapshot for resume),
+`meta`. Single writer (engine thread), WAL, `synchronous=NORMAL`,
+`busy_timeout=5s`, `executemany` batches flushed per bar and on close;
+readers (retrain thread, dashboards) use separate connections. Flushes are
+atomic: on failure the transaction rolls back and buffered rows are retained
+for retry (`StoreError`) — never partially committed or silently dropped.
+Event-time retention pruning (`retention_days`) keeps the DB a bounded, fast
+working set (audit tables — trades, orders, fills, guard events — are never
+pruned); long-term truth stays in parquet + the model registry.
 
 ## 8. Numerics & performance (measured, real 2025 data)
 
@@ -185,9 +196,39 @@ report = Engine(cfg, source=src).run()
 print(report.summary())
 ```
 
-`EngineConfig` is a plain dataclass with `from_toml()` (stdlib `tomllib`).
-CLI: `python -m src.engine replay|run|retrain|status`. Every knob has a
+`EngineConfig` is a plain dataclass with `from_toml()` (stdlib `tomllib`);
+every field and the `[retrain]` table are validated on load (unknown keys,
+bad types, and out-of-range values are `ConfigError`s). CLI:
+`python -m src.engine import-model|replay|run|status`. Every knob has a
 research-faithful default; nothing requires editing source to operate.
+
+### Operations: kill-switch, shutdown, resume
+
+- **Risk kill-switch** — `max_drawdown` (peak-to-now total-equity drop,
+  log-return units) and `max_cumulative_loss` (total-equity floor) trip a
+  session **halt**: entries are suppressed for the rest of the session while
+  open positions keep resolving through the researched exit policy. The same
+  halt fires after `halt_after_feature_errors` consecutive-session feature
+  failures. Every halt is logged, guard-evented, and carried in
+  `SessionReport.halt_reason`. Both risk limits default to `None`
+  (disabled) so the engine reproduces the offline simulator exactly.
+- **Clean shutdown** — `Engine` is a context manager (`close()` is
+  idempotent); the CLI translates SIGTERM/Ctrl-C into a drained store and
+  exit code 130.
+- **Crash-safe resume** — the store keeps an `open_positions` snapshot
+  (rewritten atomically whenever inventory changes) plus the equity curve
+  and counters. Restarting with `resume=True` (CLI `--resume`) restores the
+  open portfolio, realized P&L, trade/order counters, and the drawdown peak;
+  a fresh engine over a non-empty store *without* `resume` is a
+  `ConfigError` (protects the audit trail from silent overwrite). Online
+  monitoring stats (quantile ranks, base rates) re-warm from the stream —
+  the production spec's decisions do not consume them. Downtime between the
+  last stored bar and the first streamed bar is guard-evented (exits during
+  the gap were not observed).
+- **Determinism** — replays are byte-reproducible: bookkeeping rows are
+  stamped with event time (never wall clock), retrains carry a fixed
+  `random_seed` (its presence is asserted), and event-time scheduling makes
+  retrain triggers replay-identical.
 
 ## 10. Definition of done (verified 2026-07-10)
 

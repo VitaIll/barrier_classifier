@@ -42,10 +42,16 @@ class Broker(Protocol):
 
 class PaperBroker:
     """Fills every intent at the strategy's assumed price. Zero slippage,
-    the researched cost model applies at the ledger layer (not here)."""
+    the researched cost model applies at the ledger layer (not here).
 
-    def __init__(self) -> None:
-        self._next_order_id = 1
+    ``next_order_id`` seeds the order counter — a resumed session passes
+    ``max(order_id)+1`` so order ids never collide with the stored trail.
+    """
+
+    def __init__(self, *, next_order_id: int = 1) -> None:
+        if next_order_id < 1:
+            raise ValueError(f"next_order_id must be >= 1, got {next_order_id}")
+        self._next_order_id = int(next_order_id)
 
     def _order_id(self) -> int:
         oid = self._next_order_id

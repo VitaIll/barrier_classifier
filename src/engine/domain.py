@@ -145,16 +145,14 @@ class FeatureVector:
     """A feature row aligned to a model's ordered feature list.
 
     ``values`` is a float64 array whose order IS the contract — never a
-    dict. ``n_reconciled_undef`` counts ``undef__*`` flags the contract
-    expected but the live window didn't produce (added as 0);
-    ``n_dropped_extra`` counts flags produced live but unknown to the
-    contract (dropped, guard-evented).
+    dict. Reconciliation against the contract happens before construction
+    (``src.engine.features.reconcile_row``): a missing contract feature or
+    a non-finite value is a hard error, so a ``FeatureVector`` is always
+    complete and finite.
     """
 
     ts: pd.Timestamp
     values: np.ndarray
-    n_reconciled_undef: int = 0
-    n_dropped_extra: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,8 +167,7 @@ class Prediction:
 class Action(str, enum.Enum):
     ENTER = "enter"
     SKIP = "skip"      # gates passed context but no entry (gate/risk blocked)
-    WARMUP = "warmup"  # buffer not ready — no features/prediction
-    HALT = "halt"      # risk kill-switch active
+    HALT = "halt"      # kill-switch active — entries suppressed, exits live
 
 
 @dataclass(frozen=True, slots=True)

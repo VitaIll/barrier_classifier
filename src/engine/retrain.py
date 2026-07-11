@@ -41,7 +41,7 @@ from sklearn.metrics import average_precision_score, log_loss, roc_auc_score
 from src import utils
 from src.analytics.sampling import compute_uniqueness_weights
 from src.analytics.thresholds import derive_top_q_threshold
-from src.engine.errors import RetrainError
+from src.engine.errors import ConfigError, RetrainError
 from src.engine.features import FeatureContract
 from src.engine.model import ModelHandle, ModelRegistry, Thresholds
 from src.features.pipeline import (
@@ -77,6 +77,11 @@ def research_cb_params(*, iterations: int = 2000, verbose: int | bool = False) -
             "CB_FIXED_PARAMS lost has_time=True; refusing to train without "
             "time-awareness on overlapping 1-min labels"
         )
+    if params.get("random_seed") is None:
+        raise RetrainError(
+            "CB_FIXED_PARAMS lost random_seed; scheduled retrains would be "
+            "non-reproducible across replays"
+        )
     return params
 
 
@@ -96,6 +101,28 @@ class RetrainPolicy:
     # Champion/challenger tolerances (evaluated on the challenger's val split).
     max_logloss_regression: float = 0.005    # challenger may be at most this much worse
     min_pr_auc_ratio: float = 0.98           # challenger PR-AUC ≥ ratio × incumbent
+
+    def __post_init__(self) -> None:
+        if self.every_bars < 1:
+            raise ConfigError("RetrainPolicy.every_bars must be >= 1")
+        if self.iterations < 1:
+            raise ConfigError("RetrainPolicy.iterations must be >= 1")
+        if self.min_window_rows < 1:
+            raise ConfigError("RetrainPolicy.min_window_rows must be >= 1")
+        if self.window_rows is not None and self.window_rows < 1:
+            raise ConfigError("RetrainPolicy.window_rows must be >= 1 when set")
+        if self.embargo_rows is not None and self.embargo_rows < 0:
+            raise ConfigError("RetrainPolicy.embargo_rows must be >= 0 when set")
+        if not (0.0 < self.top_q < 1.0):
+            raise ConfigError("RetrainPolicy.top_q must be in (0, 1)")
+        if not (0.0 < self.train_frac < 1.0) or not (0.0 < self.val_frac < 1.0):
+            raise ConfigError("RetrainPolicy.train_frac and val_frac must be in (0, 1)")
+        if self.train_frac + self.val_frac >= 1.0:
+            raise ConfigError(
+                "RetrainPolicy.train_frac + val_frac must be < 1 (leaving a test split)"
+            )
+        if self.min_pr_auc_ratio <= 0.0:
+            raise ConfigError("RetrainPolicy.min_pr_auc_ratio must be > 0")
 
 
 @dataclass

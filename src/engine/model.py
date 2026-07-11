@@ -23,8 +23,9 @@ first live model is *exactly* the researched one.
 from __future__ import annotations
 
 import json
+import logging
+import math
 import shutil
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -35,6 +36,8 @@ from catboost import CatBoostClassifier
 
 from src.engine.errors import ModelArtifactError
 from src.engine.features import FeatureContract
+
+logger = logging.getLogger("src.engine.model")
 
 
 @dataclass(frozen=True)
@@ -77,14 +80,17 @@ class ModelHandle:
         self.contract = contract
         self.thresholds = thresholds
         self.metrics = metrics
-        self.last_predict_ms: float = float("nan")
 
     def predict_p(self, values: np.ndarray) -> float:
         """P(y=1) for one feature vector (contract order)."""
-        t0 = time.perf_counter()
-        p = float(self.model.predict_proba(values.reshape(1, -1))[0, 1])
-        self.last_predict_ms = (time.perf_counter() - t0) * 1e3
-        return p
+        n = self.contract.n_features
+        if values.shape[-1] != n:
+            raise ModelArtifactError(
+                f"{self.version}: feature vector has {values.shape[-1]} values "
+                f"but the contract lists {n} features — refusing to predict on "
+                "a misaligned vector"
+            )
+        return float(self.model.predict_proba(values.reshape(1, -1))[0, 1])
 
     def predict_matrix(self, matrix: np.ndarray) -> np.ndarray:
         """Vectorized P(y=1) over an (N, n_features) matrix."""
@@ -129,21 +135,58 @@ class ModelRegistry:
         if not cbm.exists():
             raise ModelArtifactError(f"model version {version!r} not found under {self.root}")
         model = CatBoostClassifier()
-        model.load_model(str(cbm))
-        contract = FeatureContract.from_json(vdir / "contract.json")
-        thresholds = Thresholds.from_dict(
-            json.loads((vdir / "thresholds.json").read_text(encoding="utf-8"))
-        )
+        try:
+            model.load_model(str(cbm))
+        except Exception as exc:  # corrupt/truncated .cbm → typed, not raw CatBoost
+            raise ModelArtifactError(f"{version}: failed to load model.cbm ({exc})") from exc
+        try:
+            contract = FeatureContract.from_json(vdir / "contract.json")
+            thresholds = Thresholds.from_dict(
+                json.loads((vdir / "thresholds.json").read_text(encoding="utf-8"))
+            )
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ModelArtifactError(
+                f"{version}: missing or malformed contract.json/thresholds.json ({exc})"
+            ) from exc
         metrics_path = vdir / "metrics.json"
         metrics = (
             json.loads(metrics_path.read_text(encoding="utf-8"))
             if metrics_path.exists() else {}
         )
-        n_model_feats = model.feature_names_ is not None and len(model.feature_names_)
-        if n_model_feats and n_model_feats != contract.n_features:
+        # Parity guard. Prefer full name+order equality (the strongest check
+        # the artifact supports). CatBoost assigns positional-default names
+        # ("0","1",…) when trained without explicit names; those carry no
+        # order information, so fall back to a count check and log that
+        # order/name parity could not be verified.
+        names = list(model.feature_names_ or [])
+        positional_default = bool(names) and names == [str(i) for i in range(len(names))]
+        if names and not positional_default:
+            if tuple(names) != tuple(contract.feature_list):
+                where = next(
+                    (i for i, (a, b) in enumerate(zip(names, contract.feature_list))
+                     if a != b),
+                    min(len(names), contract.n_features),
+                )
+                raise ModelArtifactError(
+                    f"{version}: model feature names do not match the contract "
+                    f"(len model={len(names)}, contract={contract.n_features}; "
+                    f"first divergence at index {where})"
+                )
+        else:
+            if names and len(names) != contract.n_features:
+                raise ModelArtifactError(
+                    f"{version}: model expects {len(names)} features but the "
+                    f"contract lists {contract.n_features}"
+                )
+            logger.warning(
+                "%s: model.cbm carries no named features (positional defaults) — "
+                "verifying feature COUNT only; order/name parity is unchecked",
+                version,
+            )
+        if not math.isfinite(thresholds.p_threshold) or not (0.0 < thresholds.p_threshold < 1.0):
             raise ModelArtifactError(
-                f"{version}: model expects {n_model_feats} features but the "
-                f"contract lists {contract.n_features}"
+                f"{version}: thresholds.json p_threshold must be a probability "
+                f"in (0, 1), got {thresholds.p_threshold!r}"
             )
         return ModelHandle(version, model, contract, thresholds, metrics)
 

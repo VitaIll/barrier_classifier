@@ -16,14 +16,33 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
 from src.engine.engine import Engine, EngineConfig
+from src.engine.errors import EngineError
 from src.engine.model import ModelRegistry
 from src.engine.retrain import RetrainPolicy
 from src.engine.sources import ReplaySource
 from src.engine.store import SQLiteStore
+
+logger = logging.getLogger("src.engine.cli")
+
+
+def _install_graceful_stop() -> None:
+    """Translate SIGTERM into KeyboardInterrupt so orchestrator termination
+    (not just Ctrl-C) drains the store through the same clean path."""
+    if not hasattr(signal, "SIGTERM"):
+        return
+
+    def _handler(signum, frame):  # noqa: ANN001
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except (ValueError, OSError):
+        pass  # not the main thread, or unsupported on this platform
 
 
 def _add_common(p: argparse.ArgumentParser) -> None:
@@ -42,6 +61,9 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="CatBoost iterations for scheduled retrains")
     p.add_argument("--speed", type=float, default=None,
                    help="replay pacing (1.0 = real time; default: as fast as possible)")
+    p.add_argument("--resume", action="store_true",
+                   help="continue a prior session in --store (restore open "
+                        "positions, equity, and counters)")
     p.add_argument("-v", "--verbose", action="store_true")
 
 
@@ -53,6 +75,8 @@ def _build_config(args: argparse.Namespace, feature_mode: str) -> EngineConfig:
     cfg.model_dir = args.model_dir
     cfg.store_path = args.store
     cfg.feature_mode = feature_mode
+    if args.resume:
+        cfg.resume = True
     if args.retrain_every_days is not None:
         cfg.retrain = RetrainPolicy(
             enabled=True,
@@ -80,11 +104,13 @@ def _cmd_replay(args: argparse.Namespace, feature_mode: str) -> int:
     source = ReplaySource(
         args.spot, start=args.start, end=args.end, speed=args.speed,
     )
-    engine = Engine(cfg, source=source)
-    try:
-        report = engine.run(max_bars=args.max_bars)
-    finally:
-        engine.store.close()
+    _install_graceful_stop()
+    with Engine(cfg, source=source) as engine:
+        try:
+            report = engine.run(max_bars=args.max_bars)
+        except KeyboardInterrupt:
+            logger.warning("interrupted — store drained; restart with --resume to continue")
+            return 130
     print()
     print(report.summary())
     if not report.trades.empty:
@@ -140,14 +166,18 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    if args.command == "import-model":
-        return _cmd_import_model(args)
-    if args.command == "replay":
-        return _cmd_replay(args, feature_mode="batch")
-    if args.command == "run":
-        return _cmd_replay(args, feature_mode="rolling")
-    if args.command == "status":
-        return _cmd_status(args)
+    try:
+        if args.command == "import-model":
+            return _cmd_import_model(args)
+        if args.command == "replay":
+            return _cmd_replay(args, feature_mode="batch")
+        if args.command == "run":
+            return _cmd_replay(args, feature_mode="rolling")
+        if args.command == "status":
+            return _cmd_status(args)
+    except EngineError as exc:
+        logger.error("%s: %s", type(exc).__name__, exc)
+        return 1
     parser.error(f"unknown command {args.command!r}")
     return 2
 

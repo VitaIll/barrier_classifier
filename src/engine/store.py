@@ -15,6 +15,7 @@ concurrent readers safe.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from pathlib import Path
@@ -32,6 +33,14 @@ from src.engine.domain import (
     Prediction,
     Trade,
 )
+from src.engine.errors import StoreError
+
+logger = logging.getLogger("src.engine.store")
+
+# How long SQLite waits on a locked DB before raising (ms). Covers the brief
+# windows where a reader (retrain worker / dashboard) holds the file.
+_BUSY_TIMEOUT_MS = 5_000
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars (
     ts_ms INTEGER PRIMARY KEY,
@@ -134,6 +143,18 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS open_positions (
+    k_entry INTEGER PRIMARY KEY,
+    ts_entry_ms INTEGER NOT NULL,
+    side INTEGER NOT NULL,
+    size REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    tp_price REAL NOT NULL,
+    sl_price REAL,
+    expiry_k INTEGER NOT NULL,
+    p_at_entry REAL,
+    model_version TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_trades_ts_exit ON trades(ts_exit_ms);
 CREATE INDEX IF NOT EXISTS idx_guard_events_ts ON guard_events(ts_ms);
 """
@@ -166,6 +187,7 @@ class SQLiteStore:
         if not self._memory:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         cur.execute("PRAGMA foreign_keys=ON")
         cur.executescript(_SCHEMA)
         self._conn.commit()
@@ -262,15 +284,32 @@ class SQLiteStore:
     }
 
     def flush(self) -> None:
+        """Persist all buffered rows atomically.
+
+        Buffers are cleared only *after* the commit succeeds. On any insert
+        or commit failure the transaction is rolled back, the buffered rows
+        are retained for a later retry, and a :class:`StoreError` is raised —
+        a mid-flush failure never partially commits or silently drops rows.
+        """
         with self._lock:
-            wrote = False
-            for table, rows in self._pending.items():
-                if rows:
+            pending = [(t, rows) for t, rows in self._pending.items() if rows]
+            if not pending:
+                return
+            try:
+                for table, rows in pending:
                     self._conn.executemany(self._INSERTS[table], rows)
-                    rows.clear()
-                    wrote = True
-            if wrote:
                 self._conn.commit()
+            except sqlite3.Error as exc:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                n = sum(len(rows) for _, rows in pending)
+                raise StoreError(
+                    f"flush failed ({exc}); {n} buffered row(s) retained for retry"
+                ) from exc
+            for _table, rows in pending:
+                rows.clear()
 
     # ------------------------------------------------------------------ #
     # Model/retrain bookkeeping (unbuffered — rare events)
@@ -321,6 +360,65 @@ class SQLiteStore:
                  new_version, notes, run_id),
             )
             self._conn.commit()
+
+    def snapshot_open_positions(self, rows: list[tuple]) -> None:
+        """Atomically replace the open-inventory snapshot (crash/resume state).
+
+        ``rows`` are ``(k_entry, ts_entry_ms, side, size, entry_price,
+        tp_price, sl_price, expiry_k, p_at_entry, model_version)`` tuples —
+        the engine writes one snapshot per bar *on inventory change* so a
+        restart can rebuild the exact live portfolio.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("DELETE FROM open_positions")
+                if rows:
+                    self._conn.executemany(
+                        "INSERT INTO open_positions VALUES (?,?,?,?,?,?,?,?,?,?)", rows
+                    )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise StoreError(f"open-position snapshot failed ({exc})") from exc
+
+    def load_open_positions(self) -> list[tuple]:
+        """The last open-inventory snapshot (rows as stored, ordered by entry)."""
+        cur = self._conn.execute(
+            "SELECT k_entry, ts_entry_ms, side, size, entry_price, tp_price, "
+            "sl_price, expiry_k, p_at_entry, model_version "
+            "FROM open_positions ORDER BY k_entry"
+        )
+        return list(cur.fetchall())
+
+    def last_realized_cum(self) -> Optional[float]:
+        """Realized cumulative log-return at the newest equity row (resume)."""
+        row = self._conn.execute(
+            "SELECT realized_cum FROM equity ORDER BY ts_ms DESC LIMIT 1"
+        ).fetchone()
+        return None if row is None else float(row[0])
+
+    def max_total_equity(self) -> Optional[float]:
+        """Highest total (realized + unrealized) equity ever recorded —
+        seeds the drawdown peak on resume."""
+        row = self._conn.execute("SELECT MAX(equity) FROM equity").fetchone()
+        return None if row is None or row[0] is None else float(row[0])
+
+    def max_trade_id(self) -> int:
+        row = self._conn.execute("SELECT MAX(trade_id) FROM trades").fetchone()
+        return 0 if row is None or row[0] is None else int(row[0])
+
+    def max_order_id(self) -> int:
+        row = self._conn.execute("SELECT MAX(order_id) FROM orders").fetchone()
+        return 0 if row is None or row[0] is None else int(row[0])
+
+    def last_bar_ts(self) -> Optional[pd.Timestamp]:
+        row = self._conn.execute("SELECT MAX(ts_ms) FROM bars").fetchone()
+        if row is None or row[0] is None:
+            return None
+        return pd.Timestamp(int(row[0]), unit="ms", tz="UTC")
 
     def set_meta(self, key: str, value: str) -> None:
         with self._lock:
@@ -389,7 +487,8 @@ class SQLiteStore:
         self.flush()
         out = {}
         for table in ("bars", "predictions", "decisions", "trades", "equity",
-                      "labels", "guard_events", "model_versions", "retrain_runs"):
+                      "labels", "guard_events", "model_versions", "retrain_runs",
+                      "open_positions"):
             out[table] = int(
                 self._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             )
@@ -419,8 +518,16 @@ class SQLiteStore:
         return removed
 
     def close(self) -> None:
+        """Best-effort final flush, then always release the handle.
+
+        A flush failure during shutdown (disk full, malformed buffered row)
+        is logged rather than raised — the connection is closed regardless
+        so shutdown always completes.
+        """
         try:
             self.flush()
+        except StoreError as exc:
+            logger.error("store close: final flush failed, buffered rows lost: %s", exc)
         finally:
             with self._lock:
                 self._conn.close()

@@ -52,6 +52,7 @@ from src.engine.retrain import Retrainer, RetrainPolicy
 from src.engine.sources import DataSource, ReplaySource
 from src.engine.store import SQLiteStore
 from src.engine.strategy import LiveProbFeed, LiveTrader, make_live_production_spec
+from src.strategy.inventory import Position
 from src.strategy.simulator import SimConfig
 
 logger = logging.getLogger("src.engine")
@@ -78,6 +79,13 @@ class EngineConfig:
     # Persistence
     store_path: str | Path = "runtime/engine.db"
     retention_days: Optional[float] = None
+    resume: bool = False                   # True → restore open positions/ledger from an existing store
+    # Risk limits (account-level kill-switch; None = disabled = research-faithful).
+    # When tripped: no new entries for the rest of the session; open positions
+    # still resolve via the researched exit policy. Disabled by default so the
+    # engine reproduces the offline simulator exactly.
+    max_drawdown: Optional[float] = None          # halt if peak-to-now equity drop ≥ this (log-return units)
+    max_cumulative_loss: Optional[float] = None   # halt if total equity ≤ this (negative log-return)
     # Guards
     max_repair_gap: int = 120
     halt_after_feature_errors: int = 25
@@ -91,11 +99,41 @@ class EngineConfig:
         if self.feature_mode not in ("rolling", "batch"):
             raise ConfigError(f"feature_mode must be 'rolling' or 'batch', got {self.feature_mode!r}")
         if self.exit_variant not in ("threshold", "monotonic"):
-            raise ConfigError(f"exit_variant must be 'threshold' or 'monotonic'")
+            raise ConfigError("exit_variant must be 'threshold' or 'monotonic'")
         if self.buffer_rows <= 0:
             raise ConfigError("buffer_rows must be positive")
+        if self.boundary_tail_rows <= 0:
+            raise ConfigError("boundary_tail_rows must be positive")
+        if self.min_ready_rows is not None and self.min_ready_rows < 1:
+            raise ConfigError("min_ready_rows must be >= 1 when set")
         if self.lot_size <= 0 or self.max_concurrent <= 0:
             raise ConfigError("lot_size and max_concurrent must be positive")
+        if self.cost_per_trade < 0:
+            raise ConfigError("cost_per_trade must be non-negative")
+        if self.p_threshold_override is not None and not (0.0 < self.p_threshold_override < 1.0):
+            raise ConfigError("p_threshold_override must be in (0, 1) when set")
+        if self.retention_days is not None and self.retention_days <= 0:
+            raise ConfigError("retention_days must be positive when set")
+        if self.max_repair_gap < 1:
+            raise ConfigError("max_repair_gap must be >= 1")
+        if self.halt_after_feature_errors < 1:
+            raise ConfigError("halt_after_feature_errors must be >= 1")
+        if self.log_every_bars < 1:
+            raise ConfigError("log_every_bars must be >= 1")
+        if self.max_drawdown is not None and self.max_drawdown <= 0:
+            raise ConfigError("max_drawdown must be positive when set")
+        if self.max_cumulative_loss is not None and self.max_cumulative_loss >= 0:
+            raise ConfigError("max_cumulative_loss must be negative when set (a loss floor)")
+        if (
+            self.retention_days is not None and self.retrain.enabled
+            and self.retention_days * 1440 < self.retrain.min_window_rows
+        ):
+            raise ConfigError(
+                f"retention_days={self.retention_days} keeps fewer bars "
+                f"({self.retention_days * 1440:,.0f}) than retraining needs "
+                f"(min_window_rows={self.retrain.min_window_rows:,}) — retrains "
+                "would starve; raise retention or disable one of the two"
+            )
 
     @classmethod
     def from_toml(cls, path: str | Path) -> "EngineConfig":
@@ -107,9 +145,15 @@ class EngineConfig:
         unknown = set(payload) - known
         if unknown:
             raise ConfigError(f"unknown config keys in {path}: {sorted(unknown)}")
-        cfg = cls(**payload)
+        try:
+            cfg = cls(**payload)
+        except TypeError as exc:
+            raise ConfigError(f"invalid config in {path}: {exc}") from exc
         if retrain_d is not None:
-            cfg.retrain = RetrainPolicy(**retrain_d)
+            try:
+                cfg.retrain = RetrainPolicy(**retrain_d)
+            except TypeError as exc:
+                raise ConfigError(f"invalid [retrain] table in {path}: {exc}") from exc
         cfg.validate()
         return cfg
 
@@ -131,6 +175,7 @@ class SessionReport:
     guard_repairs: int
     feature_errors: int
     halted: bool
+    halt_reason: str
     trades: pd.DataFrame
     equity: pd.DataFrame
 
@@ -146,7 +191,7 @@ class SessionReport:
             f"(unrealized {self.unrealized_log_return:+.4%})",
             f"  models: {', '.join(self.model_versions_used)}  |  retrains: {self.retrain_runs}"
             f"  |  grid repairs: {self.guard_repairs}  |  feature errors: {self.feature_errors}"
-            + ("  |  HALTED" if self.halted else ""),
+            + (f"  |  HALTED ({self.halt_reason})" if self.halted else ""),
         ]
         return "\n".join(lines)
 
@@ -189,7 +234,22 @@ class Engine:
             with_derivatives=self.contract.with_derivatives,
         )
         self.store = store or SQLiteStore(config.store_path)
-        self.broker: Broker = broker or PaperBroker()
+        # A store that already holds session rows is either a resume target
+        # (config.resume=True → restore below) or an operator mistake: starting
+        # fresh would collide on trade_id (INSERT OR REPLACE) and silently
+        # overwrite the audit trail. Refuse unless resuming.
+        prior = self.store.counts()
+        has_prior_session = bool(prior.get("bars", 0) or prior.get("trades", 0))
+        if has_prior_session and not config.resume:
+            raise ConfigError(
+                f"store already holds {prior.get('bars', 0):,} bar(s) and "
+                f"{prior.get('trades', 0):,} trade(s) — starting fresh would "
+                "overwrite them. Use a new store_path, delete the file, or set "
+                "resume=True to continue the prior session."
+            )
+        self.broker: Broker = broker or PaperBroker(
+            next_order_id=self.store.max_order_id() + 1
+        )
         self._sink = self._make_guard_sink()
         self.grid_guard = GridGuard(max_repair_gap=config.max_repair_gap, sink=self._sink)
         self.schema_guard = BarSchemaGuard(sink=self._sink)
@@ -245,30 +305,79 @@ class Engine:
         self._next_trade_id = 1
         self._feature_errors = 0
         self._halted = False
+        self._halt_reason = ""
+        self._equity_peak = 0.0                        # log-return units; session starts flat
         self._versions_used: list[str] = [self.handle.version]
         self._retrain_completions = 0
         self._n_bars = 0
         self._n_predictions = 0
         self._started_ts: Optional[pd.Timestamp] = None
         self._last_prune_ts: Optional[pd.Timestamp] = None
+        self._closed = False
+        self._resumed_from_ts: Optional[pd.Timestamp] = None
+        # The initial model-version row is stamped at the first bar's event
+        # time (not wall-clock now()) so replays are byte-reproducible.
+        self._initial_version_recorded = False
 
-        self.store.record_model_version(
-            self.handle.version,
-            created_ts=pd.Timestamp.now(tz="UTC"),
-            path=str(Path(self.registry.root) / self.handle.version),
-            metrics=self.handle.metrics,
-            thresholds=self.handle.thresholds.to_dict(),
-        )
+        if has_prior_session:
+            self._restore_session()
 
     # ------------------------------------------------------------------ #
     # Wiring helpers
     # ------------------------------------------------------------------ #
 
+    _SEVERITY_LEVEL = {"info": logging.INFO, "warning": logging.WARNING, "error": logging.ERROR}
+
     def _make_guard_sink(self):
         def sink(event: GuardEvent) -> None:
             self.store.record_guard_event(event)
+            logger.log(
+                self._SEVERITY_LEVEL.get(event.severity, logging.WARNING),
+                "guard %s (%s): %s", event.guard, event.severity, event.message,
+            )
             self._emit(EventType.GUARD_TRIPPED, event)
         return sink
+
+    def _restore_session(self) -> None:
+        """Rebuild live state from the store after a crash/shutdown.
+
+        Restores the open portfolio, realized equity, trade/order counters,
+        decision-time entry context, and the drawdown peak. Online monitoring
+        stats (regime/score quantile ranks, base rates) re-warm from the
+        stream — the production spec's decisions do not consume them, so
+        decision parity is unaffected; label-fed monitoring resumes within
+        one quantile window. Cluster bookkeeping restarts at zero (consumed
+        only by cluster-aware specs, not the production spec).
+        """
+        realized = self.store.last_realized_cum()
+        if realized is not None:
+            self.trader.realized_cum = float(realized)
+        self._next_trade_id = self.store.max_trade_id() + 1
+        peak = self.store.max_total_equity()
+        if peak is not None:
+            self._equity_peak = max(0.0, float(peak))
+        rows = self.store.load_open_positions()
+        for (k_entry, ts_entry_ms, side, size, entry_price, tp_price,
+             sl_price, expiry_k, p_at_entry, model_version) in rows:
+            self.trader.portfolio.open_one(Position(
+                k_entry=int(k_entry),
+                ts_entry=pd.Timestamp(int(ts_entry_ms), unit="ms", tz="UTC"),
+                side=int(side), size=float(size),
+                entry_price=float(entry_price), tp_price=float(tp_price),
+                sl_price=None if sl_price is None else float(sl_price),
+                expiry_k=int(expiry_k),
+            ))
+            self._entry_p[int(k_entry)] = (
+                float("nan") if p_at_entry is None else float(p_at_entry)
+            )
+            self._entry_version[int(k_entry)] = model_version or self.handle.version
+        self._resumed_from_ts = self.store.last_bar_ts()
+        logger.info(
+            "resumed session: %s open position(s), realized %+.4f, "
+            "next trade_id %s, last stored bar %s",
+            len(rows), self.trader.realized_cum, self._next_trade_id,
+            self._resumed_from_ts,
+        )
 
     def _regime_index(self, regime_col: str) -> int:
         try:
@@ -385,6 +494,27 @@ class Engine:
         self._emit(EventType.BAR_INGESTED, bar)
         if self._started_ts is None:
             self._started_ts = bar.ts
+            if self._resumed_from_ts is not None and bar.ts > self._resumed_from_ts:
+                gap_min = int((bar.ts - self._resumed_from_ts).total_seconds() // 60) - 1
+                if gap_min > 0:
+                    self._sink(GuardEvent(
+                        ts=bar.ts, guard="resume", severity="warning",
+                        message=(
+                            f"resumed after {gap_min} missing minute(s) of downtime "
+                            f"(last stored bar {self._resumed_from_ts}) — exits during "
+                            "the gap were not observed"
+                        ),
+                        count=gap_min,
+                    ))
+        if not self._initial_version_recorded:
+            self.store.record_model_version(
+                self.handle.version,
+                created_ts=bar.ts,
+                path=str(Path(self.registry.root) / self.handle.version),
+                metrics=self.handle.metrics,
+                thresholds=self.handle.thresholds.to_dict(),
+            )
+            self._initial_version_recorded = True
         k = minutes_since(self.contract.anchor, bar.ts)
 
         # Label maturation (monitoring feed; strictly causal at t+M).
@@ -397,6 +527,11 @@ class Engine:
 
         # Warmup gate (rolling mode; batch rows embed full history).
         if self.batch_service is None and not self.warmup_guard.ready(self.buffer.aligned_len()):
+            if self._n_bars % self.config.log_every_bars == 0:
+                logger.info(
+                    "warming up: %s more bar(s) until first prediction",
+                    self.warmup_guard.deficit(self.buffer.aligned_len()),
+                )
             self.store.flush()
             return
 
@@ -414,8 +549,11 @@ class Engine:
                 ts=bar.ts, guard="feature_contract", severity="error",
                 message=str(exc),
             ))
-            if self._feature_errors >= self.config.halt_after_feature_errors:
-                self._halted = True
+            if self._feature_errors >= self.config.halt_after_feature_errors and not self._halted:
+                self._halt(bar.ts, (
+                    f"{self._feature_errors} feature errors "
+                    f"(limit {self.config.halt_after_feature_errors})"
+                ))
         else:
             self._n_predictions += 1
             self.prob_feed.update(bar.ts, p)
@@ -471,6 +609,20 @@ class Engine:
         )
         self._emit(EventType.DECISION_MADE, result)
 
+        # Crash/resume state: rewrite the open-inventory snapshot whenever it
+        # changed this bar (≤ max_concurrent rows — cheap and atomic).
+        if result.closed or result.opened is not None:
+            self._snapshot_positions()
+
+        # Account-level risk kill-switch. Evaluated after this bar resolved,
+        # so it gates *subsequent* entries. No-op unless a limit is configured
+        # → offline-simulator parity preserved by default.
+        total_eq = result.equity.realized_cum + result.equity.unrealized
+        if total_eq > self._equity_peak:
+            self._equity_peak = total_eq
+        if not self._halted:
+            self._check_risk_limits(bar.ts, total_eq)
+
         # Retraining (event-time), hot-swap on completion.
         self.retrainer.on_bar(bar.ts)
         self._poll_retrain(bar.ts)
@@ -501,19 +653,20 @@ class Engine:
         logger.info("retrain completed: %s %s", outcome.status, outcome.new_version or "")
         if outcome.status != "published" or outcome.new_version is None:
             return
-        # Hot-swap at the bar boundary: activate, reload, rebind strategy.
-        self.registry.activate(outcome.new_version)
+        # Hot-swap at the bar boundary: verify the new version is serving-
+        # compatible with the running session, then activate + rebind.
         new_handle = self.registry.load(outcome.new_version)
-        anchor_delta = minutes_since(self.contract.anchor, new_handle.contract.anchor)
-        if anchor_delta % self.contract.m != 0:
+        incompatible = self._swap_incompatibility(new_handle)
+        if incompatible:
             self._sink(GuardEvent(
-                ts=ts, guard="phase_alignment", severity="error",
+                ts=ts, guard="hot_swap", severity="error",
                 message=(
-                    f"new model {outcome.new_version} anchor is not congruent "
-                    f"with the buffer grid (Δ={anchor_delta}min) — keeping incumbent"
+                    f"new model {outcome.new_version} is not serving-compatible: "
+                    f"{incompatible} — keeping incumbent {self.handle.version}"
                 ),
             ))
             return
+        self.registry.activate(outcome.new_version)
         self.handle = new_handle
         self.contract = new_handle.contract
         self._versions_used.append(new_handle.version)
@@ -531,7 +684,99 @@ class Engine:
         logger.info("hot-swapped to %s (p_threshold=%.4f)",
                     new_handle.version, self._p_threshold())
 
+    def _swap_incompatibility(self, new_handle: ModelHandle) -> str:
+        """Why ``new_handle`` cannot be hot-swapped mid-session ('' = it can).
+
+        The buffer, warmup guard, and (in batch mode) the precomputed feature
+        matrix were all built against the incumbent contract; a candidate that
+        changes the grid, the raw schema, or the feature set needs a restart,
+        not a swap. Scheduled retrains preserve all of these by construction —
+        this guards against manually published versions.
+        """
+        new = new_handle.contract
+        if new.m != self.contract.m:
+            return f"M changed ({self.contract.m} → {new.m}); buffer grid is fixed per session"
+        if new.with_derivatives != self.contract.with_derivatives:
+            return "with_derivatives changed; buffer raw schema is fixed per session"
+        anchor_delta = minutes_since(self.contract.anchor, new.anchor)
+        if anchor_delta % self.contract.m != 0:
+            return f"anchor not congruent with the buffer grid (Δ={anchor_delta}min)"
+        if new.n_warmup > self.warmup_guard.min_ready_rows:
+            return (
+                f"n_warmup {new.n_warmup:,} exceeds the session's ready window "
+                f"({self.warmup_guard.min_ready_rows:,} rows)"
+            )
+        if self.batch_service is not None and new.feature_list != self.contract.feature_list:
+            return "feature list changed; batch mode serves a precomputed matrix"
+        return ""
+
+    def _halt(self, ts: pd.Timestamp, reason: str) -> None:
+        """Trip the kill-switch: no new entries for the rest of the session
+        (open positions still resolve via the researched exit policy)."""
+        self._halted = True
+        self._halt_reason = reason
+        self._sink(GuardEvent(ts=ts, guard="halt", severity="error", message=reason))
+        logger.error(
+            "HALT at %s: %s — no new entries for the rest of the session",
+            ts, reason,
+        )
+
+    def _check_risk_limits(self, ts: pd.Timestamp, total_eq: float) -> None:
+        cfg = self.config
+        if cfg.max_drawdown is not None:
+            drawdown = self._equity_peak - total_eq
+            if drawdown >= cfg.max_drawdown:
+                self._halt(ts, (
+                    f"max_drawdown breached: drawdown {drawdown:.4f} >= "
+                    f"{cfg.max_drawdown:.4f} (peak {self._equity_peak:+.4f})"
+                ))
+                return
+        if cfg.max_cumulative_loss is not None and total_eq <= cfg.max_cumulative_loss:
+            self._halt(ts, (
+                f"max_cumulative_loss breached: equity {total_eq:+.4f} <= "
+                f"{cfg.max_cumulative_loss:.4f}"
+            ))
+
+    def _snapshot_positions(self) -> None:
+        rows = [
+            (
+                pos.k_entry, int(pos.ts_entry.value // 1_000_000), pos.side,
+                pos.size, pos.entry_price, pos.tp_price, pos.sl_price,
+                pos.expiry_k, self._entry_p.get(pos.k_entry),
+                self._entry_version.get(pos.k_entry, self.handle.version),
+            )
+            for pos in self.trader.portfolio.open_positions
+        ]
+        self.store.snapshot_open_positions(rows)
+
+    def close(self) -> None:
+        """Flush and release resources (the store handle). Idempotent.
+
+        The engine deliberately does NOT auto-close after :meth:`run` so
+        callers can still read ``self.store`` for reporting; call this — or
+        use the engine as a context manager — for a clean shutdown.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self.store.close()
+
+    def __enter__(self) -> "Engine":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def _finish(self) -> SessionReport:
+        # A retrain that finished after the last bar would otherwise be lost —
+        # record it (the published version stays in the registry for next start).
+        self._poll_retrain(self.buffer.last_ts or pd.Timestamp(0, tz="UTC"))
+        if self.retrainer.running:
+            logger.warning(
+                "a retrain is still in progress at session end — its outcome "
+                "is not recorded this session; any published version remains "
+                "in the registry for the next start"
+            )
         self.store.flush()
         trades = self.store.trades_frame()
         equity = self.store.equity_frame()
@@ -554,6 +799,7 @@ class Engine:
             guard_repairs=self.grid_guard.n_repaired + self.schema_guard.n_repaired,
             feature_errors=self._feature_errors,
             halted=self._halted,
+            halt_reason=self._halt_reason,
             trades=trades,
             equity=equity,
         )

@@ -16,6 +16,7 @@ and a row that cannot be reconciled never reaches the model.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -58,10 +59,22 @@ class FeatureContract:
     def __post_init__(self) -> None:
         if not self.feature_list:
             raise FeatureContractError("FeatureContract requires a non-empty feature_list")
+        if len(set(self.feature_list)) != len(self.feature_list):
+            raise FeatureContractError("FeatureContract feature_list has duplicate names")
         if self.label_cadence not in ("boundary", "1min"):
             raise FeatureContractError(f"bad label_cadence {self.label_cadence!r}")
+        if self.barrier_source not in ("high", "close"):
+            raise FeatureContractError(f"bad barrier_source {self.barrier_source!r}")
         if not self.grid_anchor_ts:
             raise FeatureContractError("FeatureContract requires grid_anchor_ts")
+        if not (isinstance(self.m, int) and self.m > 0):
+            raise FeatureContractError(f"FeatureContract m must be a positive int, got {self.m!r}")
+        if not (math.isfinite(self.phi) and self.phi > 0):
+            raise FeatureContractError(f"FeatureContract phi must be finite and > 0, got {self.phi!r}")
+        if not (isinstance(self.n_warmup, int) and self.n_warmup >= 0):
+            raise FeatureContractError(
+                f"FeatureContract n_warmup must be a non-negative int, got {self.n_warmup!r}"
+            )
 
     @property
     def anchor(self) -> pd.Timestamp:
@@ -153,37 +166,70 @@ def reconcile_matrix(frame: pl.DataFrame, contract: FeatureContract) -> np.ndarr
     return mat
 
 
+# Largest boundary-stage lookback at 1-min cadence (hit-rate/autocorr windows
+# 2,880 + label-maturity shift M; see run_inference_pipeline). The rolling
+# tail slice must comfortably exceed it or boundary features would be
+# truncated relative to the batch/training path.
+MAX_BOUNDARY_LOOKBACK_ROWS = 2_920
+
+
 class RollingFeatureService:
     """Recompute the pipeline on the trailing buffer; serve the last row.
 
-    ``boundary_tail_rows`` bounds the boundary-stage work (every boundary
-    lookback is ≤ ~2,920 rows at 1-min cadence; see
-    ``run_inference_pipeline``).
+    ``boundary_tail_rows`` bounds the boundary-stage work. Every boundary
+    lookback is ≤ ``MAX_BOUNDARY_LOOKBACK_ROWS`` at 1-min cadence, so the
+    tail must exceed that or rolling features would silently diverge from
+    batch; the constructor enforces the floor. ``None`` runs the full window.
     """
 
     def __init__(
         self,
         contract: FeatureContract,
         *,
-        boundary_tail_rows: int = 6_000,
+        boundary_tail_rows: Optional[int] = 6_000,
     ) -> None:
         self.contract = contract
-        self._tail_rows = int(boundary_tail_rows)
+        if boundary_tail_rows is not None:
+            tail = int(boundary_tail_rows)
+            if tail <= MAX_BOUNDARY_LOOKBACK_ROWS:
+                raise FeatureContractError(
+                    f"boundary_tail_rows={tail} must exceed the max boundary "
+                    f"lookback ({MAX_BOUNDARY_LOOKBACK_ROWS}) or rolling features "
+                    "would diverge from the batch/training path"
+                )
+            self._tail_rows: Optional[int] = tail
+        else:
+            self._tail_rows = None
         self.last_feature_ms: float = float("nan")
 
     def latest(self, buffer: BarBuffer) -> FeatureVector:
         t0 = time.perf_counter()
-        window = buffer.window_frame()
-        out = run_inference_pipeline(
-            window,
-            boundary_tail_rows=self._tail_rows,
-            **self.contract.pipeline_kwargs(),
-        )
-        arr = reconcile_row(out, self.contract, row=-1)
-        out_ts = out["ts"][-1]
         expect = buffer.last_ts
-        got = pd.Timestamp(out_ts).tz_localize("UTC")
-        if expect is None or got != expect.tz_convert("UTC"):
+        if expect is None:
+            raise FeatureContractError("RollingFeatureService.latest on an empty buffer")
+        window = buffer.window_frame()
+        try:
+            out = run_inference_pipeline(
+                window,
+                boundary_tail_rows=self._tail_rows,
+                **self.contract.pipeline_kwargs(),
+            )
+        except FeatureContractError:
+            raise
+        except Exception as exc:
+            # A polars/pipeline failure on one window must degrade the bar
+            # (typed error the engine catches), not crash the session.
+            raise FeatureContractError(
+                f"feature pipeline failed on the rolling window ending {expect} "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        if out.height == 0:
+            raise FeatureContractError(
+                f"feature pipeline returned no rows for the window ending {expect}"
+            )
+        arr = reconcile_row(out, self.contract, row=-1)
+        got = pd.Timestamp(out["ts"][-1]).tz_localize("UTC")
+        if got != expect.tz_convert("UTC"):
             raise FeatureContractError(
                 f"pipeline last row ts {got} != buffer last ts {expect}"
             )
@@ -257,11 +303,6 @@ class BatchFeatureService:
                 f"no precomputed feature row for ts {ts} — batch frame does "
                 "not cover the streamed bar"
             ) from None
-
-    def latest_for(self, ts: pd.Timestamp) -> FeatureVector:
-        i = self.row_index(ts)
-        assert self._matrix is not None
-        return FeatureVector(ts=pd.Timestamp(ts), values=self._matrix[i])
 
 
 def matured_label(

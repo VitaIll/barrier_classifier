@@ -61,6 +61,14 @@ _DERIV_FILES = {
 }
 
 
+def _as_utc(ts: "str | pd.Timestamp | None") -> Optional[pd.Timestamp]:
+    """Parse a window bound to tz-aware UTC (naive input = UTC wall time)."""
+    if ts is None:
+        return None
+    t = pd.Timestamp(ts)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
 @runtime_checkable
 class DataSource(Protocol):
     """Public interface every market-data adapter implements."""
@@ -152,12 +160,8 @@ class ReplaySource:
             frame = self._join_derivatives(frame, Path(deriv_dir))
         frame = frame.sort_index()
 
-        self._start = pd.Timestamp(start).tz_localize("UTC") if isinstance(start, str) else start
-        self._end = pd.Timestamp(end).tz_localize("UTC") if isinstance(end, str) else end
-        if self._start is not None and self._start.tzinfo is None:
-            self._start = self._start.tz_localize("UTC")
-        if self._end is not None and self._end.tzinfo is None:
-            self._end = self._end.tz_localize("UTC")
+        self._start = _as_utc(start)
+        self._end = _as_utc(end)
 
         first_streamed = self._start if self._start is not None else frame.index[0]
         self._history = frame.loc[frame.index < first_streamed]
