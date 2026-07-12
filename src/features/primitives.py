@@ -99,10 +99,12 @@ def eps_safe_div(
 def log1p_vol(x: pl.Expr) -> pl.Expr:
     """``log(1 + x)``. Used for volume-like quantities (always non-negative).
 
-    Implementation: ``(x + 1).log()``. Numerically equivalent to ``np.log1p``
-    for ``x >> 1e-8`` (which covers all realistic OHLCV-derived inputs:
-    volume, quote_volume, num_trades). For tiny ``x`` near float epsilon
-    the implementations diverge by ~1 ulp; not a concern at our scale.
+    Implementation: ``(x + 1).log()``. Matches ``np.log1p`` to within
+    ~1-2 ulp for ``x >> 1e-8`` (all realistic OHLCV-derived inputs:
+    volume, quote_volume, num_trades); bitwise equality holds on the
+    validated platform's libm but is NOT a cross-OS invariant — glibc
+    rounds a handful of values one ulp differently. For tiny ``x`` near
+    float epsilon the divergence is larger; not a concern at our scale.
 
     Pandas equivalent::
 

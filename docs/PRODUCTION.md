@@ -181,6 +181,16 @@ suite plus `scripts/validate_engine_replay.py` on real data, and if any
 parity gate moves, treat it as a model-retrain decision — the deployed
 model was trained and threshold-calibrated under the old numerics.
 
+The **operating system's libm is part of the validated environment**
+too: transcendental kernels (log/exp) legitimately differ by ~1 ulp
+between platforms even on identical package versions (measured:
+Windows vs glibc disagree on the last bit of `log1p`-family features
+for a handful of inputs). The bit-exact real-data validation ran on
+the platform recorded in the model version's provenance; deploying on
+a different OS is the same revalidation event as a dependency bump —
+run `scripts/validate_engine_replay.py` there before arming, and
+treat any parity movement as a re-baseline/retrain decision.
+
 ## 8. Pre-trade risk controls (institutional gate)
 
 Every entry signal is a REQUEST; the `EntryGovernor` decides whether the
