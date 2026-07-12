@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 from src.engine.engine import Engine, EngineConfig
+from src.engine.environment import enforce_stack, stack_report
 from src.engine.errors import EngineError
 from src.engine.model import ModelRegistry
 from src.engine.retrain import RetrainPolicy
@@ -100,6 +101,8 @@ def _cmd_import_model(args: argparse.Namespace) -> int:
 
 
 def _cmd_replay(args: argparse.Namespace, feature_mode: str) -> int:
+    for drift in enforce_stack(strict=False, context="replay"):
+        logger.warning("STACK DRIFT (parity not guaranteed): %s", drift)
     cfg = _build_config(args, feature_mode)
     source = ReplaySource(
         args.spot, start=args.start, end=args.end, speed=args.speed,
@@ -160,6 +163,13 @@ def _cmd_live(args: argparse.Namespace) -> int:
     from src.data.feed import FeedStore
     from src.engine.binance import BinanceBroker, BinanceClient
 
+    # Environment gate first: an armed session on a drifted numeric stack
+    # serves the model inputs it was never validated on. Strict when
+    # executing; dry-run sessions get a loud warning instead.
+    strict = args.execute and not args.allow_stack_drift
+    for drift in enforce_stack(strict=strict, context="live"):
+        logger.warning("STACK DRIFT (parity not guaranteed): %s", drift)
+
     cfg = _build_config(args, feature_mode="rolling")
     cfg.alert_webhook_url = args.alert_webhook or cfg.alert_webhook_url
     if args.no_risk_controls:
@@ -202,6 +212,7 @@ def _cmd_live(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    print(stack_report())
     registry = ModelRegistry(args.model_dir)
     print(f"registry: {registry.root}")
     active = registry.active_version()
@@ -269,6 +280,9 @@ def main(argv: list[str] | None = None) -> int:
     p_live.add_argument("--no-risk-controls", action="store_true",
                         help="disable the pre-trade entry controls "
                              "(research-faithful; NOT for production)")
+    p_live.add_argument("--allow-stack-drift", action="store_true",
+                        help="arm --execute even if the numeric stack differs "
+                             "from the validated pins (parity NOT guaranteed)")
 
     p_status = sub.add_parser("status", help="registry + store overview")
     p_status.add_argument("--model-dir", type=Path, default=Path("models"))

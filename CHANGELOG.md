@@ -1,3 +1,39 @@
+## 2026-07-12 — Frozen numeric stack: environment reproducibility enforced end to end
+
+CI had been red on every push for a reason that was also a production
+deployment hazard: `requirements.txt` used `>=` ranges, so a fresh
+install resolved pandas 3.0/numpy 2.4 — a stack the serving contract was
+never validated on — and the parity-sensitive suite correctly refused it.
+The environment is now part of the serving contract, enforced at three
+layers; a host that cannot reproduce the validated numerics cannot arm
+live execution.
+
+- **`requirements.txt` pins the numeric stack exactly** (numpy 1.26.4,
+  pandas 2.2.3, polars 1.39.3, pyarrow 19.0.1, catboost 1.2.8 + the
+  research-side scipy/scikit-learn/river and the pytest/ruff toolchain).
+  Ranged installs remain only for packages with no effect on numerics.
+- **`src/engine/environment.py`** — `VALIDATED_STACK` runtime manifest
+  (the versions the v0001 real-data parity validation ran under),
+  `check_stack()`/`stack_report()`/`enforce_stack()`. Metadata-only
+  (no package imports), sub-millisecond.
+- **CLI wiring**: `live --execute` REFUSES to arm on a drifted host
+  (`EnvironmentDriftError`; `--allow-stack-drift` is the deliberate
+  override), dry-run/replay warn per drifted package, `status` prints
+  the validated→installed table.
+- **`tests/engine/test_environment.py`** — pins ↔ manifest equality
+  (single source of truth), running-interpreter ↔ manifest equality
+  (the CI drift tripwire, failing with a version table instead of a
+  cascade of parity errors), drift detection/enforcement units, and
+  CLI-refusal wiring end to end.
+- **CI workflow**: pip caching keyed on requirements.txt, `pip check`
+  after install, a fail-fast resolved-stack verification before the
+  suite, job timeouts, per-ref concurrency cancellation, and
+  checkout/setup-python bumped to their Node 24 majors.
+- **docs**: PRODUCTION.md §7 — dependency upgrades are revalidation
+  events (bump pins + manifest together, full suite +
+  `validate_engine_replay.py`, numerics drift ⇒ retrain decision);
+  ENGINE.md §9 notes the stack guard.
+
 ## 2026-07-11 — Institutional hardening: pre-trade risk controls, order verification, audit, CI lint
 
 Closing the gap to an institutional production posture. What a

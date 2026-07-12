@@ -199,8 +199,15 @@ print(report.summary())
 `EngineConfig` is a plain dataclass with `from_toml()` (stdlib `tomllib`);
 every field and the `[retrain]` table are validated on load (unknown keys,
 bad types, and out-of-range values are `ConfigError`s). CLI:
-`python -m src.engine import-model|replay|run|status`. Every knob has a
-research-faithful default; nothing requires editing source to operate.
+`python -m src.engine import-model|replay|run|feed|live|status`. Every knob
+has a research-faithful default; nothing requires editing source to operate.
+
+The numeric stack is part of the serving contract:
+`src/engine/environment.py` holds the validated versions
+(mirroring the `requirements.txt` pins, tied together by test), `status`
+reports installed-vs-validated, replay/dry-run warn on drift, and
+`live --execute` refuses to arm on a drifted host unless
+`--allow-stack-drift` is passed deliberately (docs/PRODUCTION.md §7).
 
 ### Operations: kill-switch, shutdown, resume
 

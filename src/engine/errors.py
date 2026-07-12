@@ -16,6 +16,16 @@ class ConfigError(EngineError):
     """Invalid or inconsistent :class:`~src.engine.engine.EngineConfig`."""
 
 
+class EnvironmentDriftError(EngineError):
+    """The host's numeric stack differs from the validated environment.
+
+    The serving contract is bit-exact only on the pinned stack
+    (``src.engine.environment.VALIDATED_STACK``); a drifted host can
+    compute feature values the model was never validated on without any
+    crash. Raised when arming live execution on such a host.
+    """
+
+
 class GridError(EngineError):
     """The 1-minute time grid was violated beyond repair policy.
 

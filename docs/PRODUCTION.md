@@ -160,6 +160,27 @@ full test suite (`pytest --all`), restart with `--resume`. The hot-swap
 compatibility check also protects across restarts: a model incompatible
 with the running configuration refuses to serve.
 
+**The numeric stack is frozen, and enforced.** The serving contract is
+bit-exact only on the validated versions (numpy/pandas/polars/pyarrow/
+catboost — `requirements.txt` pins them; `src/engine/environment.py:
+VALIDATED_STACK` is the runtime mirror and a test pins the two to each
+other). Three layers refuse drift:
+
+1. **Install time** — `requirements.txt` exact pins; a fresh
+   `pip install -r requirements.txt` reproduces the validated stack.
+2. **Test time** — CI verifies the resolved environment against the
+   manifest before the suite, and `tests/engine/test_environment.py`
+   fails with a version table if the interpreter drifts.
+3. **Run time** — `live --execute` refuses to arm on a drifted host
+   (`EnvironmentDriftError`); dry-run and replay warn. `--allow-stack-
+   drift` is the deliberate override, and `status` prints the table.
+
+Upgrading a numeric dependency is a *revalidation event*, not routine
+maintenance: bump the pin and `VALIDATED_STACK` together, run the full
+suite plus `scripts/validate_engine_replay.py` on real data, and if any
+parity gate moves, treat it as a model-retrain decision — the deployed
+model was trained and threshold-calibrated under the old numerics.
+
 ## 8. Pre-trade risk controls (institutional gate)
 
 Every entry signal is a REQUEST; the `EntryGovernor` decides whether the

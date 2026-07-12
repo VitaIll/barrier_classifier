@@ -6,20 +6,25 @@ on:
   pull_request:
     branches: ["**"]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     name: ruff (static analysis)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
-      - name: Install ruff
+      - name: Install ruff (version pinned in requirements.txt)
         run: python -m pip install ruff==0.6.9
 
       - name: Lint src/ (error-class rules) — gate on real defects
@@ -28,19 +33,36 @@ jobs:
   test:
     name: pytest (Python 3.11)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Install dependencies (frozen numeric stack)
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Verify the installed stack matches the validated pins
+        # Fail fast, before the multi-minute suite: the same check runs
+        # inside the suite (tests/engine/test_environment.py), but a
+        # drifted resolver result should be a 5-second failure with a
+        # clear table, not a buried cascade of parity errors.
+        run: |
+          python - <<'EOF'
+          from src.engine.environment import check_stack, stack_report
+          print(stack_report())
+          drifts = check_stack()
+          assert not drifts, f"resolved environment drifted: {drifts}"
+          EOF
 
       - name: Run pytest --all
         run: |
