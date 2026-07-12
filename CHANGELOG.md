@@ -1,3 +1,41 @@
+## 2026-07-12 — DevOps skill family: machine-checked operating knowledge
+
+Six project skills under `.claude/skills/` now carry the repo's operating
+knowledge for any human or LLM: `developing` (architecture map, frozen
+invariants, definition of done), `testing` (theme system, suites of
+record, numeric assertion rules, real-data gates), `ci-cd` (workflow
+anatomy, red-run triage), `debugging` (typed error taxonomy, store
+forensics, landmine catalog), `live-ops` (safety ladder, bring-up,
+monitoring, recovery), `environment` (frozen stack, dependency-migration
+procedure). New `CLAUDE.md` is the always-loaded entry point with the
+**maintenance contract**: a routing table mapping change areas to the
+skills they impact — a major change is not done until impacted skills are
+updated.
+
+The contract is enforced, not aspirational: `tests/test_skills.py`
+(framework theme — every run, every CI build) machine-checks skill content
+against the repo. Referenced paths must exist; the environment skill's
+version pins must equal `requirements.txt` AND `VALIDATED_STACK`; the
+ci-cd skill must quote the workflow's actual ruff pin and python version;
+the testing skill must list every `pytest.ini` theme; the debugging skill
+must cover every `src/engine/errors.py` class; the live-ops skill must
+name every CLI subcommand and may only mention flags that exist; the
+CLAUDE.md registry and the skills folder must agree both ways, with no
+stray files. Fact drift anywhere turns CI red until the skill is updated
+— stale operating knowledge is now a build failure, not a hazard.
+
+The skills ship WITH the project: version-controlled in-repo (cloning is
+the install for Claude Code, which discovers them in place), and
+`scripts/package_skills.py` exports portable `.skill` bundles
+(`dist/skills/`, gitignored) or copies them into another agent's skills
+directory (`--install --target`). Both paths are covered by tests: the
+skill files must never be gitignored, and packaging must produce one
+valid bundle per registered skill. Operability was smoke-tested by fresh
+LLM agents answering a CI-failure scenario and an overnight
+execution-halt scenario strictly from the skills — both produced correct
+procedures; the gaps they flagged (host-migration state moves, manual
+flatten mechanics) were folded back into `live-ops`.
+
 ## 2026-07-12 — Frozen numeric stack: environment reproducibility enforced end to end
 
 CI had been red on every push for a reason that was also a production

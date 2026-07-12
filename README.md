@@ -72,6 +72,26 @@ A live deployment implements the `DataSource` protocol (see
 optionally a real `Broker`; everything else is unchanged. Configuration
 can also come from TOML (`EngineConfig.from_toml`).
 
+## Project skills — operating knowledge, shipped with the repo
+
+`.claude/skills/` holds six version-controlled DevOps skills that let any
+human or LLM develop and operate this system: `developing`, `testing`,
+`ci-cd`, `debugging`, `live-ops`, `environment`. `CLAUDE.md` is the entry
+point and carries the maintenance contract (change → which skill to
+update); `tests/test_skills.py` machine-checks the skills against the
+codebase on every CI run, so they cannot silently go stale.
+
+They install with the project: cloning the repo is the installation —
+Claude Code discovers them in place. For other agent surfaces:
+
+```bash
+python scripts/package_skills.py                      # export dist/skills/<name>.skill bundles
+python scripts/package_skills.py --install --target ~/.claude/skills   # copy into a skills dir
+```
+
+The in-repo copy is the source of truth; exported/installed copies are
+snapshots — re-run after pulling.
+
 ## Outputs
 
 - Raw data: `data/raw_data/klines_1m.parquet`, `data/raw_data/derivatives/*_1m.parquet`

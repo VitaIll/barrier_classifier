@@ -9,6 +9,9 @@
 /models/
 /runtime/
 
+# Packaged skill bundles (scripts/package_skills.py output)
+/dist/
+
 # Local temporary/cache files
 /.tmp/
 __pycache__/
